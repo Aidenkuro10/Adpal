@@ -419,6 +419,74 @@ pre,
 .entry[data-cat="attention"] { border-left-color: var(--blue); }
 .entry[data-cat="negotiation"] { border-left-color: #6d86a6; }
 
+/*
+ * Agent cognition lines.
+ *
+ * Reasoning events get the violet accent, an "AI" badge and an ordered step
+ * trace, so the stream visibly distinguishes an agent's thought from protocol
+ * mechanics. `data-level` rules below still win for failures, so a rejected
+ * attention verdict reads as a warning, not as a success.
+ */
+.entry[data-cat="ai"] .entry-stage {
+  background: rgba(180, 148, 255, 0.18);
+  color: #d9c9ff;
+}
+
+.entry[data-ai="true"] {
+  border-left-color: var(--violet);
+  background:
+    linear-gradient(90deg, rgba(180, 148, 255, 0.08), rgba(180, 148, 255, 0.012) 55%, transparent);
+}
+
+.entry[data-ai="true"] .entry-title {
+  color: #dccaff;
+}
+
+.entry-ai {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  height: 14px;
+  padding: 0 5px;
+  border: 1px solid rgba(180, 148, 255, 0.55);
+  border-radius: 4px;
+  background: rgba(180, 148, 255, 0.14);
+  color: #d9c9ff;
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.entry-thought {
+  padding: 0 12px 10px 43px;
+}
+
+.thought-meta {
+  margin: 0 0 5px;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+}
+
+.thought-steps {
+  margin: 0;
+  padding-left: 14px;
+  color: #a9b9d4;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.thought-steps li::marker {
+  color: rgba(180, 148, 255, 0.75);
+}
+
+.thought-steps li + li {
+  margin-top: 1px;
+}
+
 .entry[data-level="error"] { border-left-color: var(--red); background: rgba(255, 143, 129, 0.04); }
 .entry[data-level="warn"] { border-left-color: var(--amber); background: rgba(242, 198, 109, 0.035); }
 
@@ -641,6 +709,33 @@ pre,
 .card-quiet {
   background: rgba(255, 255, 255, 0.014);
 }
+
+/* Agent cognition card: the violet rail accent, same family as the AI rows. */
+.card-ai {
+  border-color: rgba(180, 148, 255, 0.24);
+  background:
+    linear-gradient(180deg, rgba(180, 148, 255, 0.08), rgba(255, 255, 255, 0.012));
+}
+
+.ai-thought {
+  margin: 9px 0 0;
+  padding: 8px 9px;
+  max-height: 132px;
+  overflow: auto;
+  border-left: 2px solid rgba(180, 148, 255, 0.55);
+  border-radius: 0 6px 6px 0;
+  background: rgba(180, 148, 255, 0.06);
+  color: #c9d6ea;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.ai-good { color: var(--green); font-weight: 700; }
+.ai-bad { color: var(--red); font-weight: 700; }
+
+#stat-tokens { color: #c1a9ff; }
 
 .card-head {
   display: flex;

@@ -18,7 +18,9 @@ const cors = require('cors');
 
 const config = require('./src/config');
 const { evaluateAttention, GUARD_LABELS } = require('./src/heuristic');
-const { Ledger, round4 } = require('./src/ledger');
+const { Ledger, round4, MICROS_PER_EURO } = require('./src/ledger');
+const { Presence } = require('./src/presence');
+const { createWebhookReconciler } = require('./src/webhook-reconciler');
 const { Telemetry } = require('./src/telemetry');
 const { CREATIVES, creativePayload } = require('./src/creatives');
 const { AdvertiserRotation } = require('./src/rotation');
@@ -35,6 +37,8 @@ const { PROTOCOL: L402_PROTOCOL, STATES: L402_STATES, DEFAULT_OFFER_ID: L402_OFF
 const app = express();
 const ledger = new Ledger(config);
 const telemetry = new Telemetry();
+// Single source of truth for "is a reader actually on the page right now".
+const presence = new Presence({ ttlMs: config.presence.ttlMs });
 const l402 = new L402Issuer({ rootKey: config.l402.rootKey, ttlMs: config.l402.ttlMs });
 const l402Sessions = new l402Contract.L402Contexts({ ttlMs: config.l402.ttlMs });
 // Rotates distinct advertiser profiles across placements and over time.
@@ -52,6 +56,9 @@ const serverState = { port: config.port, url: `http://localhost:${config.port}` 
 
 // Simple anti-spam: at most one offer per second per client.
 const lastOfferByClient = new Map();
+// Debounces "no active reader" warnings so a probing script cannot fill the
+// terminal with one line per refused request.
+const lastPresenceWarnAt = new Map();
 const OFFER_COOLDOWN_MS = 1000;
 
 app.disable('x-powered-by');
@@ -283,6 +290,7 @@ const TOOLKIT = toolkit.profile();
 function snapshot() {
   return {
     ...ledger.snapshot(),
+    presence: presence.snapshot(),
     paypal: paypal.publicProfile(),
     solana: solana.publicProfile(),
     payoutRail: config.payoutRail
@@ -556,19 +564,28 @@ app.get('/api/logs', (req, res) => {
         ? telemetry.seq
         : Math.max(0, telemetry.seq - 40);
 
+  // A live SSE stream must not wait on Nagle or on a corked socket: the whole
+  // point is that an impression on /demo/ shows in /terminal/ in the same tick.
+  res.flushHeaders?.();
+  req.socket?.setNoDelay?.(true);
+  req.socket?.setKeepAlive?.(true, 5000);
+
   const send = (event) => {
     if (res.writableEnded) return;
     try {
-      res.write(`id: ${event.seq}\n`);
-      res.write('event: log\n');
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      // One write per event. Three separate writes let the frame be split across
+      // packets, and an EventSource that receives `id:`/`event:` without its
+      // `data:` line has nothing to dispatch yet.
+      res.write(
+        `id: ${event.seq}\nevent: log\ndata: ${JSON.stringify(event)}\n\n`
+      );
     } catch {
       // The socket closed between the writableEnded check and the write.
     }
   };
 
   // Ask the browser to reconnect quickly, then describe the stream itself.
-  res.write('retry: 2000\n\n');
+  res.write('retry: 1000\n\n');
   res.write('event: hello\n');
   res.write(
     `data: ${JSON.stringify({
@@ -596,6 +613,7 @@ app.get('/api/logs', (req, res) => {
         budget: entry.budget
       })),
       autoPayout: config.paypal.autoPayout,
+      presence: presence.snapshot(),
       payoutRail: config.payoutRail,
       cognition: agentCognition.publicProfile(),
       toolkit: {
@@ -631,6 +649,42 @@ app.get('/api/logs', (req, res) => {
 });
 
 /**
+ * POST /api/presence
+ *
+ * The reader's heartbeat. Deliberately does **not** emit a telemetry event: a
+ * ping every few seconds would drown the terminal, and presence is state, not
+ * an event. Returns the live count so the content script can back off or the
+ * terminal header can show "1 reader live".
+ *
+ * Presence is what every value-touching route consults, so this is the only
+ * thing that can make an impression possible.
+ */
+app.post('/api/presence', (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const result = presence.touch({
+    clientId: sanitizeText(body.clientId, 64),
+    state: body.state === 'hidden' ? 'hidden' : body.state === 'closing' ? 'closing' : 'active',
+    page: {
+      title: sanitizeText(body.page?.title, 120),
+      host: sanitizeText(body.page?.host, 120)
+    },
+    slot: sanitizeText(body.slot, 40),
+    userAgent: sanitizeText(req.get('user-agent'), 160)
+  });
+
+  if (!result.ok) {
+    return res.status(400).json({ ok: false, error: result.reason, presence: presence.snapshot() });
+  }
+
+  res.json({
+    ok: true,
+    state: result.state || 'ended',
+    ttlMs: config.presence.ttlMs,
+    presence: presence.snapshot()
+  });
+});
+
+/**
  * POST /api/client-event
  *
  * Silent sink for the content script's session events. The article page never
@@ -649,6 +703,16 @@ app.post('/api/client-event', (req, res) => {
   const detail = sanitizeText(body.detail, 300);
   const data = body.data && typeof body.data === 'object' ? body.data : null;
   const host = sanitizeText(body.host, 120);
+  const clientId = sanitizeText(body.client, 64);
+
+  // Any extension activity is also proof of life: a reader who is mid-session
+  // should not lose presence just because the dedicated ping is in flight.
+  if (clientId) {
+    presence.touch({
+      clientId,
+      page: { title: sanitizeText(body.pageTitle, 120), host }
+    });
+  }
 
   emit({
     stage: kind,
@@ -1477,7 +1541,12 @@ async function handleL402Settle(req, res) {
   queueAutoPayout(`l402 settle ${receipt.reference}`, {
     rail: config.payoutRail,
     paymentHash: issued.paymentHash,
-    anchorSignature: solanaAnchor?.signature || ''
+    anchorSignature: solanaAnchor?.signature || '',
+    // A settled 402 is itself the explicit instruction: the caller paid the
+    // challenge in this request. It is not a background loop, so it does not
+    // need a browser session — but it is still causally tied to a request,
+    // which is the property this guard exists to protect.
+    explicit: true
   });
 
   res.set('Cache-Control', 'no-store');
@@ -1594,6 +1663,19 @@ function rememberWebhookEvent(id, record) {
     seenWebhookEvents.delete(oldest);
   }
 }
+
+/*
+ * Webhook reconciliation lives in its own module so the matching rules can be
+ * tested without a signed PayPal delivery. `report` is a thunk so the
+ * reconciler can be built before `reportWebhook` is defined below.
+ */
+const webhookReconciler = createWebhookReconciler({
+  ledger,
+  report: (event) => reportWebhook(event),
+  // One definition of "the money never moved", shared with the route.
+  terminalFailures: TERMINAL_FAILURES,
+  money
+});
 
 /**
  * Records a webhook decision in both log surfaces.
@@ -1778,37 +1860,40 @@ async function handlePaypalWebhook(req, res) {
 
   // --- dispatch -----------------------------------------------------
   const resource = event.resource && typeof event.resource === 'object' ? event.resource : {};
-  const batchId = sanitizeText(resource.payout_batch_id || resource.batch_id, 80);
+  // PayPal puts the batch id on the resource for item events and the sender
+  // ids inside `payout_item`. Reading all of them is what makes the first
+  // delivery match instead of falling through to "unmatched".
+  const item = resource.payout_item && typeof resource.payout_item === 'object'
+    ? resource.payout_item
+    : {};
+  const batchId = sanitizeText(
+    resource.payout_batch_id || resource.batch_id || item.payout_batch_id,
+    80
+  );
+  const senderBatchId = sanitizeText(
+    resource.sender_batch_id || item.sender_batch_id || resource.batch_header?.sender_batch_id,
+    80
+  );
+  const senderItemId = sanitizeText(item.sender_item_id || resource.sender_item_id, 64);
+  const itemId = sanitizeText(resource.payout_item_id || item.payout_item_id, 80);
   const status = PAYOUT_ITEM_STATUS[eventType] || null;
+
+  const identifiers = { batchId, senderBatchId, senderItemId, itemId };
 
   let outcome = 'ignored';
   let payout = null;
   let reversal = null;
 
-  if (status && batchId) {
-    if (TERMINAL_FAILURES.has(status)) {
-      const result = ledger.reversePayout(batchId, { reason: eventType });
-      if (result?.reversed) {
-        payout = result.payout;
-        reversal = { reversed: true, restored: result.restored };
-        outcome = 'handled';
-      } else if (result?.alreadyReversed) {
-        payout = result.payout;
-        reversal = { reversed: false, restored: 0 };
-        outcome = 'duplicate';
-      } else {
-        // Well-formed event for a batch this process never paid out — after a
-        // restart, or from another environment. Acknowledge, record, change nothing.
-        outcome = 'unmatched';
-      }
-    } else {
-      payout = ledger.updatePayoutStatus(batchId, status);
-      reversal = { reversed: false, restored: 0 };
-      outcome = payout ? 'handled' : 'unmatched';
-    }
-  } else if (status) {
-    // A payout item event without a batch id cannot be tied to a ledger entry.
-    outcome = 'unmatched';
+  if (status) {
+    const result = webhookReconciler.receive({
+      eventId,
+      eventType,
+      status,
+      identifiers
+    });
+    payout = result.payout;
+    reversal = result.reversal;
+    outcome = result.outcome;
   }
 
   reportWebhook({
@@ -1818,21 +1903,29 @@ async function handlePaypalWebhook(req, res) {
     title:
       outcome === 'handled'
         ? `Payout ${status} · ledger updated`
-        : outcome === 'unmatched'
-          ? 'Webhook acknowledged · no matching payout'
-          : 'Webhook acknowledged · nothing to apply',
+        : outcome === 'duplicate'
+          ? 'Webhook redelivered · item already final'
+          : outcome === 'deferred'
+            ? 'Webhook held · payout not yet committed'
+            : outcome === 'unmatched'
+              ? 'Webhook acknowledged · no matching payout'
+              : 'Webhook acknowledged · nothing to apply',
     detail:
-      `${eventType} · ${batchId || 'no batch id'}` +
-      (reversal?.reversed ? ` · reversed €${money(reversal.restored)}` : ''),
+      `${eventType} · ${batchId || senderBatchId || itemId || 'no batch id'}` +
+      (reversal?.reversed ? ` · reversed €${money(reversal.restored)}` : '') +
+      (outcome === 'deferred' ? ` · queued for reconciliation (${webhookReconciler.size} held)` : ''),
     data: {
       eventId,
       eventType,
       outcome,
       signature: signature.status,
-      batchId,
+      batchId: batchId || null,
+      senderBatchId: senderBatchId || null,
+      itemId: itemId || null,
       status,
       reversal,
-      payoutId: payout?.id || null
+      payoutId: payout?.id || null,
+      pendingWebhooks: webhookReconciler.size
     }
   });
 
@@ -2149,6 +2242,58 @@ app.post('/api/offer', async (req, res) => {
   const clientId = sanitizeText(body.clientId, 64) || req.ip || 'anonymous';
   const now = Date.now();
 
+  /*
+   * The presence gate.
+   *
+   * `/api/offer` is the only route that can create an impression, so it is the
+   * only place this check has to be enforced. Without a live, visible session
+   * there is no reader to show an ad to, and no telemetry event that asked for
+   * one — which is precisely the ghost-transaction case: a replay, a script, or
+   * a tab that was closed before the request landed.
+   */
+  if (config.presence.required) {
+    const alive = presence.requireActive(clientId);
+    if (!alive.ok) {
+      // One warn per reason per few seconds, so a probe cannot flood the
+      // terminal the way the refused request itself would have flooded it.
+      const key = `${clientId}:${alive.reason}`;
+      const lastWarn = lastPresenceWarnAt.get(key) || 0;
+      if (now - lastWarn > 5000) {
+        lastPresenceWarnAt.set(key, now);
+        emit({
+          stage: 'presence',
+          source: 'extension.agent',
+          level: 'warn',
+          title: 'Offer refused · no active reader',
+          detail: `${alive.reason} · an impression requires a live /demo/ session`,
+          data: {
+            client: clientLabel(clientId),
+            reason: alive.reason,
+            ageMs: alive.ageMs,
+            activeReaders: alive.activeCount
+          }
+        });
+      }
+
+      return res.status(409).json({
+        ok: false,
+        approved: false,
+        error: 'NO_ACTIVE_SESSION',
+        reason: alive.reason,
+        message:
+          alive.reason === 'TAB_NOT_VISIBLE'
+            ? 'The reader tab is not visible; no impression was sold.'
+            : 'No live /demo/ reader session; no impression was sold.',
+        presence: presence.snapshot(),
+        balance: snapshot()
+      });
+    }
+  } else if (body.clientId) {
+    // Presence tracking still runs when the gate is disabled, so the terminal
+    // can show the session even for scripted checks.
+    presence.touch({ clientId, page: { title: sanitizeText(body.page?.title, 120), host: sanitizeText(body.page?.host, 120) } });
+  }
+
   const lastOfferAt = lastOfferByClient.get(clientId) || 0;
   if (now - lastOfferAt < OFFER_COOLDOWN_MS) {
     emit({
@@ -2169,6 +2314,13 @@ app.post('/api/offer', async (req, res) => {
   if (lastOfferByClient.size > 500) {
     for (const [key, timestamp] of lastOfferByClient) {
       if (now - timestamp > 10 * 60 * 1000) lastOfferByClient.delete(key);
+    }
+  }
+  // Same bound for the refusal-warning debounce; it is keyed per client+reason
+  // and would otherwise keep one entry per probe for the life of the process.
+  if (lastPresenceWarnAt.size > 500) {
+    for (const [key, timestamp] of lastPresenceWarnAt) {
+      if (now - timestamp > 60 * 1000) lastPresenceWarnAt.delete(key);
     }
   }
 
@@ -2421,7 +2573,8 @@ app.post('/api/offer', async (req, res) => {
     reason: evaluation.reason,
     publisher,
     pageTitle,
-    pageHost
+    pageHost,
+    sessionId: clientId
   });
 
   if (!offer) {
@@ -2624,7 +2777,11 @@ app.post('/api/offer', async (req, res) => {
 
   // Same trigger as the L402 settle route: once a credited impression pushes
   // the reader balance past the threshold, the protocol agent pays out.
-  queueAutoPayout(`offer ${offer.id}`, { rail: config.payoutRail, paymentHash: challenge.paymentHash });
+  queueAutoPayout(`offer ${offer.id}`, {
+    rail: config.payoutRail,
+    paymentHash: challenge.paymentHash,
+    sessionId: clientId
+  });
 
   res.json({
     approved: true,
@@ -2669,7 +2826,7 @@ let autoPayoutChain = Promise.resolve();
  * @param {{ auto?: boolean, reason?: string, receiverEmail?: string, publisherEmail?: string }} options
  * @returns {Promise<{ status: number, body: object }>}
  */
-async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail, publisherEmail } = {}) {
+async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail, publisherEmail, sessionId = '' } = {}) {
   const profile = paypal.publicProfile();
   const trigger = auto ? 'auto' : 'manual';
 
@@ -2826,6 +2983,11 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
   const payout = ledger.commitPayout(reservation, { ...batch, rail: RAILS.PAYPAL });
   if (auto) lastAutoPayoutAt = Date.now();
 
+  // A webhook that beat the create response to the server is already buffered.
+  // Apply it now, in the same tick, so the ledger is consistent before the
+  // batch is even reported to the terminal.
+  const reconciled = webhookReconciler.flush(payout);
+
   emit({
     stage: 'payout',
     source: 'adserver.agent',
@@ -2833,11 +2995,15 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     title: `PayPal batch ${batch.status}`,
     detail:
       `${batch.batchId} · €${money(batch.amount)} ${batch.currency} → ${batch.receiverEmail}` +
-      (batch.items?.length > 1 ? ` (+${batch.items.length - 1} publisher item)` : ''),
+      (batch.items?.length > 1 ? ` (+${batch.items.length - 1} publisher item)` : '') +
+      (reservation.reconciliation.carried.gross > 0
+        ? ` · €${money(reservation.reconciliation.carried.gross)} carried (sub-cent)`
+        : ' · cent-exact'),
     data: {
       trigger,
       payoutId: payout?.id,
       batchId: batch.batchId,
+      senderBatchId: batch.senderBatchId,
       status: batch.status,
       rawStatus: batch.rawStatus,
       amount: batch.amount,
@@ -2847,6 +3013,9 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
       itemCount: items.length,
       publisherAmount: reservation.publisherAmount,
       split,
+      reconciliation: reservation.reconciliation,
+      reconciledWebhooks: reconciled,
+      sessionId: String(sessionId || '').slice(0, 24),
       mode: batch.mode,
       reference: reservation.reference,
       selfUrl: batch.selfUrl
@@ -2866,6 +3035,9 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
       trigger,
       payout,
       split: reservation.split,
+      reconciliation: reservation.reconciliation,
+      reconciledWebhooks: reconciled,
+      accounting: ledger.audit(),
       paypal: {
         configured: true,
         mode: batch.mode,
@@ -2932,20 +3104,21 @@ async function runSolanaPayout({ auto = false, reason = 'manual', paymentHash = 
     };
   }
 
-  // The ledger is kept in euros at four decimals. Solana's quantum is one base
-  // unit, i.e. `1 / unitsPerEuro` euros, so rounding to that grid keeps the
-  // reservation and the transfer identical.
-  const quantumEuros = 1 / config.solana.unitsPerEuro;
-  const quantize = (value) =>
-    Math.round(Number(value) / quantumEuros) * quantumEuros;
-  const minimum = quantumEuros;
+  // The ledger is stored in integer micro-euros. Solana's quantum is one base
+  // unit, i.e. `1 / unitsPerEuro` euros, which for native SOL (1e8 units/€) is
+  // 1e-8 € — finer than a micro. Quantising to the nearest representable micro
+  // (100 lamports) keeps the reservation and the transfer identical, and the
+  // residual is reported by `solana.splitUnits` rather than hidden.
+  const unitsPerEuro = Math.max(1, Number(config.solana.unitsPerEuro) || 1);
+  const quantumMicros = Math.max(1, Math.round(MICROS_PER_EURO / unitsPerEuro));
+  const quantize = (micros) => Math.round(Number(micros) / quantumMicros) * quantumMicros;
 
   const prepared = ledger.preparePayout({
     maxAmount: config.solana.maxPayout,
     // The rail always has a distinct publisher destination.
     payPublisher: true,
     quantize,
-    minAmount: minimum,
+    minMicros: quantumMicros,
     rail: RAILS.SOLANA
   });
 
@@ -3222,29 +3395,39 @@ async function runPayoutBatch({
   receiverEmail,
   publisherEmail,
   paymentHash = '',
-  anchorSignature = ''
+  anchorSignature = '',
+  sessionId = ''
 } = {}) {
   const selected = normalizeRail(rail);
 
   if (selected === RAILS.SOLANA) {
-    return runSolanaPayout({ auto, reason, paymentHash, anchorSignature });
+    return runSolanaPayout({ auto, reason, paymentHash, anchorSignature, sessionId });
   }
 
-  return runPaypalPayout({ auto, reason, receiverEmail, publisherEmail });
+  return runPaypalPayout({ auto, reason, receiverEmail, publisherEmail, sessionId });
 }
 
 /**
  * Called after every credited attention proof (extension offer or L402 settle).
  *
- * It runs once the reader balance crosses the payout threshold, with a short
- * delay so the terminal shows the settlement first and the transfer second. The
- * chain guarantees one payout at a time, and the interval keeps a burst of
- * settlements from producing a burst of rail calls.
+ * It runs once the reader balance crosses the payout threshold — but only while
+ * the session that earned the money is still alive. That check is what removes
+ * the last ghost-transaction path: the queue used to fire on a timer, so a tab
+ * closed a second after an impression still produced a PayPal batch. Now a
+ * departed reader means the batch is abandoned, the balance stays on the
+ * ledger, and the next live impression (or an explicit manual settle) pays it.
+ *
+ * The chain still serialises batches so a burst cannot create a burst of rail
+ * calls, but it no longer sleeps first: settlement and payout land in the same
+ * tick, which is what the terminal is supposed to show.
  *
  * @param {string} reason
- * @param {{ rail?: string, paymentHash?: string, anchorSignature?: string }} options
+ * @param {{ rail?: string, paymentHash?: string, anchorSignature?: string, sessionId?: string }} options
  */
-function queueAutoPayout(reason, { rail, paymentHash = '', anchorSignature = '' } = {}) {
+function queueAutoPayout(
+  reason,
+  { rail, paymentHash = '', anchorSignature = '', sessionId = '', explicit = false } = {}
+) {
   if (!config.paypal.autoPayout) return;
 
   // The configured rail wins unless the caller names one. If the chosen rail
@@ -3260,20 +3443,65 @@ function queueAutoPayout(reason, { rail, paymentHash = '', anchorSignature = '' 
   if (ledger.pendingPayout) return;
   if (ledger.user.balance + 1e-9 < config.payoutThreshold) return;
   if (Date.now() - lastAutoPayoutAt < config.paypal.autoPayoutMinIntervalMs) return;
+  // No reader, no payout. Checked here *and* again when the chain reaches the
+  // front, because the reader can leave while an earlier batch is in flight.
+  // `explicit` is reserved for a request that paid its own 402 challenge: that
+  // request is the instruction, so it does not need a browser heartbeat.
+  if (!explicit && !presence.isActive(sessionId)) {
+    emit({
+      stage: 'payout',
+      source: 'ledger',
+      level: 'info',
+      title: 'Auto payout skipped · reader not present',
+      detail: `€${money(ledger.user.balance)} stays on the ledger until a live session settles it.`,
+      data: { trigger: 'auto', reason, rail: selected, sessionId: String(sessionId || '').slice(0, 24) }
+    });
+    return;
+  }
 
+  const epoch = presence.epoch;
+
+  const step = async () => {
+    // A reset between queueing and execution must not let an old run's payout
+    // land in the new one.
+    if (presence.epoch !== epoch) return null;
+    if (!explicit && !presence.isActive(sessionId)) {
+      emit({
+        stage: 'payout',
+        source: 'ledger',
+        level: 'info',
+        title: 'Auto payout cancelled · reader left',
+        detail: 'The impression was real; the transfer waits for a live session.',
+        data: { trigger: 'auto', reason, rail: selected }
+      });
+      return null;
+    }
+    if (ledger.pendingPayout) return null;
+    if (ledger.user.balance + 1e-9 < config.payoutThreshold) return null;
+    return runPayoutBatch({
+      auto: true,
+      reason,
+      rail: selected,
+      paymentHash,
+      anchorSignature,
+      // Forwarded so the rail layer can emit the same presence evidence the
+      // ledger used to authorise the batch.
+      sessionId
+    });
+  };
+
+  const delay = config.paypal.autoPayoutDelayMs;
   autoPayoutChain = autoPayoutChain
-    .then(
-      () =>
-        new Promise((resolve) => {
-          setTimeout(resolve, config.paypal.autoPayoutDelayMs);
-        })
+    .then(() =>
+      delay > 0
+        ? new Promise((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            // Do not hold the process open for a cosmetic pause.
+            timer.unref?.();
+          })
+        : undefined
     )
-    .then(async () => {
-      if (ledger.pendingPayout) return;
-      if (ledger.user.balance + 1e-9 < config.payoutThreshold) return;
-      const result = await runPayoutBatch({ auto: true, reason, rail: selected, paymentHash, anchorSignature });
-      return result;
-    })
+    .then(step)
     .catch((error) => {
       console.error(`[payout] auto failed · ${error?.message || error}`);
     });
@@ -3390,21 +3618,32 @@ app.post('/api/dev/reset', (_req, res) => {
   ledger.setAdvertiserBudget(rotation.totalBudget({ initial: true }));
   l402Sessions.clear();
   lastOfferByClient.clear();
+  lastPresenceWarnAt.clear();
   lastAutoPayoutAt = 0;
   solana.reset();
+  /*
+   * Invalidates every live reader session and every queued payout.
+   *
+   * Without this, a batch queued a moment earlier can land *after* the reset,
+   * so run N+1 opens with a payout that belongs to run N. Bumping the epoch is
+   * what the queue checks; clearing the map stops a stale heartbeat from
+   * re-authorising an impression in the new run.
+   */
+  presence.reset();
   // The webhook replay guard is in-memory state like everything else reset
   // here. Clearing it is what lets the documented demo events be replayed by
   // a repeat run instead of being answered `duplicate` forever.
   seenWebhookEvents.clear();
+  webhookReconciler.clear();
   emit({
     stage: 'system',
     source: 'simulator',
     level: 'info',
     title: 'Simulator reset',
-    detail: 'Ledger balances, advertiser campaigns, L402 contexts and counters were reset to zero.'
+    detail: 'Ledger balances, advertiser campaigns, L402 contexts, reader sessions and counters were reset to zero.'
   });
   console.log('[dev] counters reset');
-  res.json({ reset: true, balance: snapshot() });
+  res.json({ reset: true, balance: snapshot(), accounting: ledger.audit() });
 });
 
 /* ------------------------------------------------------------------ */

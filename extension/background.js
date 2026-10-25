@@ -372,6 +372,43 @@ async function relayClientEvent(payload) {
   }
 }
 
+/**
+ * Forwards a presence heartbeat.
+ *
+ * Presence is deliberately *not* a telemetry event: the terminal would drown in
+ * a ping every four seconds. It only tells the server that a visible reader
+ * exists, which is what authorises an impression and, later, the payout that
+ * impression funds.
+ *
+ * Failures are swallowed like every other relay: losing a beat only means the
+ * server's TTL expires the session, and the next beat recreates it.
+ */
+async function relayPresence(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, error: 'Invalid presence payload.' };
+  }
+
+  const cache = await getCache();
+  if (cache.online === false) return { ok: false, skipped: 'offline' };
+
+  try {
+    const data = await apiRequest('/api/presence', {
+      method: 'POST',
+      body: {
+        clientId: await getClientId(),
+        state: payload.state === 'hidden' ? 'hidden' : payload.state === 'closing' ? 'closing' : 'active',
+        page: payload.page || {},
+        slot: payload.slot || '',
+        host: payload.host || ''
+      },
+      hint: payload.serverHint
+    });
+    return { ok: true, data };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Presence relay failed.' };
+  }
+}
+
 async function flushPayout(options = {}) {
   try {
     const data = await apiRequest('/api/flush-payout', { ...options, method: 'POST', body: {} });
@@ -432,6 +469,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return flushPayout({ hint: message.payload?.hint });
       case 'ADPAL_CLIENT_EVENT':
         return relayClientEvent(message.payload);
+      case 'ADPAL_PRESENCE':
+        return relayPresence(message.payload);
       case 'ADPAL_DISCOVER':
         return { ok: true, ...(await resolveServerUrl(message.payload?.hint)) };
       case 'ADPAL_GET_STATE':

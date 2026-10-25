@@ -43,6 +43,9 @@
           <button class="filter is-active" data-filter="all" type="button">
             All <span id="count-all">0</span>
           </button>
+          <button class="filter" data-filter="ai" type="button">
+            Agent AI <span id="count-ai">0</span>
+          </button>
           <button class="filter" data-filter="l402" type="button">
             L402 <span id="count-l402">0</span>
           </button>
@@ -80,9 +83,10 @@
           <p class="empty-title">Waiting for reader attention…</p>
           <p class="empty-body">
             Open <code>/demo/</code> in a second window and read. Hold a sponsored
-            placement in view for about six seconds; the extension submits the
-            attention proof and every step of the negotiation appears here as raw
-            JSON — 402 challenge, macaroon, 70/30 split, PayPal batch.
+            placement in view for about six seconds; the agents start reasoning —
+            attention verdict, each advertiser's bid and its written justification,
+            402 challenge, macaroon, 70/30 split, PayPal batch — and every step
+            appears here as raw JSON.
           </p>
           <p class="empty-body empty-body-quiet">
             The stream is opened from the current sequence, so a refreshed terminal
@@ -94,7 +98,10 @@
       <footer class="statusline">
         <span id="stat-events">0 events</span>
         <span id="stat-seq">seq 0</span>
+        <span id="stat-readers" title="Live /demo/ sessions. No session, no impression, no payout.">0 readers</span>
+        <span id="stat-accounting" title="Cumulative reader+publisher paid versus the 70/30 rule.">70/30 · exact</span>
         <span id="stat-errors">0 errors</span>
+        <span id="stat-tokens">0 tokens</span>
         <span id="stat-last">—</span>
         <span class="statusline-spacer"></span>
         <span id="stat-paused" hidden>paused · buffer is not updating the view</span>
@@ -121,7 +128,7 @@
             <span class="act-dot" aria-hidden="true"></span>
             <div class="act-body">
               <strong>402 challenge</strong>
-              <span>Offer, €0.020 price, payment hash.</span>
+              <span>Offer, live price, payment hash.</span>
             </div>
           </li>
           <li class="act" data-act="macaroon">
@@ -140,6 +147,27 @@
           </li>
         </ol>
         <p class="card-note" id="runbook-note">Waiting for reader attention…</p>
+      </section>
+
+      <section class="card card-ai" id="card-cognition">
+        <header class="card-head">
+          <h2>Agent cognition</h2>
+          <span class="card-tag" id="ai-state">awaiting</span>
+        </header>
+        <dl class="kv">
+          <div><dt>Provider</dt><dd class="mono" id="ai-provider">—</dd></div>
+          <div><dt>Model</dt><dd class="mono" id="ai-model">—</dd></div>
+          <div><dt>Last verdict</dt><dd id="ai-verdict">—</dd></div>
+          <div><dt>Bid relevance</dt><dd class="mono" id="ai-relevance">—</dd></div>
+          <div><dt>Tokens</dt><dd class="mono" id="ai-tokens">0 tok · 0 calls</dd></div>
+          <div><dt>Latency</dt><dd class="mono" id="ai-latency">—</dd></div>
+        </dl>
+        <p class="ai-thought" id="ai-thought">No agent thought yet. Hold a placement in view.</p>
+        <p class="card-note">
+          Every eligible advertiser agent scores the page and writes its own bid;
+          the verification agent explains the attention verdict. Steps and token
+          cost stream into the log above.
+        </p>
       </section>
 
       <section class="card" id="card-attention">
@@ -204,6 +232,7 @@
           <div><dt>Payable now</dt><dd class="mono" id="paypal-payable">€0.00</dd></div>
           <div><dt>Threshold</dt><dd class="mono" id="paypal-threshold">€0.050</dd></div>
           <div><dt>Publisher · 30%</dt><dd class="mono" id="paypal-publisher">€0.000</dd></div>
+          <div><dt>Carried · sub-cent</dt><dd class="mono" id="paypal-carry">€0.000</dd></div>
         </dl>
 
         <div class="paypal-actions">

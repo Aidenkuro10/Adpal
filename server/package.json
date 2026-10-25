@@ -6,7 +6,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node scripts/health-check.js",
+    "check:accounting": "node scripts/accounting-check.js",
+    "check:webhooks": "node scripts/webhook-reconcile-check.js",
+    "check:webhooks:e2e": "node scripts/webhook-e2e.js",
+    "check:stream": "node scripts/sse-latency.js"
   },
   "engines": {
     "node": ">=18"

@@ -34,7 +34,7 @@ The repository contains three independent parts:
                                 │ HTTP localhost:3000
 ┌───────────────────────────────▼───────────────────────────────────────────┐
 │  server.js — Express                                                      │
-│    POST /api/offer         → heuristic + rotation + L402 + ledger          │
+│    POST /api/offer         → cognition + heuristic + rotation + L402 + ledger          │
 │    POST /api/client-event  → silent session event sink                    │
 │    GET  /api/balance       → user / publisher / advertiser balances       │
 │    GET  /api/telemetry     → incremental negotiation feed (poll)          │
@@ -52,7 +52,7 @@ The repository contains three independent parts:
                                 │ SSE /api/logs
 ┌───────────────────────────────▼───────────────────────────────────────────┐
 │  demo-publisher/terminal/ — dedicated operator console                    │
-│  raw JSON events · L402 macaroons · attention · PayPal + Solana payloads  │
+│  agent reasoning · token cost · L402 macaroons · PayPal + Solana payloads  │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,8 +90,11 @@ Adpal/
 │   ├── .env.example        All configuration options
 │   └── src/
 │       ├── config.js       Environment variable parsing and validation
+│       ├── agent-cognition.js  Bid reasoning + attention explanation (agent layer)
 │       ├── heuristic.js    0-100 attention score and guard rails
-│       ├── ledger.js       Accounts, offers, split, and payouts
+│       ├── ledger.js       Accounts, offers, split, and payouts (integer micro-euros)
+│       ├── presence.js     Live reader sessions: the impression/payout gate
+│       ├── webhook-reconciler.js  PayPal event matching, hold-and-replay
 │       ├── creatives.js    Advertiser profiles (creative + campaign budget)
 │       ├── rotation.js     Multi-advertiser rotation, per slot and over time
 │       ├── paypal-agent-toolkit.js  PayPal AI Toolkit bridge (agent tools)
@@ -219,9 +222,9 @@ Go to **[http://localhost:3000/demo/](http://localhost:3000/demo/)** and read no
 
    > **Act 2/3** — `/terminal/` streams the `402 Payment Required` challenge, the attention proof, the macaroon caveats and the revenue split as raw JSON.
 
-5. If approved, the sponsored banner appears **inside the article**, automatically, with no interaction. The reader is credited **€0.014** (70% of €0.02).
-6. Keep reading: each placement negotiates once, so a full read of the four placements credits **€0.056** and rotates the creative between sponsors.
-7. Open **[http://localhost:3000/terminal/](http://localhost:3000/terminal/)** in a second window. At €0.05 the PayPal card's **Settle €0.05 to PayPal** button lights up; `POST /api/payout` creates a real Sandbox batch.
+5. If approved, the sponsored banner appears **inside the article**, automatically, with no interaction. The reader is credited **€0.035** (70% of €0.05).
+6. Keep reading: each placement negotiates once, so a full read of the four placements credits **€0.14** and rotates the creative between sponsors.
+7. Open **[http://localhost:3000/terminal/](http://localhost:3000/terminal/)** in a second window. The PayPal card shows **Settle €0.03 to PayPal**: the reader accrued €0.035, but PayPal settles in whole cents, so €0.03 moves now and the €0.005 carry is shown explicitly. The next impression makes the second batch cent-exact (€0.04 + €0.02), and the cumulative total is exactly 70/30.
 
    > **Act 4** — the batch id and status appear in the terminal, and the money lands in the Sandbox account.
 8. Open the AdPal popup: live balance, last verification, activity, and rules.
@@ -293,7 +296,7 @@ The terminal carries a **Demo runbook** card that tracks these four steps. It is
 
 The stream is opened as `/api/logs?live=1`, which starts at the current sequence instead of replaying the tail. That is why a refreshed terminal shows *“Waiting for reader attention…”* rather than the previous run; a reconnecting `EventSource` still resumes from `Last-Event-ID`.
 
-Each article placement is worth **€0.014** to the reader, so four verified impressions (€0.056) cross the €0.05 payout threshold. Reload `/demo/` to start a new page view.
+Each article placement is worth **€0.05** to the advertiser, which splits exactly into **€0.035 to the reader** and **€0.015 to the publisher**. One verified impression already crosses the (deliberately tiny) `PAYOUT_THRESHOLD`. Reload `/demo/` to start a new page view.
 
 ### Multi-advertiser rotation
 
@@ -366,8 +369,16 @@ are triggered by the settlement itself:
 
 - a credited attention proof — either an extension `POST /api/offer` or an L402
   `POST /api/l402/settle` — calls the auto-settlement queue; once the reader
-  balance crosses `PAYOUT_THRESHOLD` (€0.05 by default) the protocol agent
-  creates the batch on its own (`PAYPAL_AUTO_PAYOUT=true`);
+  balance crosses `PAYOUT_THRESHOLD` the protocol agent creates the batch on its
+  own (`PAYPAL_AUTO_PAYOUT=true`);
+- the queue executes in the **same tick** as the settlement. There is no
+  cosmetic delay (`PAYPAL_AUTO_PAYOUT_DELAY_MS=0`), so the terminal shows the
+  split and the payout trigger together; only the batch response itself waits
+  on PayPal's REST round-trip;
+- **an impression needs a live reader.** `POST /api/offer` refuses a client with
+  no visible `/demo/` session (`409 NO_ACTIVE_SESSION`), and an auto payout is
+  abandoned if that session disappears before it executes. See *Reader presence*
+  below;
 - `POST /api/payout` still exists for a manual settlement (terminal button,
   extension popup, curl) and runs the *same* code path;
 - it fetches an OAuth2 token from `https://api-m.sandbox.paypal.com/v1/oauth2/token`, then creates a batch with `POST /v1/payments/payouts`, paying the reader share to `PAYPAL_RECEIVER_EMAIL`;
@@ -386,9 +397,83 @@ backoff on HTTP 429 — and the toolkit's MCP endpoint
 (`https://mcp.sandbox.paypal.com/sse`) is reported in `/api/toolkit` and the
 terminal.
 
-Amounts are floored to whole cents, so any remainder stays on the balance for the next payout. Nothing is debited unless PayPal accepts the batch: a network error or API rejection leaves both balances untouched.
+#### Exact 1:1 accounting
+
+The ledger stores **integer micro-euros**, not floats. Every impression is split
+as `reader = round(gross × 0.70)` and `publisher = gross − reader`, so the two
+legs always add back to the gross to the micro-euro — there is no second
+independent rounding to drift against the first.
+
+A €0.05 impression therefore accrues exactly **€0.035 / €0.015**. PayPal settles
+in **whole cents**, and €0.035 is not a whole number of cents, so the rail moves
+what it can and the ledger reports the rest:
+
+- first impression: €0.03 reader + €0.01 publisher move, **€0.005 per leg is
+  carried** (shown as *Carried · sub-cent* in the terminal);
+- second impression: the carry is included, so €0.04 + €0.02 move and nothing is
+  left behind;
+- cumulative: **€0.07 / €0.03 on €0.10 — exactly 70/30, zero drift**.
+
+`GET /api/balance → accounting` exposes the audit a judge can check by hand:
+accrued, paid, reversed, held, and four invariants (`splitIsExact`,
+`readerConserved`, `publisherConserved`, `ratioWithinOneCent`). **No fee is ever
+deducted from a split leg**: PayPal Payouts charges the sender, so the recipient
+amounts are gross (`fees.model = "sender-pays"`, `deductedFromSplit = 0`).
+
+Two extra fields answer "did a micro-cent go missing?" without reading code:
+`carryMicros` is the sub-cent remainder still held for the next batch, and
+`unexplainedMicros` is `accrued − (paid − reversed + carried)` per party. The
+latter must be `0`; it is the number that would move if the split or the
+reversal ever lost money. `invariants.readerDriftCents` is measured against what
+was *paid*, so a single impression legitimately shows `0.2¢` — that is the
+carry, not a loss.
+
+Nothing is debited unless PayPal accepts the batch: a network error or API
+rejection leaves both balances untouched.
 
 Below the threshold, the API returns `409 THRESHOLD_NOT_REACHED` with the missing amount. Missing credentials return `503 PAYPAL_NOT_CONFIGURED`, and a rejected batch returns the PayPal issue code (for example `RECEIVER_UNREGISTERED`).
+
+#### Reader presence
+
+`server/src/presence.js` is the one thing that can authorise an impression. The
+content script sends a heartbeat every 4 s **only while the tab is visible**;
+`PRESENCE_TTL_MS` (12 s) tolerates two missed beats. A hidden tab, a closed
+page, a `curl` replay, or an expired session all get `409 NO_ACTIVE_SESSION`
+and no ledger entry is written.
+
+Presence deliberately uses **no server timer**: expiry is computed on read, so
+an idle simulator has nothing running in the background. `/api/dev/reset` bumps
+a run epoch, which also cancels any payout queued by the previous run — a batch
+can no longer land after a reset and look like a ghost transaction.
+
+#### Webhook reconciliation
+
+`POST /api/webhooks/paypal` matches a delivery on **any** identifier PayPal
+sends — `payout_batch_id`, `sender_batch_id`, `sender_item_id`, `payout_item_id`
+or our own reference — rather than the batch id alone. A notification that
+arrives before our create-response is committed is **held and replayed** the
+moment the matching payout is committed, so the terminal reports
+`Early webhook reconciled` instead of *“no matching payout”*. A retried failure
+is idempotent: the reversal runs once.
+
+```bash
+node scripts/webhook-reconcile-check.js   # 18 checks, no network
+node scripts/webhook-e2e.js http://localhost:3101   # real batch, real deliveries
+```
+
+The end-to-end check needs a second server with `PAYPAL_WEBHOOK_ID` blanked, so
+signature verification is skipped and unsigned deliveries are accepted:
+
+```powershell
+$env:PORT='3101'; $env:PAYPAL_WEBHOOK_ID=' '; node server.js
+```
+
+It creates one real sandbox batch, then delivers an item event carrying **only**
+`sender_batch_id` (the shape that used to fall through to *unmatched*), the same
+event again from the `payout_batch_id` side, a byte-identical redelivery, and a
+foreign batch id. Expected outcomes: `handled`, `handled`/`duplicate`,
+`duplicate`, `deferred` — with balances untouched in the last case.
+
 
 ### The Solana Devnet rail
 
@@ -489,8 +574,9 @@ inventory this server exposes, and the retry policy. A missing checkout reports
 ### `GET /api/agents`
 
 The rotation roster — advertiser agent id, sponsor, objective, campaign budget,
-spend and impressions — plus the current 70/30 split and whether automatic
-payout is enabled.
+spend and impressions — plus the current 70/30 split, whether automatic payout
+is enabled, and the active `cognition` profile (provider, model, relevance
+floor, and whether a hosted model is actually configured).
 
 ### `GET /api/balance`
 
@@ -545,8 +631,8 @@ Incremental feed used by scripts and tests. Events are sequence-numbered and kep
       "source": "extension.agent",
       "level": "info",
       "title": "Offer requested",
-      "detail": "€0.020 · localhost · The city reinvents its squares",
-      "data": { "price": 0.02, "slot": "declared" }
+      "detail": "€0.050 · localhost · The city reinvents its squares",
+      "data": { "price": 0.05, "slot": "declared" }
     }
   ],
   "guards": [
@@ -611,13 +697,24 @@ Expected body (the values below produce an approved offer):
 }
 ```
 
-Example with `curl.exe` (Windows) or `curl`:
+Example with `curl.exe` (Windows) or `curl`. The endpoint requires a live reader
+session, so send the heartbeat first (the content script does this every 4 s
+while the tab is visible):
 
 ```bash
+# 1. register the session (state: active)
+curl -X POST http://localhost:3000/api/presence \
+  -H "Content-Type: application/json" \
+  -d '{"clientId":"demo","state":"active","page":{"title":"Demo","host":"localhost"}}'
+
+# 2. request the offer within PRESENCE_TTL_MS (12 s)
 curl -X POST http://localhost:3000/api/offer \
   -H "Content-Type: application/json" \
-  -d '{"clientId":"demo","price":0.02,"signals":{"durationMs":6200,"mouseMoves":32,"directionChanges":11,"scrollEvents":5,"scrollDepth":0.62,"clicks":2,"keyPresses":1,"visibleRatio":1,"focusRatio":1,"clientSentAt":1792578000000},"page":{"title":"Demo","host":"localhost"},"slot":{"detected":true}}'
+  -d '{"clientId":"demo","price":0.05,"signals":{"durationMs":6200,"mouseMoves":32,"directionChanges":11,"scrollEvents":5,"scrollDepth":0.62,"clicks":2,"keyPresses":1,"visibleRatio":1,"focusRatio":1,"clientSentAt":1792578000000},"page":{"title":"Demo","host":"localhost"},"slot":{"detected":true}}'
 ```
+
+Without a live session the response is `409 NO_ACTIVE_SESSION` and **nothing is
+credited** — that is the guarantee, not an error path.
 
 Approved response (excerpt):
 
@@ -628,15 +725,19 @@ Approved response (excerpt):
   "score": 99,
   "verdict": "human",
   "reason": "Attention signal consistent with human browsing.",
-  "price": 0.02,
+  "price": 0.05,
   "checks": [
     { "id": "automation", "label": "Automation flag", "status": "pass", "detail": "navigator.webdriver = false" }
   ],
   "split": {
-    "user": 0.014,
-    "publisher": 0.006,
+    "user": 0.035,
+    "publisher": 0.015,
     "userRate": 0.7,
-    "publisherRate": 0.3
+    "publisherRate": 0.3,
+    "gross": 0.05,
+    "exact": true,
+    "micros": { "reader": 35000, "publisher": 15000, "gross": 50000 },
+    "carryMicros": { "reader": 5000, "publisher": 5000 }
   },
   "creative": {
     "id": "northbound-coffee",
@@ -1118,6 +1219,49 @@ the PayPal dashboard (it must end in `/api/webhooks/paypal`, not `/api/api/…`)
 that the deployed build contains this route, and that the service is bound to
 the platform's `$PORT`.
 
+### Environment consistency (Sandbox vs Live)
+
+PayPal keeps Sandbox and Live completely separate, and three independent settings
+have to agree: the credentials, `PAYPAL_MODE` (which picks the API host) and the
+webhook id. A mix fails silently — the credentials may still authenticate, the
+webhook still arrives, and every notification is answered `FAILURE` forever,
+which looks identical to a forged signature.
+
+`scripts/paypal-env-check.js` proves the answer instead of guessing:
+
+```bash
+cd server
+node scripts/paypal-env-check.js
+```
+
+```
+  ok   credentials authenticate · sandbox (app APP-4XE00973…)
+  ok   PAYPAL_MODE matches the credentials · sandbox vs sandbox
+  ok   webhook id resolves in sandbox · https://adpal.onrender.com/api/webhooks/paypal
+  ok   subscribed to payout events · *
+CONSISTENT · credentials, API host and webhook id are all the same environment.
+```
+
+It works because the environment is provable in both directions: PayPal rejects
+the other environment's credentials with `401 invalid_client`, and a webhook id
+resolves only against the Webhooks API of the environment it was registered in.
+Run it with the deployment's variables to check a host you cannot shell into.
+
+At runtime the same conclusion is guarded from the notification itself. PayPal
+stamps each event with `paypal-cert-url`, whose host names the environment that
+sent it, so a Live event reaching a Sandbox-configured server is refused before
+the network round trip and logged as `Webhook environment mismatch` rather than
+an anonymous `FAILURE`. An unrecognised cert host is *not* treated as a
+mismatch — it falls through to normal verification, because proxies exist and a
+misread header must never reject a genuine event.
+
+The boot banner states all three values on one line, so a mixed deployment is
+visible at deploy time:
+
+```
+  Webhooks   sandbox · https://api-m.sandbox.paypal.com · id 09V249…
+```
+
 ---
 
 ## Configuration
@@ -1137,7 +1281,7 @@ copy .env.example .env      # Windows (cmd)
 | `PORT_SCAN_RANGE` | `10` | Ports to try (`3001`, `3002`, …) if `PORT` is taken. Ignored when `PORT` is injected by the platform, where the assigned port is not negotiable. The server binds `0.0.0.0` |
 | `PAYOUT_THRESHOLD` | `0.05` | Reader balance that unlocks a PayPal payout, in euros |
 | `MAX_OFFER_PRICE` | `0.05` | Maximum price accepted per offer |
-| `DEFAULT_OFFER_PRICE` | `0.02` | Informational price exposed in the rules |
+| `DEFAULT_OFFER_PRICE` | `0.05` | Informational price exposed in the rules |
 | `USER_SHARE` | `0.7` | User share (the remainder goes to the publisher) |
 | `ADVERTISER_BUDGET` | `50` | Simulated initial advertiser budget |
 | `HUMAN_THRESHOLD` | `50` | Minimum score required to approve an offer |
@@ -1151,8 +1295,10 @@ copy .env.example .env      # Windows (cmd)
 | `PAYPAL_MAX_PAYOUT` | `5` | Guard rail: largest amount a single demo payout may move |
 | `PAYPAL_TIMEOUT_MS` | `15000` | Abort a PayPal HTTP call after this long |
 | `PAYPAL_AUTO_PAYOUT` | `true` | Create the batch automatically when a settled invoice crosses the threshold |
-| `PAYPAL_AUTO_PAYOUT_DELAY_MS` | `900` | Pause between the settlement event and the PayPal call |
+| `PAYPAL_AUTO_PAYOUT_DELAY_MS` | `0` | Pause between the settlement event and the PayPal call; `0` keeps them on the same tick |
 | `PAYPAL_AUTO_PAYOUT_MIN_INTERVAL_MS` | `15000` | Minimum gap between two automatic batches |
+| `PRESENCE_TTL_MS` | `12000` | How long a reader session stays live without a heartbeat (the content script pings every 4 s) |
+| `PRESENCE_REQUIRED` | `true` | Refuse `POST /api/offer` with no live session; `false` reintroduces ghost impressions and is for scripted checks only |
 | `PAYPAL_WEBHOOK_ID` | *(empty)* | Webhook id from the PayPal dashboard. Without it, notifications are accepted but reported `unverified` |
 | `PAYPAL_WEBHOOK_STRICT` | `false` | `true` refuses unverified notifications (503) instead of accepting them — use outside a sandbox demo |
 | `PAYPAL_WEBHOOK_REPLAY_WINDOW` | `500` | Event ids remembered to suppress PayPal's retries |
@@ -1170,12 +1316,18 @@ copy .env.example .env      # Windows (cmd)
 | `SOLANA_ANCHOR_TIMEOUT_MS` / `SOLANA_TIMEOUT_MS` | `8000` / `15000` | Confirmation timeouts |
 | `SOLANA_MAX_PAYOUT` | `5` | Guard rail for a single devnet payout |
 | `SOLANA_FALLBACK_TO_PAYPAL` | `true` | Send the same split through PayPal if devnet cannot confirm |
+| `AGENT_PROVIDER` | `local` | Agent cognition backend: `local` (deterministic reasoner) or `openai` / `anthropic` / `gemini` |
+| `AGENT_API_KEY` | *(empty)* | Key for the hosted provider; falls back to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` |
+| `AGENT_MODEL` / `AGENT_BASE_URL` | *(provider default)* | Override the model or an OpenAI-compatible endpoint |
+| `AGENT_MIN_RELEVANCE` | `0.35` | Relevance floor below which an advertiser agent declines to spend |
+| `AGENT_TIMEOUT_MS` / `AGENT_MAX_TOKENS` / `AGENT_TEMPERATURE` | `6000` / `512` / `0.4` | Hosted-call limits; any failure falls back to the local reasoner |
+| `AGENT_ENABLED` | `true` | `false` skips the cognition layer entirely |
 
 PayPal credentials are only read by the server. The page and the extension never receive them: the terminal gets the mode, the recipient, and the batch result, nothing more. OAuth tokens are truncated to a prefix before they reach the log.
 
 If a payout stays `PENDING`, that is the sandbox's own processing state. `POST /api/payout` reports exactly what PayPal returned; the **Refresh** action in the terminal re-reads the batch with `GET /v1/payments/payouts/{id}`. Paying the business account itself is useful as a demo, but the batch only completes when the recipient is a separate **personal** Sandbox account — set `PAYPAL_RECEIVER_EMAIL` to that address.
 
-The price actually requested is defined in `extension/content.js` (`CONFIG.price`, €0.02 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
+The price actually requested is defined in `extension/content.js` (`CONFIG.price`, €0.05 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
 
 The simulator **never fails because of a busy port**. If `PORT` is already taken (a stale terminal, another app), it walks forward through `PORT_SCAN_RANGE` following ports and prints the one it settled on:
 
@@ -1209,6 +1361,50 @@ The passive loop timings live in `CONFIG` at the top of `extension/content.js`:
 | `retryCooldownMs` | `10000` | Delay after a rejection |
 | `minNewSignals` | `4` | Fresh interactions required before retrying |
 | `maxImpressionsPerPage` | `9` | Cap across all placements on one page load |
+
+---
+
+## Agent cognition
+
+`server/src/agent-cognition.js` is the reasoning layer around the deterministic pipeline. It has two roles:
+
+| Role | Called from | Output |
+| --- | --- | --- |
+| Advertiser bid reasoning | `POST /api/offer`, `POST /api/l402/settle` | a relevance score and a written justification per eligible advertiser; the highest relevant bid wins the slot |
+| Attention explanation | same routes | the telemetry read back as a behavioural signature, with each guard rail named |
+
+### Providers
+
+| `AGENT_PROVIDER` | What runs | Network |
+| --- | --- | --- |
+| `local` (default) | Deterministic reasoner: page classification, keyword + concept overlap, objective × page affinity, budget check, then prose assembled from those numbers | none |
+| `openai` / `anthropic` / `gemini` | The same task as a JSON prompt; `usage` from the API is recorded | provider API |
+
+The local reasoner is not a neural network, and this README will not pretend otherwise: it is feature extraction plus weighted scoring. Its output is still genuinely contextual — *"The city reinvents its squares"* and *"A desk garden for small apartments"* produce different winners and different arguments. Select a hosted provider with `AGENT_PROVIDER` plus `AGENT_API_KEY` (or `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`). On a missing key, timeout, 4xx or unparseable JSON the layer falls back to the local reasoner and marks the event `fallback: true` / `degraded: true` — it never reports a model that did not answer.
+
+### What the agents decide
+
+Each eligible advertiser is scored on three components:
+
+- **audience fit** — does the campaign objective suit this page type (`editorial`, `commerce`, `general`)?
+- **topic fit** — keyword overlap plus a small category map; exact terms count more than category adjacency
+- **novelty** — tie-breaker for an advertiser that has not been shown yet
+
+Relevance must clear `AGENT_MIN_RELEVANCE` (default `0.35`) or the agent declines to spend, and the offer is withheld with `402 NO_RELEVANT_ADVERTISER`. Budget and the per-slot no-repeat rule stay in `rotation.js`, so reasoning chooses the winner but cannot break the placement invariants.
+
+### What the attention agent does
+
+`heuristic.js` remains the authority: it produces the score and the approve/refuse decision, and the money follows it. The cognition layer reads the same signals and writes the explanation — reading cadence, pointer dynamics, viewport discipline, and each guard rail that passed or failed. With a hosted model, a disagreement between the model's verdict and the heuristic is reported (`disagreement: true`), never applied.
+
+### In the stream
+
+Three SSE stages carry the reasoning, each with a `cognition` envelope (`provider`, `model`, `usage`, `latencyMs`, `steps`):
+
+- `agent.attention` — the verification narrative and the measured signature
+- `agent.reasoning` — every bid, ranked, with the step trace
+- `agent.bid` — the winner's full justification in `detail`
+
+The terminal paints these rows violet, adds an `AI` badge and a numbered step list, and the **Agent cognition** card tracks provider, last verdict, relevance, cumulative tokens and latency. Token counts from a hosted API are exact; local-reasoner counts are marked `(est)` and computed as `chars / 4`.
 
 ---
 

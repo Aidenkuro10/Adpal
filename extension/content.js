@@ -30,7 +30,7 @@
   const SLOT_SELECTOR = '#adpal-slot, [data-adpal-slot]';
 
   const CONFIG = {
-    price: 0.02,
+    price: 0.05,
 
     /* Measurement window */
     dwellBeforeStartMs: 2500,
@@ -61,7 +61,14 @@
     pauseCooldownMs: 1500,
 
     /* Telemetry: one attention sample every few seconds, never per input. */
-    attentionReportMs: 8000
+    attentionReportMs: 8000,
+
+    /*
+     * Presence heartbeat. The server refuses an impression without a live,
+     * visible session, so this is what makes an offer possible at all. Kept
+     * below the server TTL (12 s) so two missed beats still count as present.
+     */
+    presenceIntervalMs: 4000
   };
 
   const READY_PHASES = new Set(['idle', 'delivered', 'rejected', 'invalid', 'paused', 'offline']);
@@ -84,6 +91,8 @@
     // exist, so a long article does not spawn a timer per slot.
     window.setInterval(tick, CONFIG.stateIntervalMs);
     tick();
+
+    startPresence();
 
     // Single-page apps may mount placements after load; watch briefly.
     const observer = new MutationObserver(() => {
@@ -744,6 +753,65 @@
       );
     } catch {
       /* extension context invalidated; telemetry is optional */
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Presence                                                            */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Keeps the reader session alive for as long as the page is genuinely open
+   * and visible.
+   *
+   * The server will not sell an impression without this: that is the whole
+   * point. A tab left in the background, a page restored from the bfcache, or
+   * a closed browser sends `hidden` / `closing` and stops counting immediately,
+   * so nothing can be bought or paid out on behalf of a reader who is not there.
+   */
+  function startPresence() {
+    const currentState = () =>
+      document.visibilityState === 'visible' ? 'active' : 'hidden';
+
+    const beat = () => sendPresence(currentState());
+
+    beat();
+
+    // The interval is page-scoped: closing the page clears it, and a hidden tab
+    // reports `hidden` rather than pretending to be a reader.
+    const timer = window.setInterval(beat, CONFIG.presenceIntervalMs);
+
+    document.addEventListener('visibilitychange', beat, { passive: true });
+    window.addEventListener('pageshow', beat);
+    window.addEventListener('pagehide', () => {
+      window.clearInterval(timer);
+      sendPresence('closing');
+    });
+    window.addEventListener('beforeunload', () => sendPresence('closing'));
+
+    return timer;
+  }
+
+  function sendPresence(state) {
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'ADPAL_PRESENCE',
+          payload: {
+            state,
+            page: {
+              title: document.title.slice(0, 120),
+              host: location.host
+            },
+            host: location.host
+          }
+        },
+        () => {
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch {
+      /* extension context invalidated; the server TTL expires the session */
     }
   }
 

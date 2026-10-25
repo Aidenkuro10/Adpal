@@ -18,6 +18,9 @@
   const $ = (id) => document.getElementById(id);
 
   const CATEGORY = {
+    'agent.reasoning': 'ai',
+    'agent.bid': 'ai',
+    'agent.attention': 'ai',
     l402: 'l402',
     'l402.challenge': 'l402',
     'l402.issue': 'l402',
@@ -48,6 +51,7 @@
     expandAll: $('expand-all'),
     collapseAll: $('collapse-all'),
     countAll: $('count-all'),
+    countAi: $('count-ai'),
     countL402: $('count-l402'),
     countAttention: $('count-attention'),
     countPaypal: $('count-paypal'),
@@ -56,6 +60,7 @@
     statEvents: $('stat-events'),
     statSeq: $('stat-seq'),
     statErrors: $('stat-errors'),
+    statTokens: $('stat-tokens'),
     statLast: $('stat-last'),
     statPaused: $('stat-paused'),
     buffer: $('stream-buffer'),
@@ -73,6 +78,14 @@
     agentBid: $('agent-bid'),
     agentCreative: $('agent-creative'),
     agentScore: $('agent-score'),
+    aiState: $('ai-state'),
+    aiProvider: $('ai-provider'),
+    aiModel: $('ai-model'),
+    aiVerdict: $('ai-verdict'),
+    aiRelevance: $('ai-relevance'),
+    aiTokens: $('ai-tokens'),
+    aiLatency: $('ai-latency'),
+    aiThought: $('ai-thought'),
     l402State: $('l402-state'),
     l402Offer: $('l402-offer'),
     l402Context: $('l402-context'),
@@ -94,8 +107,11 @@
     payoutRefresh: $('payout-refresh'),
     payoutNote: $('payout-note'),
     paypalPayable: $('paypal-payable'),
+    paypalCarry: $('paypal-carry'),
     paypalThreshold: $('paypal-threshold'),
     paypalPublisher: $('paypal-publisher'),
+    statReaders: $('stat-readers'),
+    statAccounting: $('stat-accounting'),
     paypalDashboard: $('paypal-dashboard'),
     solanaState: $('solana-state'),
     solanaBalance: $('solana-balance'),
@@ -133,7 +149,8 @@
     filter: 'all',
     paused: false,
     pending: [],
-    counts: { all: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 },
+    counts: { all: 0, ai: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 },
+    ai: { calls: 0, tokens: 0 },
     errors: 0,
     seq: 0,
     lastAt: null,
@@ -223,6 +240,8 @@
       els.statSeq.textContent = `seq ${state.seq}`;
     }
     if (hello.toolkit) applyToolkit(hello.toolkit, hello.autoPayout);
+    if (hello.cognition) applyCognitionProfile(hello.cognition);
+    if (hello.presence) applyPresence(hello.presence);
     setConnection('live', 'streaming');
   }
 
@@ -246,6 +265,20 @@
       els.toolkitAuto,
       autoPayout === false ? 'off · manual only' : 'on · after each settled invoice'
     );
+  }
+
+  /**
+   * Provider badge from the SSE hello, so the cognition card names the reasoner
+   * before the first impression arrives.
+   */
+  function applyCognitionProfile(profile) {
+    if (!profile) return;
+    setText(els.aiProvider, profile.provider || '—');
+    setText(els.aiModel, profile.model || '—');
+    els.aiState.textContent = profile.hosted ? 'hosted model' : 'local reasoner';
+    els.aiState.className = `card-tag ${profile.hosted ? 'is-live' : ''}`.trim();
+    els.aiState.title = profile.degraded && profile.reason ? profile.reason : '';
+    if (profile.localReasoner) els.aiThought.title = profile.localReasoner;
   }
 
   function setConnection(mode, label) {
@@ -299,6 +332,7 @@
 
   function updateCounters() {
     els.countAll.textContent = String(state.counts.all);
+    if (els.countAi) els.countAi.textContent = String(state.counts.ai);
     els.countL402.textContent = String(state.counts.l402);
     els.countAttention.textContent = String(state.counts.attention);
     els.countPaypal.textContent = String(state.counts.paypal);
@@ -308,6 +342,9 @@
     els.statEvents.textContent = `${state.counts.all} event${state.counts.all === 1 ? '' : 's'}`;
     els.statSeq.textContent = `seq ${state.seq}`;
     els.statErrors.textContent = `${state.errors} error${state.errors === 1 ? '' : 's'}`;
+    if (els.statTokens) {
+      els.statTokens.textContent = `${state.ai.tokens} tokens · ${state.ai.calls} agent calls`;
+    }
     els.statLast.textContent = state.lastAt ? formatClock(state.lastAt, true) : '—';
     els.buffer.textContent = `${state.events.length} events`;
   }
@@ -359,17 +396,26 @@
     return '€';
   }
 
+  /** Stages whose payload is agent cognition rather than protocol mechanics. */
+  const AI_STAGES = new Set(['agent.reasoning', 'agent.bid', 'agent.attention']);
+
+  function isAiEvent(event) {
+    return AI_STAGES.has(String(event.stage || '')) || Boolean(event.data?.cognition);
+  }
+
   function appendRow(event, category) {
     const placeholder = els.stream.querySelector('.empty');
     if (placeholder) placeholder.remove();
 
     const money = isMoneyEvent(event);
+    const ai = isAiEvent(event);
 
     const row = document.createElement('article');
     row.className = 'entry is-open';
     row.dataset.cat = category;
     row.dataset.level = event.level === 'error' || event.level === 'warn' ? event.level : 'info';
     if (money) row.dataset.money = 'true';
+    if (ai) row.dataset.ai = 'true';
 
     const head = document.createElement('header');
     head.className = 'entry-head';
@@ -384,12 +430,13 @@
 
     head.append(seq, time, stage);
     if (money) head.append(span('entry-money', moneyGlyph(event)));
+    if (ai) head.append(span('entry-ai', 'AI'));
     head.append(title, source, caret);
     head.addEventListener('click', () => row.classList.toggle('is-open'));
 
     const detail = document.createElement('p');
     detail.className = 'entry-detail';
-    detail.textContent = String(event.detail || '').slice(0, 400);
+    detail.textContent = String(event.detail || '').slice(0, ai ? 700 : 400);
 
     const json = document.createElement('pre');
     json.className = 'entry-json';
@@ -397,6 +444,12 @@
 
     row.append(head);
     if (event.detail) row.append(detail);
+
+    const cognition = event.data && event.data.cognition;
+    if (cognition) {
+      row.append(buildThoughtBlock(cognition));
+    }
+
     row.append(json);
 
     els.stream.append(row);
@@ -424,6 +477,46 @@
     node.className = className;
     node.textContent = text;
     return node;
+  }
+
+  /**
+   * The agent's step trace, rendered as a compact ordered list above the JSON.
+   *
+   * This is the part a judge reads: every line is one decision the agent took,
+   * followed by the provider, token cost and latency that produced it.
+   */
+  function buildThoughtBlock(cognition) {
+    const block = document.createElement('div');
+    block.className = 'entry-thought';
+
+    const meta = document.createElement('p');
+    meta.className = 'thought-meta';
+    const usage = cognition.usage || {};
+    const parts = [
+      `${cognition.provider}/${cognition.model}`,
+      `${usage.promptTokens ?? 0} prompt + ${usage.completionTokens ?? 0} completion tok${usage.estimated ? ' (est)' : ''}`,
+      `${cognition.latencyMs ?? 0} ms`
+    ];
+    if (cognition.fallback) {
+      parts.push(
+        `fallback from ${cognition.fallbackProvider || 'hosted'}${cognition.fallbackModel ? `/${cognition.fallbackModel}` : ''}`
+      );
+    }
+    if (cognition.disagreement) parts.push('model disagreed · heuristic authoritative');
+    if (cognition.confidence != null) parts.push(`confidence ${cognition.confidence}`);
+    meta.textContent = parts.join(' · ');
+    block.append(meta);
+
+    const list = document.createElement('ol');
+    list.className = 'thought-steps';
+    for (const step of (Array.isArray(cognition.steps) ? cognition.steps : []).slice(0, 8)) {
+      const item = document.createElement('li');
+      item.textContent = String(step);
+      list.append(item);
+    }
+    if (list.childElementCount > 0) block.append(list);
+
+    return block;
   }
 
   /**
@@ -545,6 +638,10 @@
   function index(event, category) {
     const data = event.data && typeof event.data === 'object' ? event.data : {};
 
+    if (category === 'ai') {
+      indexCognition(event, data);
+    }
+
     if (category === 'attention') {
       indexAttention(event, data);
     }
@@ -594,8 +691,72 @@
     }
   }
 
-  function indexAttention(event, data) {
-    const value =
+  /**
+   * Agent cognition card.
+   *
+   * Fed only by events that carry a `cognition` envelope, so the panel can never
+   * display a thought that no agent actually produced.
+   */
+  function indexCognition(event, data) {
+    const cognition = data.cognition;
+    if (!cognition) return;
+
+    state.ai.calls += 1;
+    state.ai.tokens += Number(cognition.usage?.totalTokens) || 0;
+
+    setText(els.aiProvider, cognition.provider || '—');
+    setText(els.aiModel, cognition.model || '—');
+    setText(
+      els.aiTokens,
+      `${state.ai.tokens} tok · ${state.ai.calls} call${state.ai.calls === 1 ? '' : 's'}`
+    );
+    setText(
+      els.aiLatency,
+      Number.isFinite(Number(cognition.latencyMs)) ? `${cognition.latencyMs} ms` : '—'
+    );
+
+    const hosted = cognition.hosted === true;
+    els.aiState.textContent = cognition.fallback
+      ? 'fallback'
+      : cognition.degraded
+        ? 'degraded'
+        : hosted
+          ? 'hosted model'
+          : 'local reasoner';
+    els.aiState.className =
+      `card-tag ${cognition.fallback || cognition.degraded ? 'is-warn' : hosted ? 'is-live' : ''}`.trim();
+    els.aiState.title = cognition.fallbackReason || '';
+
+    if (event.stage === 'agent.attention') {
+      const confidence = Number(data.confidence);
+      setText(
+        els.aiVerdict,
+        `${data.verdict || 'unknown'}${Number.isFinite(confidence) ? ` · ${Math.round(confidence * 100)}%` : ''}`
+      );
+      els.aiVerdict.className = data.approved ? 'ai-good' : 'ai-bad';
+      setText(els.aiThought, String(data.narrative || ''));
+      return;
+    }
+
+    if (event.stage === 'agent.reasoning') {
+      const bids = Array.isArray(data.bids) ? data.bids : [];
+      const winner = bids.find((bid) => bid.agentId === data.winnerId);
+      // The verdict field belongs to the attention agent; the auction only
+      // updates relevance, so "human · 99%" is never overwritten by "5/5 bidding".
+      if (winner) {
+        setText(els.aiRelevance, `${Number(winner.relevance).toFixed(2)} · ${winner.sponsor}`);
+        els.aiRelevance.title = `${bids.filter((b) => b.verdict === 'bid').length}/${bids.length} agents bidding`;
+      }
+      return;
+    }
+
+    if (event.stage === 'agent.bid') {
+      setText(els.aiRelevance, `${Number(data.relevance).toFixed(2)} · ${data.sponsor}`);
+      setText(els.aiThought, String(data.rationale || ''));
+    }
+  }
+
+  function indexAttention(event, data) {    const value =
       event.stage === 'attention'
         ? Number(data.attention)
         : event.stage === 'score'
@@ -1079,6 +1240,55 @@
     updatePayoutButton();
   }
 
+  /**
+   * Reader presence.
+   *
+   * The server only sells an impression when a visible session is alive, so
+   * this is the one number that explains a quiet terminal: no readers means
+   * nothing should be happening, and nothing is.
+   */
+  function applyPresence(presence) {
+    if (!presence) return;
+    const live = Number(presence.live) || 0;
+    if (els.statReaders) {
+      els.statReaders.textContent = `${live} reader${live === 1 ? '' : 's'}`;
+      els.statReaders.title =
+        live > 0
+          ? `${live} live /demo/ session${live === 1 ? '' : 's'} (ttl ${presence.ttlMs} ms). No session, no impression, no payout.`
+          : 'No live /demo/ session. The simulator will not sell an impression or move money.';
+    }
+  }
+
+  /**
+   * The 1:1 accounting check, from the server's own audit.
+   *
+   * `splitIsExact` is structural (reader + publisher === gross for every
+   * impression); `ratioWithinOneCent` is the cumulative 70/30 test. Both must
+   * hold for the badge to read "exact".
+   */
+  function applyAccounting(accounting) {
+    if (!accounting) return;
+    const inv = accounting.invariants || {};
+    const balanced =
+      inv.splitIsExact === true &&
+      inv.readerConserved === true &&
+      inv.publisherConserved === true &&
+      inv.ratioWithinOneCent === true;
+
+    if (els.statAccounting) {
+      const paid = Number(accounting.grossPaid) || 0;
+      els.statAccounting.textContent = balanced
+        ? `70/30 · exact · €${paid.toFixed(2)} settled`
+        : `70/30 · drift ${Number(inv.readerDriftCents) || 0}¢`;
+      els.statAccounting.title =
+        `accrued €${(Number(accounting.grossAccrued) || 0).toFixed(4)} · ` +
+        `reader €${(Number(accounting.readerPaid) || 0).toFixed(4)} / ` +
+        `publisher €${(Number(accounting.publisherPaid) || 0).toFixed(4)} · ` +
+        `carried €${(Number(accounting.grossCarried) || 0).toFixed(4)} · ` +
+        `fees ${accounting.fees?.model || 'sender-pays'} (deducted from split: ${accounting.fees?.deductedFromSplit ?? 0})`;
+    }
+  }
+
   async function refreshBalance() {
     try {
       const response = await fetch('/api/balance', { cache: 'no-store' });
@@ -1095,6 +1305,8 @@
         }
       }
       renderBalance(data.user?.balance, data.publisher?.balance);
+      applyPresence(data.presence);
+      applyAccounting(data.accounting);
       if (data.solana) applySolanaProfile(data.solana);
       if (data.payoutRail) {
         state.rail = data.payoutRail === 'solana-devnet' ? 'solana-devnet' : 'paypal_payouts';
@@ -1143,13 +1355,25 @@
 
     if (els.paypalPayable) els.paypalPayable.textContent = euro2(payable);
     if (els.paypalThreshold) els.paypalThreshold.textContent = euro(state.threshold);
+    // The balance minus what a whole-cent rail can carry. This is the half cent
+    // a €0.05 impression leaves behind, shown instead of silently vanishing.
+    if (els.paypalCarry) {
+      els.paypalCarry.textContent = euro(Math.max(0, state.balance - payable));
+      els.paypalCarry.title =
+        'Sub-cent remainder held on the ledger: PayPal settles in whole cents, so it moves with the next batch.';
+    }
 
     els.payoutRequest.disabled = !ready || state.payoutBusy;
     els.payoutRequest.textContent = state.payoutBusy
       ? (onChain ? 'Submitting to devnet…' : 'Contacting PayPal…')
       : ready
         ? (onChain ? `Settle ${euro2(payable)} on Solana` : `Settle ${euro2(payable)} to PayPal`)
-        : `Payout · ${euro(missing)} to go`;
+        // Below the threshold, say how far there is to go. At/above it but
+        // with a sub-cent carry, "€0.000 to go" would be a lie: the blocker is
+        // the half cent a 2-decimal rail cannot express, not the threshold.
+        : missing > 1e-9
+          ? `Payout · ${euro(missing)} to go`
+          : `Sub-cent carry · ${euro(Math.max(0, state.balance - payable))} held`;
 
     if (els.payoutSolana) {
       // The devnet rail pays in integer base units, so the payable amount is the
@@ -1343,7 +1567,8 @@
     els.clear.addEventListener('click', () => {
       state.events = [];
       state.pending = [];
-      state.counts = { all: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 };
+      state.counts = { all: 0, ai: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 };
+      state.ai = { calls: 0, tokens: 0 };
       state.errors = 0;
       rebuild();
       updateCounters();
@@ -1392,7 +1617,8 @@
 
     state.events = [];
     state.pending = [];
-    state.counts = { all: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 };
+    state.counts = { all: 0, ai: 0, l402: 0, attention: 0, paypal: 0, solana: 0, negotiation: 0 };
+    state.ai = { calls: 0, tokens: 0 };
     state.errors = 0;
     state.batchId = '';
     state.solanaSignature = '';
@@ -1439,6 +1665,15 @@
     setText(els.agentBid, '—');
     setText(els.agentCreative, '—');
     setText(els.agentScore, '—');
+
+    els.aiState.textContent = 'awaiting';
+    els.aiState.className = 'card-tag';
+    setText(els.aiVerdict, '—');
+    els.aiVerdict.className = '';
+    setText(els.aiRelevance, '—');
+    setText(els.aiTokens, '0 tok · 0 calls');
+    setText(els.aiLatency, '—');
+    setText(els.aiThought, 'No agent thought yet. Hold a placement in view.');
 
     els.l402State.textContent = 'no token';
     els.l402State.className = 'card-tag';

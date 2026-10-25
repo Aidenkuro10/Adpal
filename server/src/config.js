@@ -60,7 +60,7 @@ const solanaUnitsPerEuro = Math.max(
   )
 );
 const defaultOfferPrice = clamp(
-  numberFromEnv('DEFAULT_OFFER_PRICE', 0.02),
+  numberFromEnv('DEFAULT_OFFER_PRICE', 0.05),
   0.001,
   maxOfferPrice
 );

@@ -3282,6 +3282,27 @@ function printBanner(port) {
     `  Payouts    ${config.paypal.mode} · ${config.paypal.receiverEmail}` +
       (paypal.isConfigured() ? '' : ' · credentials missing')
   );
+
+  /*
+   * Webhook environment, stated at boot.
+   *
+   * A Sandbox webhook id and Live credentials (or any other mix) cannot work
+   * together — verification would answer FAILURE for every event, forever, with
+   * nothing in the log explaining it. Printing the mode, host and id presence
+   * together on one line is what makes that mismatch obvious at deploys.
+   */
+  const { webhook } = config.paypal;
+  console.log(
+    `  Webhooks   ${config.paypal.mode} · ${config.paypal.apiBase}` +
+      (webhook.id
+        ? ` · id ${webhook.id.length > 6 ? `${webhook.id.slice(0, 6)}…` : webhook.id}`
+        : ' · PAYPAL_WEBHOOK_ID unset') +
+      (webhook.strict ? ' · strict' : '')
+  );
+  if (!webhook.id) {
+    console.log('             notifications are acknowledged unverified; set PAYPAL_WEBHOOK_ID');
+  }
+
   if (shifted) {
     console.log(`  Note       port ${config.port} was busy, using ${port}`);
     console.log('             (the extension discovers this port automatically)');

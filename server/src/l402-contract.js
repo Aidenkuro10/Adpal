@@ -32,6 +32,8 @@
 
 const { randomUUID } = require('crypto');
 
+const config = require('./config');
+
 const PROTOCOL = 'L402';
 const VERSION = '1.0.0';
 
@@ -59,7 +61,8 @@ const OFFERS = Object.freeze([
     id: 'attention_impression_v1',
     title: 'Human Attention Verification',
     description: '70% reader split / 30% publisher split upon human attention proof',
-    amount: 0.02,
+    // Same price the extension requests: one advertiser bid drives both paths.
+    amount: config.defaultOfferPrice,
     currency: 'EUR',
     payment_methods: Object.freeze(['paypal_payouts'])
   }),

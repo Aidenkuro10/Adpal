@@ -532,6 +532,33 @@ function round2(value) {
 }
 
 /**
+ * Which PayPal environment a notification came from, read from its
+ * `paypal-cert-url` header.
+ *
+ * PayPal serves Sandbox and Live from different hosts, and stamps the
+ * notification with the host that owns the certificate. That makes the header a
+ * reliable signal for the one mistake that is otherwise invisible: a Live
+ * webhook pointed at a Sandbox-configured server (or the reverse). In that case
+ * verification can only ever return FAILURE, which is indistinguishable from a
+ * forged signature — so it is worth detecting explicitly.
+ *
+ * Returns 'unknown' for a missing or unrecognised host, and the caller then
+ * falls through to normal verification rather than guessing.
+ */
+function environmentOfCertUrl(certUrl) {
+  let host = '';
+  try {
+    host = new URL(String(certUrl || '')).hostname.toLowerCase();
+  } catch {
+    return 'unknown';
+  }
+  if (!host) return 'unknown';
+  if (host.includes('sandbox')) return 'sandbox';
+  if (/^(api|api-m)\.paypal\.com$/.test(host)) return 'live';
+  return 'unknown';
+}
+
+/**
  * Verifies an incoming webhook notification with PayPal.
  *
  * PayPal signs the exact bytes it sent. The route keeps the raw buffer for
@@ -560,6 +587,39 @@ async function verifyWebhookSignature({ headers, event }) {
       reason: !isConfigured()
         ? 'PayPal credentials are missing, so the signature could not be verified.'
         : 'PAYPAL_WEBHOOK_ID is not set, so the signature could not be verified.'
+    };
+  }
+
+  /*
+   * Refuse a notification from the other environment before spending a round
+   * trip on it. A Sandbox webhook id is unknown to the Live API and vice versa,
+   * so verification would answer FAILURE and every event would be retried
+   * forever with no hint as to why. Failing closed with the real reason is both
+   * safer and diagnosable.
+   */
+  const notificationEnv = environmentOfCertUrl(headers['paypal-cert-url']);
+  if (notificationEnv !== 'unknown' && notificationEnv !== paypal.mode) {
+    const reason =
+      `This server is configured for ${paypal.mode} (${paypal.apiBase}) but the notification ` +
+      `came from ${notificationEnv} (${String(headers['paypal-cert-url']).trim()}). ` +
+      `Webhook ids and credentials are environment-specific, so it can never verify here.`;
+    publish('paypal.webhook.verify', {
+      level: 'error',
+      title: 'Webhook environment mismatch',
+      detail: reason,
+      data: {
+        serverMode: paypal.mode,
+        apiBase: paypal.apiBase,
+        notificationEnv,
+        certUrl: headers['paypal-cert-url'] || '',
+        webhookId
+      }
+    });
+    return {
+      status: 'failed',
+      attempted: false,
+      reason,
+      environmentMismatch: { server: paypal.mode, notification: notificationEnv }
     };
   }
 
@@ -633,9 +693,11 @@ async function verifyWebhookSignature({ headers, event }) {
   publish('paypal.webhook.verify', {
     level: verified ? 'ok' : 'warn',
     title: verified ? 'Webhook signature verified' : 'Webhook signature rejected',
-    detail: `POST /v1/notifications/verify-webhook-signature · ${verificationStatus}`,
+    detail: `POST /v1/notifications/verify-webhook-signature · ${verificationStatus} · ${paypal.mode}`,
     data: {
-      request: { webhookId, transmissionId: body.transmission_id },
+      // Recording the environment on every check is what makes a mixed
+      // Sandbox/Live configuration visible instead of merely suspected.
+      request: { webhookId, transmissionId: body.transmission_id, apiBase: paypal.apiBase },
       response: { verificationStatus, ...correlationOf(response) }
     }
   });
@@ -656,6 +718,7 @@ module.exports = {
   createPayout,
   getPayout,
   verifyWebhookSignature,
+  environmentOfCertUrl,
   observe,
   PayPalError,
   normalizeBatchStatus

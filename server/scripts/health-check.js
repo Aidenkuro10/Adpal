@@ -40,11 +40,15 @@ async function probe(method, path, { body = null, expect = 200, note = '' } = {}
   } catch {
     payload = text;
   }
-  const ok = response.status === expect;
+  // A route whose correct answer depends on configuration (a webhook is 200
+  // when verification is off and 401 when it is on) declares every acceptable
+  // code; anything else still fails.
+  const accepted = Array.isArray(expect) ? expect : [expect];
+  const ok = accepted.includes(response.status);
   record(
     `${method} ${path}`,
     ok,
-    `${response.status} in ${ms}ms${note ? ` · ${note}` : ''}${ok ? '' : ` · expected ${expect}`}`
+    `${response.status} in ${ms}ms${note ? ` · ${note}` : ''}${ok ? '' : ` · expected ${accepted.join(' or ')}`}`
   );
   return { status: response.status, ms, payload };
 }
@@ -167,33 +171,56 @@ async function probe(method, path, { body = null, expect = 200, note = '' } = {}
   record('server survived an invalid on-chain proof', Boolean(alive));
 
   console.log('\nPayPal webhook route');
+  /*
+   * The correct status here depends on configuration, and that is the point:
+   * with PAYPAL_WEBHOOK_ID set every notification must carry a signature that
+   * PayPal confirms, so an unsigned probe is refused with 401. Without it the
+   * route acknowledges and says `signature: "skipped"`. Both are healthy; a
+   * 404 or 500 is not.
+   */
   const webhook = await probe('POST', '/api/webhooks/paypal', {
     body: {
       id: `WH-HEALTH-${Date.now().toString(36).toUpperCase()}`,
       event_type: 'PAYMENT.PAYOUTS-ITEM.SUCCEEDED',
       resource: { payout_batch_id: 'HEALTH-CHECK-NO-BATCH' }
     },
-    note: 'well-formed event acknowledged'
+    expect: [200, 401],
+    note: 'well-formed event'
   });
-  record(
-    'webhook acknowledges with an explicit outcome',
-    webhook?.payload?.received === true &&
-      ['handled', 'ignored', 'duplicate', 'unmatched'].includes(webhook?.payload?.outcome),
-    `outcome=${webhook?.payload?.outcome} signature=${webhook?.payload?.signature}`
-  );
 
-  // An unknown event type must be acknowledged, not rejected: PayPal retries
-  // every non-2xx forever, so refusing one would be an infinite loop.
+  if (webhook?.status === 401) {
+    record(
+      'unsigned webhook refused while verification is configured',
+      ['WEBHOOK_SIGNATURE_INVALID', 'WEBHOOK_VERIFICATION_UNAVAILABLE'].includes(webhook.payload?.error),
+      `error=${webhook.payload?.error}`
+    );
+  } else {
+    record(
+      'webhook acknowledges with an explicit outcome',
+      webhook?.payload?.received === true &&
+        ['handled', 'ignored', 'duplicate', 'unmatched'].includes(webhook?.payload?.outcome),
+      `outcome=${webhook?.payload?.outcome} signature=${webhook?.payload?.signature}`
+    );
+  }
+
+  // An unknown event type must never be a hard error: PayPal retries every
+  // non-2xx forever, so a type we do not model has to be acknowledged once.
   const unknownEvent = await probe('POST', '/api/webhooks/paypal', {
     body: { id: `WH-HEALTH-UNKNOWN-${Date.now().toString(36).toUpperCase()}`, event_type: 'ADPAL.HEALTH.PROBE' },
+    expect: [200, 401],
     note: 'unknown type is not an outage'
   });
   record(
-    'unknown event type is ignored, not rejected',
-    unknownEvent?.payload?.outcome === 'ignored',
-    `outcome=${unknownEvent?.payload?.outcome}`
+    'unknown event type never becomes a server error',
+    unknownEvent?.status === 401
+      ? unknownEvent.payload?.error === 'WEBHOOK_SIGNATURE_INVALID'
+      : unknownEvent?.payload?.outcome === 'ignored',
+    unknownEvent?.status === 401
+      ? `refused before dispatch (${unknownEvent.payload?.error})`
+      : `outcome=${unknownEvent?.payload?.outcome}`
   );
 
+  // Parsing happens before verification, so this is 400 in every configuration.
   await probe('POST', '/api/webhooks/paypal', {
     body: 'not-an-event',
     expect: 400,

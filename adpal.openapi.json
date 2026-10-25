@@ -650,7 +650,7 @@
             }
           },
           "503": {
-            "description": "Verification is required (strict mode) but could not be attempted.",
+            "description": "Verification is required but could not be performed — either strict mode is on with nothing to verify against, or PayPal's `verify-webhook-signature` call itself failed. The event was *not* evaluated, so this is retryable rather than a rejection.",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" }

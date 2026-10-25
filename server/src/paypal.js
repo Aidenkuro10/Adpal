@@ -543,8 +543,10 @@ function round2(value) {
  * case, because a missing webhook id is a configuration gap, not a failure:
  *
  *   { status: 'verified' }    PayPal confirmed the signature
- *   { status: 'failed'   }    PayPal rejected it — the caller must not trust the event
- *   { status: 'skipped'  }    no credentials or no webhook id; nothing was checked
+ *   { status: 'failed'    }   PayPal rejected it — the caller must not trust the event
+ *   { status: 'unavailable' } the check itself failed (network, 4xx/5xx, outage);
+ *                             the signature is neither trusted nor disproved
+ *   { status: 'skipped'   }   no credentials or no webhook id; nothing was checked
  *
  * @param {{ headers: Record<string, string>, event: object }} input
  */
@@ -597,7 +599,32 @@ async function verifyWebhookSignature({ headers, event }) {
   const data = await readJson(response);
 
   if (!response.ok) {
-    throw errorFromResponse(response, data);
+    /*
+     * A 4xx/5xx from the verification API is not a verdict on the signature —
+     * it means the check could not be performed (bad credentials, an expired
+     * app, a PayPal outage, a proxy). Reporting that as `failed` would answer
+     * 401, which PayPal interprets as "rejected" and retries indefinitely,
+     * while the real cause stays invisible. Return `unavailable` instead so the
+     * route can answer with a retryable status and log the actual error.
+     */
+    const failure = errorFromResponse(response, data);
+    publish('paypal.webhook.verify', {
+      level: 'error',
+      title: 'Webhook verification could not be performed',
+      detail: `POST /v1/notifications/verify-webhook-signature · HTTP ${response.status} · ${failure.message}`,
+      data: {
+        request: { webhookId, transmissionId: body.transmission_id },
+        response: { status: response.status, error: failure.toJSON(), ...correlationOf(response) }
+      }
+    });
+    return {
+      status: 'unavailable',
+      attempted: true,
+      httpStatus: response.status,
+      reason: failure.message,
+      code: failure.code,
+      correlationId: correlationOf(response).correlationId
+    };
   }
 
   const verificationStatus = String(data?.verification_status || 'UNKNOWN').toUpperCase();

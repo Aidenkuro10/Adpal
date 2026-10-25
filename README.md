@@ -1086,10 +1086,37 @@ parser is mounted on this path *before* the JSON parser), so the event is parsed
 from the exact bytes PayPal signed. Verification itself is a round-trip to
 `POST /v1/notifications/verify-webhook-signature` and needs `PAYPAL_WEBHOOK_ID`:
 
-- no id or no credentials → `signature: "skipped"`, event still accepted, so the
-  sandbox demo works out of the box;
-- `PAYPAL_WEBHOOK_STRICT=true` and nothing to verify against → `503`, which is
-  the setting to use anywhere that is not a demo.
+| configuration | unsigned / bad signature | outcome |
+| --- | --- | --- |
+| no id, no credentials | not checked | `200`, `signature: "skipped"` |
+| id configured, PayPal says `FAILURE` | refused | `401` `WEBHOOK_SIGNATURE_INVALID` |
+| id configured, verification API unreachable | held | `503` `WEBHOOK_VERIFICATION_UNAVAILABLE` |
+| `PAYPAL_WEBHOOK_STRICT=true`, nothing to verify against | refused | `503` `WEBHOOK_UNVERIFIED` |
+
+The middle two rows matter operationally. Once an id is configured, *every*
+notification must carry a signature PayPal confirms, so an unsigned request is
+refused — which also means the Postman and health-check probes accept either
+`200` or `401` depending on how the server is configured. And a failure of the
+verification *call* is deliberately not reported as a rejected signature: `401`
+tells PayPal the event is bad and it retries indefinitely, so an outage becomes
+an infinite retry loop with the real cause hidden.
+
+### Seeing webhooks in the logs
+
+The terminal stream (`/terminal/`, `/api/logs`) is an in-memory ring buffer fed
+by SSE — it is **not** stdout. On a hosted platform the log stream is stdout, so
+the server writes an access line for every request, before any route matches:
+
+```
+[http] POST /api/webhooks/paypal → 200 · 118.9ms · paypal-transmission-id=b0f0e0d0-…
+[webhook] · Webhook acknowledged · no matching payout · PAYMENT.PAYOUTS-ITEM.SUCCEEDED · XKGQ3VT6VDJ2Q
+```
+
+If `[http]` shows nothing while PayPal's dashboard reports delivery attempts,
+the request is not reaching this process — check the callback URL registered in
+the PayPal dashboard (it must end in `/api/webhooks/paypal`, not `/api/api/…`),
+that the deployed build contains this route, and that the service is bound to
+the platform's `$PORT`.
 
 ---
 
@@ -1107,7 +1134,7 @@ copy .env.example .env      # Windows (cmd)
 | --- | --- | --- |
 | `NODE_ENV` | *(unset → development)* | `development` serves every view `no-store` with hashed asset URLs; `production` enables `must-revalidate` + validators |
 | `PORT` | `3000` | Preferred Express server port |
-| `PORT_SCAN_RANGE` | `10` | Ports to try (`3001`, `3002`, …) if `PORT` is taken |
+| `PORT_SCAN_RANGE` | `10` | Ports to try (`3001`, `3002`, …) if `PORT` is taken. Ignored when `PORT` is injected by the platform, where the assigned port is not negotiable. The server binds `0.0.0.0` |
 | `PAYOUT_THRESHOLD` | `0.05` | Reader balance that unlocks a PayPal payout, in euros |
 | `MAX_OFFER_PRICE` | `0.05` | Maximum price accepted per offer |
 | `DEFAULT_OFFER_PRICE` | `0.02` | Informational price exposed in the rules |

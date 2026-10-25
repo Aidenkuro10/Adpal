@@ -992,13 +992,15 @@ function buildScenarios() {
     { key: 'GET /api/payout/{id}', label: 'payout status (bad id)', path: () => '/api/payout/not-a-batch-id', expectStatus: [400] },
     {
       key: 'POST /api/webhooks/paypal',
-      label: 'webhook unknown event (acknowledged)',
+      label: 'webhook unknown event (acknowledged or refused)',
       body: {
         id: `WH-VALIDATOR-${Date.now().toString(36).toUpperCase()}`,
         event_type: 'ADPAL.VALIDATOR.PROBE',
         resource: { payout_batch_id: 'NOT-A-BATCH' }
       },
-      expectStatus: [200]
+      // 200 when verification is not configured, 401 when it is and the probe is
+      // unsigned. Both are the documented contract.
+      expectStatus: [200, 401]
     },
     {
       key: 'POST /api/webhooks/paypal',

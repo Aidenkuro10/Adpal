@@ -1,6 +1,16 @@
 'use strict';
 
 const path = require('path');
+
+/*
+ * Captured *before* dotenv runs. A PORT already in the environment came from
+ * the hosting platform (Render, Fly and Railway all inject one), not from
+ * `.env`; dotenv never overwrites an existing variable, so the platform's value
+ * is what ends up in `config.port`. That value is the only port the platform
+ * routes traffic to, so it must never be abandoned for "the next free one".
+ */
+const portFromPlatform = typeof process.env.PORT === 'string' && process.env.PORT.trim() !== '';
+
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 function numberFromEnv(name, fallback) {
@@ -61,6 +71,9 @@ module.exports = Object.freeze({
   // development mode, which serves assets `no-store` (see src/view-assets.js).
   isProduction: process.env.NODE_ENV === 'production',
   port: Math.round(clamp(numberFromEnv('PORT', 3000), 1, 65535)),
+  // True when the port was injected by the platform, in which case it is not
+  // negotiable: see startListening in server.js.
+  portFromPlatform,
   // If the preferred port is taken, the simulator tries the next ones instead
   // of failing to start (useful when a stale process or another app holds it).
   portScanRange: Math.round(clamp(numberFromEnv('PORT_SCAN_RANGE', 10), 1, 100)),

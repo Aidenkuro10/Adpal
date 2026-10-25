@@ -58,6 +58,36 @@ app.set('json spaces', 2);
 app.use(cors());
 
 /*
+ * HTTP access log — this is what "the logs" means on a hosted platform.
+ *
+ * `emit()` below writes to an in-memory ring buffer and pushes to SSE
+ * subscribers; it never touches stdout. That is fine locally, where the
+ * terminal view is the log surface, but on Render/Fly/Railway the log stream is
+ * stdout/stderr. Without this middleware a request leaves no trace there at
+ * all — not a 200, not a 404 from a mistyped path, not a 401 from a rejected
+ * webhook signature — which makes "the webhook never arrived" impossible to
+ * distinguish from "the webhook arrived and was refused".
+ *
+ * Mounted before the body parsers so a request rejected while parsing (413,
+ * 400 on malformed JSON) is still logged, and written on `finish` so it fires
+ * for every response, including ones that never reach a route.
+ */
+app.use((req, res, next) => {
+  const startedAt = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    // PayPal's transmission id is the only identifier that lets an operator
+    // line a log entry up with the event in the PayPal dashboard.
+    const transmissionId = req.get('paypal-transmission-id');
+    console.log(
+      `[http] ${req.method} ${req.originalUrl} → ${res.statusCode} · ${ms.toFixed(1)}ms` +
+        (transmissionId ? ` · paypal-transmission-id=${transmissionId}` : '')
+    );
+  });
+  next();
+});
+
+/*
  * PayPal signs the exact bytes it sent, so the webhook route needs the raw
  * buffer, not a re-serialised object. Mounting a raw parser on that path before
  * the global JSON parser means `express.json()` sees `req._body` already set and
@@ -1378,6 +1408,23 @@ function rememberWebhookEvent(id, record) {
 }
 
 /**
+ * Records a webhook decision in both log surfaces.
+ *
+ * The SSE terminal is the local log surface; stdout is the one a hosting
+ * platform keeps. A webhook that only reaches the former is invisible in
+ * exactly the place an operator looks when PayPal's dashboard says the event
+ * was delivered — so every path here, including the refusals, writes a line.
+ */
+function reportWebhook(event) {
+  telemetry.emit(event);
+  const marker = event.level === 'error' ? '!' : event.level === 'warn' ? '~' : '·';
+  console.log(`[webhook] ${marker} ${event.title} · ${event.detail}`);
+  if (event.level === 'error' && event.data) {
+    console.error(`[webhook]   ${JSON.stringify(event.data)}`);
+  }
+}
+
+/**
  * POST /api/webhooks/paypal — asynchronous payout notifications.
  *
  * Acknowledging matters as much as processing: PayPal retries anything that is
@@ -1396,7 +1443,7 @@ async function handlePaypalWebhook(req, res) {
     : Buffer.from(typeof req.body === 'string' ? req.body : '', 'utf8');
 
   if (raw.length === 0) {
-    emit({
+    reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'error',
@@ -1411,7 +1458,7 @@ async function handlePaypalWebhook(req, res) {
   try {
     event = JSON.parse(raw.toString('utf8'));
   } catch (error) {
-    emit({
+    reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'error',
@@ -1447,17 +1494,44 @@ async function handlePaypalWebhook(req, res) {
   try {
     signature = await paypal.verifyWebhookSignature({ headers: req.headers, event });
   } catch (error) {
-    // A PayPal outage must not turn into "trust everything". Record it as a
-    // failed verification and let the policy below decide.
+    /*
+     * The verification call itself blew up (DNS, timeout, an unexpected throw).
+     * That is emphatically not proof of a forged signature: `unavailable` keeps
+     * it distinct from `failed`, so the route answers with a retryable status
+     * instead of a 401 that would make PayPal's retry think it was rejected.
+     */
     signature = {
-      status: 'failed',
+      status: 'unavailable',
       attempted: true,
       reason: error?.message || 'Signature verification could not be completed.'
     };
   }
 
+  if (signature.status === 'unavailable') {
+    reportWebhook({
+      stage: 'paypal.webhook',
+      source: 'paypal.webhook',
+      level: 'error',
+      title: 'Webhook held · verification service unavailable',
+      detail: `${eventType} · ${signature.reason || 'verification could not be performed'}`,
+      data: {
+        eventId,
+        eventType,
+        code: 'WEBHOOK_VERIFICATION_UNAVAILABLE',
+        httpStatus: signature.httpStatus ?? null,
+        paypalCode: signature.code || null
+      }
+    });
+    // 503 is retryable on purpose: the event is probably genuine, we simply
+    // could not prove it. Dropping it with a 401 would lose a real notification.
+    return res.status(503).json({
+      error: 'WEBHOOK_VERIFICATION_UNAVAILABLE',
+      message: signature.reason || 'Signature verification could not be performed.'
+    });
+  }
+
   if (signature.status === 'failed') {
-    emit({
+    reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'error',
@@ -1472,7 +1546,7 @@ async function handlePaypalWebhook(req, res) {
   }
 
   if (signature.status === 'skipped' && config.paypal.webhook.strict) {
-    emit({
+    reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'error',
@@ -1489,7 +1563,7 @@ async function handlePaypalWebhook(req, res) {
   // --- replay guard -------------------------------------------------
   if (eventId && seenWebhookEvents.has(eventId)) {
     const prior = seenWebhookEvents.get(eventId);
-    emit({
+    reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'info',
@@ -1549,7 +1623,7 @@ async function handlePaypalWebhook(req, res) {
     outcome = 'unmatched';
   }
 
-  emit({
+  reportWebhook({
     stage: 'paypal.webhook',
     source: 'paypal.webhook',
     level: outcome === 'handled' ? 'ok' : outcome === 'unmatched' ? 'warn' : 'info',
@@ -3133,7 +3207,15 @@ process.on('unhandledRejection', (reason) => {
  * terminal still holds it), so it must never crash the process.
  */
 function startListening(preferredPort, attempt = 0) {
-  const server = app.listen(preferredPort);
+  /*
+   * Bind every interface explicitly.
+   *
+   * `app.listen(port)` alone usually binds `::`, but a host that resolves to
+   * loopback only is unreachable from the platform's reverse proxy — every
+   * request, webhooks included, dies before it can be logged. Naming 0.0.0.0
+   * removes that failure mode entirely.
+   */
+  const server = app.listen(preferredPort, '0.0.0.0');
   let started = false;
 
   server.once('listening', () => {
@@ -3150,8 +3232,16 @@ function startListening(preferredPort, attempt = 0) {
     }
 
     const nextPort = preferredPort + 1;
+    /*
+     * Never scan when the platform assigned the port. Render routes traffic to
+     * exactly $PORT; moving to $PORT+1 would leave the service listening on a
+     * port nothing can reach, so every request — PayPal's webhooks included —
+     * would vanish with no log line anywhere. Failing loudly is the correct
+     * outcome there, because the platform will restart the dyno.
+     */
     const canRetry =
       error.code === 'EADDRINUSE' &&
+      !config.portFromPlatform &&
       attempt < config.portScanRange &&
       nextPort <= 65535;
 
@@ -3163,8 +3253,11 @@ function startListening(preferredPort, attempt = 0) {
 
     if (error.code === 'EADDRINUSE') {
       console.error(
-        `\n[AdPal] Ports ${config.port}-${preferredPort} are all in use.` +
-        '\nStop the process holding them, or set PORT / PORT_SCAN_RANGE in server/.env.\n'
+        config.portFromPlatform
+          ? `\n[AdPal] Port ${preferredPort} (assigned by the platform) is already in use.` +
+            '\nThe port is not negotiable when PORT comes from the environment; refusing to bind elsewhere.\n'
+          : `\n[AdPal] Ports ${config.port}-${preferredPort} are all in use.` +
+            '\nStop the process holding them, or set PORT / PORT_SCAN_RANGE in server/.env.\n'
       );
       process.exit(1);
     }

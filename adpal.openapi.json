@@ -1,0 +1,2294 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AdPal API",
+    "version": "1.0.0",
+    "description": "Attention-billing protocol simulator with two settlement rails.\n\n## What this API is\n\nA reader earns attention credit, an advertiser pays for verified impressions, and the credit is split 70/30 between reader and publisher. Settlement happens on **PayPal Sandbox Payouts** or **Solana Devnet**; both rails share the same ledger reservation, the same threshold and the same split.\n\n## The L402 handshake\n\nThe paid resource is guarded by an L402 challenge rather than a session cookie:\n\n1. `GET /api/l402/offer` returns **402** with the offer catalogue and a challenge binding `sha256(preimage)`.\n2. `POST /api/l402/challenge` starts an explicit negotiation and returns a fresh `payment_context_token` plus the same kind of challenge.\n3. `POST /api/l402/settle` submits the attention proof. The proof is scored, the ledger is credited 70/30, and a macaroon is minted.\n4. `GET /api/l402/offer` with `Authorization: Bearer <macaroon>` returns **200** with the paid impression.\n\nOn the Solana rail the same 32-byte hash is anchored on-chain as a memo, so the invoice becomes publicly verifiable — see `POST /api/l402/solana/confirm`.\n\n## Status codes that are not errors\n\nThree responses deliberately use non-2xx codes to mean something other than failure:\n\n| Code | Where | Meaning |\n|---|---|---|\n| **402** | `GET /api/l402/offer`, `POST /api/l402/challenge` | A payment challenge, not a failure |\n| **402** | `POST /api/l402/solana/confirm` | The proof did not verify |\n| **409** | `POST /api/payout` | Balance below the payout threshold |\n\n## Devnet funding\n\nThe Solana treasury needs devnet SOL to anchor proofs and to transfer. When the public faucet is rate-limited the rail degrades honestly: the receipt records `anchor.status = \"unfunded\"`, and a Solana payout falls back to PayPal with an explicit `fallback` block rather than silently changing rails. Fund the treasury using the `faucetUrl` from `GET /api/solana`.",
+    "contact": {
+      "name": "AdPal",
+      "url": "https://github.com/adpal"
+    },
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local simulator. Start it with `cd server && npm start`."
+    }
+  ],
+  "tags": [
+    {
+      "name": "Discovery",
+      "description": "Liveness, capability and ledger inspection. Safe to poll."
+    },
+    {
+      "name": "Solana Rail",
+      "description": "The Devnet wallet profile, live balances and faucet help."
+    },
+    {
+      "name": "L402 Protocol",
+      "description": "Challenge, settle, unlock, and on-chain verification. The requests in this tag are stateful and must be used in order."
+    },
+    {
+      "name": "Payouts",
+      "description": "Move the accumulated 70/30 credit to a rail. Both rails share the threshold and the split."
+    },
+    {
+      "name": "Webhooks",
+      "description": "Inbound PayPal notifications. Unlike every other operation here, these are called by PayPal, not by a client."
+    },
+    {
+      "name": "Maintenance",
+      "description": "Destructive development helpers. Never expose these in a deployment."
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Discovery"],
+        "summary": "Liveness and capability summary",
+        "description": "Reports whether the process is up, which payout rail is active, and whether the PayPal and Solana rails are configured. The quickest way to tell a misconfigured `.env` from a dead process.",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "The simulator is up.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/toolkit": {
+      "get": {
+        "tags": ["Discovery"],
+        "summary": "PayPal Agent Toolkit capability profile",
+        "description": "Returns what the vendored Agent Toolkit ships (`tools`) and what this server actually bound (`callable`). The two lists agreeing is the point: it proves the toolkit was read from disk rather than hard-coded.",
+        "operationId": "getToolkit",
+        "responses": {
+          "200": {
+            "description": "Toolkit profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Toolkit" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents": {
+      "get": {
+        "tags": ["Discovery"],
+        "summary": "Advertiser roster and rail readiness",
+        "description": "The advertiser rotation with per-campaign budgets, plus the rail readiness block that drives the payout controls in the terminal.",
+        "operationId": "listAgents",
+        "responses": {
+          "200": {
+            "description": "Roster and rails.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Agents" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/balance": {
+      "get": {
+        "tags": ["Discovery"],
+        "summary": "Ledger snapshot",
+        "description": "Balances, rules, counters, recent offers, payout history and the redacted PayPal and Solana profiles.",
+        "operationId": "getBalance",
+        "responses": {
+          "200": {
+            "description": "Current ledger state.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Balance" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/telemetry": {
+      "get": {
+        "tags": ["Discovery"],
+        "summary": "Bounded telemetry history",
+        "description": "The in-memory event ring buffer used by the terminal inspector. Poll this instead of holding the `/api/logs` stream open.",
+        "operationId": "getTelemetry",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of events to return.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 120 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event history plus the current configuration.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Telemetry" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/solana": {
+      "get": {
+        "tags": ["Solana Rail"],
+        "summary": "Devnet rail profile and live balances",
+        "description": "Treasury, reader and publisher wallet addresses, the integer base-unit rate, live cluster balances and funding help.\n\n`balances.treasury = 0` means on-chain anchoring and Solana payouts will report `unfunded` until the treasury is funded.",
+        "operationId": "getSolanaProfile",
+        "responses": {
+          "200": {
+            "description": "Rail profile, balances and endpoints.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/solana/fund": {
+      "post": {
+        "tags": ["Solana Rail"],
+        "summary": "Request devnet SOL for the treasury",
+        "description": "Asks the devnet faucet for SOL. Manual by design: the public faucet is rate-limited per IP, so calling it on every settlement would only produce a wall of 429s.\n\nA failure here is not fatal — an unfunded treasury is a supported state, and the API reports it explicitly instead of stalling.",
+        "operationId": "fundSolanaTreasury",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SolanaFundRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Treasury funded.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaFundResult" }
+              }
+            }
+          },
+          "502": {
+            "description": "The faucet or the RPC refused the request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaFundError" }
+              }
+            }
+          },
+          "503": {
+            "description": "The public faucet is rate-limited. The body names the address to fund manually.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaFundError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/offer": {
+      "get": {
+        "tags": ["L402 Protocol"],
+        "summary": "The gated paid resource",
+        "description": "Without a macaroon this returns **402 Payment Required** with the offer catalogue and a challenge binding `sha256(preimage)`. With `Authorization: Bearer <macaroon>` it returns **200** and the paid impression.\n\nBoth outcomes are documented because both are correct — the difference is the credential, not the request.",
+        "operationId": "getL402Offer",
+        "security": [{}, { "L402Bearer": [] }],
+        "parameters": [
+          {
+            "name": "offer_id",
+            "in": "query",
+            "required": false,
+            "description": "Select a specific offer. Defaults to `attention_impression_v1`.",
+            "schema": { "type": "string", "example": "attention_session_v1" }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": false,
+            "description": "Alternative to the `Authorization` header for clients that cannot set headers.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "publisher",
+            "in": "query",
+            "required": false,
+            "description": "Publisher name recorded on the receipt.",
+            "schema": { "type": "string", "example": "localhost" }
+          },
+          {
+            "name": "page_title",
+            "in": "query",
+            "required": false,
+            "description": "Page title recorded on the receipt.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A valid macaroon was presented; the paid impression is returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402UnlockedResource" }
+              }
+            }
+          },
+          "402": {
+            "description": "No valid credential. The body is the L402 contract: offers, price and a challenge.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402Contract" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/challenge": {
+      "post": {
+        "tags": ["L402 Protocol"],
+        "summary": "Start an explicit L402 negotiation",
+        "description": "Mints a fresh negotiation context and replies **402** with a new `payment_context_token` and a challenge. The payment hash in this response is the one the eventual macaroon commits to — that binding is what makes this a real challenge rather than a decorative header.",
+        "operationId": "createL402Challenge",
+        "x-adpal-success-codes": [402],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/L402ChallengeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Unknown `offer_id`.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "402": {
+            "description": "A fresh challenge. Not an error.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402Contract" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/settle": {
+      "post": {
+        "tags": ["L402 Protocol"],
+        "summary": "Settle an invoice with an attention proof",
+        "description": "Scores the attention signals, and if they clear the human threshold credits the ledger 70/30 and mints a bearer macaroon.\n\n**This endpoint does not choose a payout rail.** Settlement queues an automatic payout on the server's configured `PAYOUT_RAIL`. Use `POST /api/payout` to name a rail explicitly.\n\nThe request is idempotent per `payment_context_token`: replaying a settled context returns the same receipt instead of charging twice.",
+        "operationId": "settleL402",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/L402SettleRequest" },
+              "example": {
+                "payment_context_token": "14922c35-ecee-494e-ae4a-039d1cb7566e",
+                "offer_id": "attention_session_v1",
+                "attention": {
+                  "signals": {
+                    "durationMs": 7600,
+                    "pageDwellMs": 15400,
+                    "mouseMoves": 96,
+                    "directionChanges": 21,
+                    "scrollEvents": 14,
+                    "scrollDepth": 0.72,
+                    "clicks": 2,
+                    "keyPresses": 8,
+                    "visibleRatio": 0.94,
+                    "focusRatio": 0.88,
+                    "slotVisibleRatio": 0.91,
+                    "webdriver": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payment settled, macaroon minted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402Settlement" }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed `payment_context_token`.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "402": {
+            "description": "The attention proof did not clear the threshold, the advertiser budget is exhausted, or the context expired. The body explains which.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402SettleRejection" }
+              }
+            }
+          },
+          "500": {
+            "description": "The offer catalogue is inconsistent. A server-side bug.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/sessions": {
+      "get": {
+        "tags": ["L402 Protocol"],
+        "summary": "Recent negotiation contexts",
+        "description": "The same context list the terminal inspector renders: state, attempt count, macaroon and settlement receipt per negotiation.",
+        "operationId": "listL402Sessions",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of contexts to return.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Offer catalogue, counters and recent contexts.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402Sessions" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/receipt/{token}": {
+      "get": {
+        "tags": ["L402 Protocol"],
+        "summary": "Receipt for a negotiation context",
+        "description": "Resolve a `payment_context_token` to its full context, including the settlement receipt when the invoice has been paid.",
+        "operationId": "getL402Receipt",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "description": "The `payment_context_token` returned by the challenge.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The context and the current ledger snapshot.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/L402ReceiptResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "No context exists for this token.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/l402/solana/confirm": {
+      "post": {
+        "tags": ["L402 Protocol"],
+        "summary": "Verify a Solana transaction against the invoice",
+        "description": "Re-reads a transaction from Devnet and checks it against the settled invoice: existence, confirmation status, the memo binding to `sha256(preimage)`, the recipient wallet, and the exact base-unit amount.\n\nThe signature is validated locally first — a 64-character base58 string that decodes to the wrong number of bytes is rejected as a format failure instead of reaching the RPC and surfacing as a `WrongSize` error.\n\nEvery rejection returns **402** with a per-check breakdown, so a caller always knows *which* property failed.",
+        "operationId": "confirmSolanaProof",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SolanaConfirmRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Every check passed; the transaction is bound to this invoice.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaConfirmResult" }
+              }
+            }
+          },
+          "400": {
+            "description": "The signature is missing or the context token is malformed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "402": {
+            "description": "The transaction did not verify. `checks` names the failing property.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaConfirmResult" }
+              }
+            }
+          },
+          "404": {
+            "description": "The `payment_context_token` is unknown.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "409": {
+            "description": "This signature has already been consumed by an earlier confirmation. Replay is refused.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SolanaConfirmResult" }
+              }
+            }
+          },
+          "429": {
+            "description": "The Devnet RPC is rate-limiting reads. Retry with backoff.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/payout": {
+      "post": {
+        "tags": ["Payouts"],
+        "summary": "Move the accumulated credit to a rail",
+        "description": "Reserves the reader and publisher balances and settles them on the requested rail. Both rails enforce the same threshold and the same 70/30 split; only the settlement call differs.\n\n**PayPal** moves two Payouts items (reader 70%, publisher 30%).\n\n**Solana** moves one atomic devnet transaction: two transfers plus a memo committing to the payout reference and the L402 hash. One transaction means both legs succeed or neither does, and integer base units mean the split cannot drift.\n\nWhen the treasury is unfunded and `SOLANA_FALLBACK_TO_PAYPAL=true`, the response reports `requestedRail` plus a `fallback` block. A caller that asked for Solana never has to infer from a PayPal batch id that the rail changed.",
+        "operationId": "createPayout",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PayoutRequest" },
+              "example": { "rail": "solana-devnet", "reason": "postman-suite" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Payout settled on a rail.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutResult" }
+              }
+            }
+          },
+          "409": {
+            "description": "The reader balance is below the payout threshold. `missing` is the exact shortfall.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutThresholdError" }
+              }
+            }
+          },
+          "503": {
+            "description": "The requested rail is not configured, so no money moved.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutRailError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/payout/{id}": {
+      "get": {
+        "tags": ["Payouts"],
+        "summary": "Read a payout back from the rail",
+        "description": "Accepts either a PayPal batch id or a Solana transaction signature and asks the rail for its current status. The prefix determines which rail is queried.",
+        "operationId": "getPayout",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "A PayPal batch id, or a base58 Solana transaction signature.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rail-reported status.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutStatus" }
+              }
+            }
+          },
+          "400": {
+            "description": "The id does not look like a batch id for this rail.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutStatusError" }
+              }
+            }
+          },
+          "404": {
+            "description": "The rail does not know this id.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutStatusError" }
+              }
+            }
+          },
+          "502": {
+            "description": "The rail's API failed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutStatusError" }
+              }
+            }
+          },
+          "503": {
+            "description": "The Solana rail is disabled.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PayoutStatusError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/webhooks/paypal": {
+      "post": {
+        "tags": ["Webhooks"],
+        "summary": "Receive a PayPal payout notification",
+        "description": "PayPal calls this after a payout item changes state. It is the only route in this API a client never calls.\n\n**Acknowledging is part of the contract.** PayPal retries anything that is not a 2xx, so a well-formed event that this simulator chooses not to act on must still return **200** or it will be redelivered indefinitely. The `outcome` field says what happened:\n\n| outcome | meaning |\n|---|---|\n| `handled` | the ledger was updated |\n| `ignored` | a known event type with nothing to apply, or an event type this simulator does not model |\n| `duplicate` | the event id was already processed, or the payout was already reversed |\n| `unmatched` | well-formed, but no ledger record matches the batch id (e.g. after a restart) |\n\nOnly three responses are refusals: an unparseable body is **400**, a signature PayPal rejects is **401**, and strict mode with no way to verify is **503**.\n\n### Ledger effects\n\nA `PAYMENT.PAYOUTS-ITEM.SUCCEEDED` event records the status without moving money. A terminal failure (`FAILED`, `RETURNED`, `BLOCKED`, `CANCELED`, `REFUNDED`) **reverses** the payout: the reader and publisher balances are restored, because a failed payout means the money never left. `UNCLAIMED` and `ONHOLD` are deliberately *not* terminal and are recorded as status updates only.\n\n### Signature verification\n\nVerification is a round-trip to PayPal's `verify-webhook-signature` API and needs `PAYPAL_WEBHOOK_ID`. Without it the route still accepts events but labels them `skipped` — a sandbox demo that rejected everything would be unusable. Set `PAYPAL_WEBHOOK_STRICT=true` to require verification.",
+        "operationId": "receivePaypalWebhook",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PaypalWebhookEvent" },
+              "example": {
+                "id": "WH-2WR32451HC0233532-67976317FL4543714",
+                "event_type": "PAYMENT.PAYOUTS-ITEM.SUCCEEDED",
+                "event_version": "1.0",
+                "create_time": "2026-10-25T19:48:18.000Z",
+                "resource_type": "payouts",
+                "resource": {
+                  "payout_batch_id": "XKGQ3VT6VDJ2Q",
+                  "payout_item_id": "ITEM-1",
+                  "transaction_status": "SUCCESS",
+                  "sender_batch_id": "ADPAL-MVO8PXLP"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Acknowledged. `outcome` states whether anything changed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PaypalWebhookReceipt" }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is empty, is not JSON, or carries no `event_type`. Retrying cannot fix this.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "401": {
+            "description": "PayPal rejected the signature, so the event was not trusted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "503": {
+            "description": "Verification is required (strict mode) but could not be attempted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/dev/reset": {
+      "post": {
+        "tags": ["Maintenance"],
+        "summary": "Reset the simulator",
+        "description": "**Destructive.** Clears balances, campaign budgets, L402 contexts, payout history, the Solana replay guard and the webhook replay guard. Exists so the demo and the integration suite are repeatable.",
+        "operationId": "resetLedger",
+        "responses": {
+          "200": {
+            "description": "Reset complete; the ledger is back to zero.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DevReset" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "L402Bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "L402 macaroon",
+        "description": "The `bearer_token` returned by `POST /api/l402/settle`. Note the scheme is `Bearer`, not `L402`, even though the credential is a macaroon."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "A plain failure. Handlers that report more detail use a dedicated schema instead.",
+        "required": ["error"],
+        "additionalProperties": true,
+        "properties": {
+          "error": { "type": "string", "description": "Machine-readable code." },
+          "message": { "type": "string", "description": "Human-readable explanation." }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status", "service", "version", "port", "demoUrl", "terminalUrl",
+          "logsUrl", "uptimeSeconds", "toolkit", "agents", "rails", "solana", "now"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "status": { "type": "string", "enum": ["ok"] },
+          "service": { "type": "string", "enum": ["adpal-simulator"] },
+          "version": { "type": "string", "example": "1.0.0" },
+          "port": { "type": "integer", "example": 3000 },
+          "demoUrl": { "type": "string", "format": "uri" },
+          "terminalUrl": { "type": "string", "format": "uri" },
+          "logsUrl": { "type": "string", "format": "uri" },
+          "uptimeSeconds": { "type": "integer", "minimum": 0 },
+          "toolkit": { "$ref": "#/components/schemas/HealthToolkit" },
+          "agents": {
+            "type": "array",
+            "description": "Ids of the advertisers currently loaded.",
+            "items": { "type": "string" }
+          },
+          "rails": { "$ref": "#/components/schemas/HealthRails" },
+          "solana": { "$ref": "#/components/schemas/HealthSolanaConfig" },
+          "now": { "type": "string", "format": "date-time" }
+        }
+      },
+      "HealthToolkit": {
+        "type": "object",
+        "required": ["present", "version", "tools", "mcp"],
+        "additionalProperties": false,
+        "properties": {
+          "present": { "type": "boolean" },
+          "version": { "type": "string", "nullable": true },
+          "tools": { "type": "integer", "minimum": 0 },
+          "mcp": { "type": "string", "format": "uri", "nullable": true }
+        }
+      },
+      "HealthRails": {
+        "type": "object",
+        "required": ["active", "paypal", "solana"],
+        "additionalProperties": false,
+        "properties": {
+          "active": { "$ref": "#/components/schemas/RailName" },
+          "paypal": { "type": "boolean" },
+          "solana": { "type": "boolean" }
+        }
+      },
+      "HealthSolanaConfig": {
+        "type": "object",
+        "required": ["cluster", "rpcUrl", "anchorProofs"],
+        "additionalProperties": false,
+        "properties": {
+          "cluster": { "type": "string", "example": "devnet" },
+          "rpcUrl": { "type": "string", "format": "uri" },
+          "anchorProofs": { "type": "boolean" }
+        }
+      },
+      "RailName": {
+        "type": "string",
+        "description": "Which rail settles payouts.",
+        "enum": ["paypal_payouts", "solana-devnet"]
+      },
+      "SplitRate": {
+        "type": "object",
+        "required": ["userShare", "publisherShare"],
+        "additionalProperties": false,
+        "properties": {
+          "userShare": { "type": "number", "example": 0.7 },
+          "publisherShare": { "type": "number", "example": 0.3 }
+        }
+      },
+      "Toolkit": {
+        "type": "object",
+        "required": [
+          "present", "name", "version", "source", "license", "mcp",
+          "payoutsReference", "skills", "tools", "configured", "retry", "callable"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "present": { "type": "boolean", "description": "Whether the vendored checkout was found on disk." },
+          "name": { "type": "string", "example": "paypal" },
+          "version": { "type": "string", "example": "1.2.0" },
+          "source": { "type": "string", "description": "Relative path of the checkout that was read." },
+          "license": { "type": "string", "example": "Apache-2.0" },
+          "mcp": { "$ref": "#/components/schemas/ToolkitMcp" },
+          "payoutsReference": {
+            "type": "string",
+            "description": "Path to the payouts reference document inside the toolkit.",
+            "example": "skills/paypal-best-practices/references/payouts.md"
+          },
+          "skills": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "tools": {
+            "type": "array",
+            "description": "Tools the toolkit declares.",
+            "items": { "$ref": "#/components/schemas/ToolkitTool" }
+          },
+          "configured": { "type": "boolean", "description": "Whether credentials for the MCP server are present." },
+          "retry": { "$ref": "#/components/schemas/ToolkitRetry" },
+          "callable": {
+            "type": "array",
+            "description": "Tool names this server actually bound. Must match `tools`.",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ToolkitMcp": {
+        "type": "object",
+        "required": ["server", "transport", "url", "auth"],
+        "additionalProperties": false,
+        "properties": {
+          "server": { "type": "string", "example": "paypal-sandbox" },
+          "transport": { "type": "string", "enum": ["sse"] },
+          "url": { "type": "string", "format": "uri" },
+          "auth": { "type": "string", "example": "Authorization" }
+        }
+      },
+      "ToolkitTool": {
+        "type": "object",
+        "required": ["name", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "ToolkitRetry": {
+        "type": "object",
+        "required": ["attempts", "baseMs", "maxMs", "on"],
+        "additionalProperties": false,
+        "properties": {
+          "attempts": { "type": "integer", "minimum": 0 },
+          "baseMs": { "type": "integer", "minimum": 0 },
+          "maxMs": { "type": "integer", "minimum": 0 },
+          "on": { "type": "string", "example": "HTTP 429" }
+        }
+      },
+      "Agents": {
+        "type": "object",
+        "required": ["rotation", "split", "autoPayout", "payoutRail", "rails", "currency"],
+        "additionalProperties": false,
+        "properties": {
+          "rotation": { "$ref": "#/components/schemas/Rotation" },
+          "split": { "$ref": "#/components/schemas/SplitRate" },
+          "autoPayout": { "type": "boolean" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" },
+          "rails": { "$ref": "#/components/schemas/AgentsRails" },
+          "currency": { "type": "string", "example": "EUR" }
+        }
+      },
+      "Rotation": {
+        "type": "object",
+        "required": ["advertisers", "slots", "impressions"],
+        "additionalProperties": false,
+        "properties": {
+          "advertisers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Advertiser" }
+          },
+          "slots": {
+            "type": "array",
+            "description": "The last creative shown in each slot.",
+            "items": { "$ref": "#/components/schemas/SlotAssignment" }
+          },
+          "impressions": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "SlotAssignment": {
+        "type": "object",
+        "required": ["slotKey", "creativeId"],
+        "additionalProperties": false,
+        "properties": {
+          "slotKey": { "type": "string" },
+          "creativeId": { "type": "string" }
+        }
+      },
+      "Advertiser": {
+        "type": "object",
+        "required": [
+          "creativeId", "sponsor", "agent", "budget", "initialBudget",
+          "spend", "impressions", "lastShownAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "creativeId": { "type": "string" },
+          "sponsor": { "type": "string" },
+          "agent": { "$ref": "#/components/schemas/AgentRef" },
+          "budget": { "type": "number", "description": "Remaining campaign budget." },
+          "initialBudget": { "type": "number" },
+          "spend": { "type": "number" },
+          "impressions": { "type": "integer", "minimum": 0 },
+          "lastShownAt": { "type": "string", "format": "date-time", "nullable": true }
+        }
+      },
+      "AgentRef": {
+        "type": "object",
+        "required": ["id", "name", "bid"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "example": "agt_northbound_01" },
+          "name": { "type": "string" },
+          "bid": { "type": "number" }
+        }
+      },
+      "AgentsRails": {
+        "type": "object",
+        "required": ["paypal", "solana"],
+        "additionalProperties": false,
+        "properties": {
+          "paypal": { "$ref": "#/components/schemas/RailStatus" },
+          "solana": { "$ref": "#/components/schemas/SolanaRailStatus" }
+        }
+      },
+      "RailStatus": {
+        "type": "object",
+        "required": ["ready", "label"],
+        "additionalProperties": false,
+        "properties": {
+          "ready": { "type": "boolean" },
+          "label": { "type": "string" }
+        }
+      },
+      "SolanaRailStatus": {
+        "type": "object",
+        "required": ["ready", "label", "profile"],
+        "additionalProperties": false,
+        "properties": {
+          "ready": { "type": "boolean" },
+          "label": { "type": "string" },
+          "profile": { "$ref": "#/components/schemas/SolanaProfile" }
+        }
+      },
+      "SolanaProfile": {
+        "type": "object",
+        "required": [
+          "enabled", "rail", "cluster", "rpcUrl", "currency", "mint", "decimals",
+          "unitsPerEuro", "explorerBase", "anchorProofs", "airdrop", "maxPayout",
+          "treasury", "reader", "publisher", "ready"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "cluster": { "type": "string", "example": "devnet" },
+          "rpcUrl": { "type": "string", "format": "uri" },
+          "currency": { "type": "string", "enum": ["SOL"] },
+          "mint": { "type": "string", "nullable": true, "description": "SPL mint address, or null when paying in native SOL." },
+          "decimals": { "type": "integer", "example": 9 },
+          "unitsPerEuro": {
+            "type": "integer",
+            "description": "Base units per euro. Integer by construction, so the 70/30 split cannot drift."
+          },
+          "explorerBase": { "type": "string", "format": "uri" },
+          "anchorProofs": { "type": "boolean" },
+          "airdrop": { "type": "boolean" },
+          "maxPayout": { "type": "number" },
+          "treasury": { "type": "string", "description": "Base58 treasury address." },
+          "reader": { "type": "string", "description": "Base58 reader wallet address." },
+          "publisher": { "type": "string", "description": "Base58 publisher wallet address." },
+          "ready": { "type": "boolean" }
+        }
+      },
+      "SolanaStatus": {
+        "type": "object",
+        "required": [
+          "enabled", "rail", "cluster", "rpcUrl", "currency", "mint", "decimals",
+          "unitsPerEuro", "explorerBase", "anchorProofs", "airdrop", "maxPayout",
+          "treasury", "reader", "publisher", "ready", "balances", "faucetUrl",
+          "explorerUrl", "payoutRail", "rails", "split", "memoFormat", "endpoints"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "cluster": { "type": "string" },
+          "rpcUrl": { "type": "string", "format": "uri" },
+          "currency": { "type": "string", "enum": ["SOL"] },
+          "mint": { "type": "string", "nullable": true },
+          "decimals": { "type": "integer" },
+          "unitsPerEuro": { "type": "integer" },
+          "explorerBase": { "type": "string", "format": "uri" },
+          "anchorProofs": { "type": "boolean" },
+          "airdrop": { "type": "boolean" },
+          "maxPayout": { "type": "number" },
+          "treasury": { "type": "string" },
+          "reader": { "type": "string" },
+          "publisher": { "type": "string" },
+          "ready": { "type": "boolean" },
+          "balances": { "$ref": "#/components/schemas/SolanaBalances" },
+          "faucetUrl": { "type": "string", "format": "uri" },
+          "explorerUrl": { "type": "string", "format": "uri" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" },
+          "rails": {
+            "type": "object",
+            "required": ["paypal", "solana"],
+            "additionalProperties": false,
+            "properties": {
+              "paypal": { "type": "boolean" },
+              "solana": { "type": "boolean" }
+            }
+          },
+          "split": { "$ref": "#/components/schemas/SplitRate" },
+          "memoFormat": { "type": "string", "example": "ADPAL/v1|kind=<proof|payout>|hash=<sha256(preimage)>|ref=<reference>" },
+          "endpoints": {
+            "type": "object",
+            "required": ["confirm", "fund", "payout"],
+            "additionalProperties": false,
+            "properties": {
+              "confirm": { "type": "string" },
+              "fund": { "type": "string" },
+              "payout": { "type": "string" }
+            }
+          }
+        }
+      },
+      "SolanaBalances": {
+        "type": "object",
+        "required": ["cluster", "currency", "treasury", "reader", "publisher", "treasurySol"],
+        "additionalProperties": false,
+        "properties": {
+          "cluster": { "type": "string" },
+          "currency": { "type": "string" },
+          "treasury": { "type": "integer", "description": "Lamports." },
+          "reader": { "type": "integer" },
+          "publisher": { "type": "integer" },
+          "treasurySol": { "type": "number" }
+        }
+      },
+      "SolanaFundRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sol": { "type": "number", "minimum": 0.000005, "default": 1, "description": "Amount to request from the faucet." }
+        }
+      },
+      "SolanaFundResult": {
+        "type": "object",
+        "description": "Funding succeeded. The exact funding metadata depends on the faucet response, so this object is intentionally open.",
+        "required": ["ok", "treasury"],
+        "additionalProperties": true,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "treasury": { "type": "string" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "SolanaFundError": {
+        "type": "object",
+        "required": ["ok", "error", "message", "treasury", "faucetUrl"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [false] },
+          "error": { "type": "string", "example": "SOLANA_AIRDROP_FAILED" },
+          "message": { "type": "string" },
+          "treasury": { "type": "string" },
+          "faucetUrl": { "type": "string", "format": "uri" }
+        }
+      },
+      "L402Contract": {
+        "type": "object",
+        "description": "The 402 body: a priced catalogue plus a challenge bound to `sha256(preimage)`.",
+        "required": [
+          "version", "protocol", "payment_request_url", "payment_context_token",
+          "expires_at", "selected_offer_id", "offers", "payment_request", "challenge"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "version": { "type": "string" },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "payment_request_url": { "type": "string", "format": "uri" },
+          "payment_context_token": {
+            "type": "string",
+            "description": "Opaque handle for this negotiation. Present it to settle.",
+            "example": "14922c35-ecee-494e-ae4a-039d1cb7566e"
+          },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "selected_offer_id": { "type": "string" },
+          "offers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/L402Offer" }
+          },
+          "payment_request": { "$ref": "#/components/schemas/L402PaymentRequest" },
+          "challenge": { "$ref": "#/components/schemas/L402Challenge" }
+        }
+      },
+      "L402Offer": {
+        "type": "object",
+        "required": ["id", "title", "description", "amount", "currency", "payment_methods"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "example": "attention_session_v1" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "amount": { "type": "number", "minimum": 0 },
+          "currency": { "type": "string", "example": "EUR" },
+          "type": { "type": "string", "description": "Present on multi-impression offers.", "example": "session" },
+          "duration": { "type": "string", "example": "1 hour" },
+          "max_impressions": { "type": "integer", "minimum": 1 },
+          "payment_methods": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "L402PaymentRequest": {
+        "type": "object",
+        "required": ["method", "url", "content_type", "required_fields", "body", "signals_schema"],
+        "additionalProperties": false,
+        "properties": {
+          "method": { "type": "string", "enum": ["POST"] },
+          "url": { "type": "string", "format": "uri" },
+          "content_type": { "type": "string", "example": "application/json" },
+          "required_fields": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "body": {
+            "type": "object",
+            "description": "Template of the settle body, pre-filled with this context's token.",
+            "additionalProperties": true
+          },
+          "signals_schema": {
+            "type": "object",
+            "description": "Field name to human-readable description of each attention signal.",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "L402Challenge": {
+        "type": "object",
+        "required": [
+          "scheme", "caveat", "ttl_ms", "base_url", "payment_hash", "www_authenticate"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "scheme": { "type": "string", "enum": ["L402"] },
+          "caveat": { "type": "string", "example": "viewport-gated" },
+          "ttl_ms": { "type": "integer", "minimum": 0 },
+          "base_url": { "type": "string", "format": "uri" },
+          "payment_hash": {
+            "type": "string",
+            "description": "Lowercase hex of `sha256(preimage)`. The eventual macaroon and the Solana memo both commit to it.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "www_authenticate": {
+            "type": "string",
+            "description": "The raw header value a protocol client should send back.",
+            "example": "L402 macaroon=\"pending\", payment_hash=\"...\", caveat=\"viewport-gated\""
+          }
+        }
+      },
+      "L402ChallengeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "offer_id": { "type": "string", "example": "attention_session_v1" },
+          "publisher": { "type": "string" },
+          "page_title": { "type": "string" }
+        }
+      },
+      "L402SettleRequest": {
+        "type": "object",
+        "required": ["payment_context_token", "attention"],
+        "additionalProperties": false,
+        "properties": {
+          "payment_context_token": { "type": "string" },
+          "offer_id": { "type": "string", "description": "Optional; the context's offer is used when omitted." },
+          "attention": {
+            "type": "object",
+            "required": ["signals"],
+            "additionalProperties": false,
+            "properties": {
+              "signals": { "$ref": "#/components/schemas/AttentionSignals" }
+            }
+          },
+          "solana_signature": {
+            "type": "string",
+            "description": "Optional on-chain payment proof supplied with the attention proof."
+          }
+        }
+      },
+      "AttentionSignals": {
+        "type": "object",
+        "required": [
+          "durationMs", "pageDwellMs", "mouseMoves", "directionChanges", "scrollEvents",
+          "scrollDepth", "clicks", "keyPresses", "visibleRatio", "focusRatio",
+          "slotVisibleRatio"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "durationMs": { "type": "integer", "minimum": 0, "description": "Measured session length. Must be at least 2500ms to score." },
+          "pageDwellMs": { "type": "integer", "minimum": 0 },
+          "mouseMoves": { "type": "integer", "minimum": 0 },
+          "directionChanges": { "type": "integer", "minimum": 0 },
+          "scrollEvents": { "type": "integer", "minimum": 0 },
+          "scrollDepth": { "type": "number", "minimum": 0, "maximum": 1 },
+          "clicks": { "type": "integer", "minimum": 0 },
+          "keyPresses": { "type": "integer", "minimum": 0 },
+          "visibleRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+          "focusRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+          "slotVisibleRatio": { "type": "number", "minimum": 0, "maximum": 1, "nullable": true },
+          "webdriver": { "type": "boolean", "description": "Must be false. Ignored on input, reported back in the proof." },
+          "clientSentAt": { "type": "integer", "description": "Client clock in epoch milliseconds, used for skew checks." }
+        }
+      },
+      "L402Settlement": {
+        "type": "object",
+        "required": [
+          "message", "protocol", "version", "bearer_token", "token_type",
+          "payment_context_token", "expires_at", "macaroon", "receipt", "solana",
+          "proof", "resource_url", "balance"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "message": { "type": "string", "enum": ["Payment settled"] },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "version": { "type": "string" },
+          "bearer_token": { "type": "string", "description": "Present as `Authorization: Bearer <token>`." },
+          "token_type": { "type": "string", "enum": ["Bearer"] },
+          "payment_context_token": { "type": "string" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "macaroon": { "$ref": "#/components/schemas/Macaroon" },
+          "receipt": { "$ref": "#/components/schemas/Receipt" },
+          "solana": { "$ref": "#/components/schemas/SolanaSettlement" },
+          "proof": { "$ref": "#/components/schemas/Proof" },
+          "resource_url": { "type": "string", "format": "uri" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "L402SettleRejection": {
+        "type": "object",
+        "description": "The proof was refused. The shape mirrors the settlement payload so a client can inspect the score even on failure, so it is left open here.",
+        "required": ["error"],
+        "additionalProperties": true,
+        "properties": {
+          "error": { "type": "string", "example": "ATTENTION_NOT_VERIFIED" },
+          "message": { "type": "string" },
+          "proof": { "$ref": "#/components/schemas/Proof" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "Macaroon": {
+        "type": "object",
+        "required": [
+          "id", "status", "valid", "token", "caveats", "caveatList",
+          "issuedAt", "expiresAt", "paymentHash", "reason", "paymentHashFull"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "example": "mcr_b98aea6f44c8" },
+          "status": { "type": "string", "example": "verified" },
+          "valid": { "type": "boolean" },
+          "token": { "type": "string" },
+          "caveats": { "type": "integer", "minimum": 0 },
+          "caveatList": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "issuedAt": { "type": "string", "format": "date-time" },
+          "expiresAt": { "type": "string", "format": "date-time" },
+          "paymentHash": { "type": "string", "description": "Truncated hash used in the macaroon identifier." },
+          "reason": { "type": "string" },
+          "paymentHashFull": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      },
+      "Receipt": {
+        "type": "object",
+        "required": [
+          "reference", "offerId", "contractOfferId", "amount", "currency", "score",
+          "verdict", "split", "publisher", "pageTitle", "creative", "agent",
+          "paymentHash", "settledAt", "payoutRail", "solana"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "reference": { "type": "string", "example": "l402_14922c35" },
+          "offerId": { "type": "string" },
+          "contractOfferId": { "type": "string" },
+          "amount": { "type": "number" },
+          "currency": { "type": "string" },
+          "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "verdict": { "type": "string", "example": "human" },
+          "split": { "$ref": "#/components/schemas/SplitAmounts" },
+          "publisher": { "type": "string" },
+          "pageTitle": { "type": "string" },
+          "creative": { "$ref": "#/components/schemas/Creative" },
+          "agent": { "$ref": "#/components/schemas/AgentAttribution" },
+          "paymentHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "settledAt": { "type": "string", "format": "date-time" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" },
+          "solana": { "$ref": "#/components/schemas/SolanaSettlement" }
+        }
+      },
+      "SplitAmounts": {
+        "type": "object",
+        "required": ["user", "publisher", "userRate", "publisherRate"],
+        "additionalProperties": false,
+        "properties": {
+          "user": { "type": "number" },
+          "publisher": { "type": "number" },
+          "userRate": { "type": "number" },
+          "publisherRate": { "type": "number" }
+        }
+      },
+      "Creative": {
+        "type": "object",
+        "required": ["id", "sponsor", "headline", "body", "cta", "theme"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "sponsor": { "type": "string" },
+          "headline": { "type": "string" },
+          "body": { "type": "string" },
+          "cta": { "type": "string" },
+          "theme": { "type": "string" }
+        }
+      },
+      "AgentAttribution": {
+        "type": "object",
+        "required": ["id", "name", "bid", "currency", "creativeId", "sponsor", "objective"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "bid": { "type": "number" },
+          "currency": { "type": "string" },
+          "creativeId": { "type": "string" },
+          "sponsor": { "type": "string" },
+          "objective": { "type": "string" }
+        }
+      },
+      "SolanaSettlement": {
+        "type": "object",
+        "required": [
+          "rail", "cluster", "paymentHash", "anchor", "anchorSignature",
+          "anchorExplorerUrl", "hashExplorerUrl", "paymentSignature",
+          "paymentExplorerUrl", "treasury"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "cluster": { "type": "string" },
+          "paymentHash": { "type": "string" },
+          "anchor": { "$ref": "#/components/schemas/SolanaAnchor" },
+          "anchorSignature": { "type": "string", "nullable": true },
+          "anchorExplorerUrl": { "type": "string", "format": "uri" },
+          "hashExplorerUrl": { "type": "string", "format": "uri" },
+          "paymentSignature": { "type": "string", "nullable": true },
+          "paymentExplorerUrl": { "type": "string", "format": "uri", "nullable": true },
+          "treasury": { "type": "string" }
+        }
+      },
+      "SolanaAnchor": {
+        "type": "object",
+        "description": "The on-chain anchoring of the invoice hash. `status` distinguishes a real confirmation from an honest degradation (`unfunded`).",
+        "required": ["status", "rail", "cluster", "paymentHash", "explorerUrl"],
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["confirmed", "finalized", "pending", "unfunded", "failed", "disabled", "skipped"]
+          },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "cluster": { "type": "string" },
+          "paymentHash": { "type": "string" },
+          "explorerUrl": { "type": "string", "format": "uri" },
+          "signature": { "type": "string" },
+          "slot": { "type": "integer", "nullable": true },
+          "memo": { "type": "string" },
+          "code": { "type": "string", "description": "Machine-readable reason when the anchor did not land." },
+          "reason": { "type": "string" },
+          "treasury": { "type": "string" }
+        }
+      },
+      "Proof": {
+        "type": "object",
+        "required": ["score", "verdict", "threshold", "checks", "signals", "solana"],
+        "additionalProperties": false,
+        "properties": {
+          "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "verdict": { "type": "string" },
+          "threshold": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "checks": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ProofCheck" }
+          },
+          "signals": { "$ref": "#/components/schemas/ProofSignals" },
+          "solana": { "$ref": "#/components/schemas/ProofSolana" }
+        }
+      },
+      "ProofCheck": {
+        "type": "object",
+        "required": ["id", "label", "status", "detail"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "example": "automation" },
+          "label": { "type": "string" },
+          "status": { "type": "string", "enum": ["pass", "warn", "fail"] },
+          "detail": { "type": "string" }
+        }
+      },
+      "ProofSignals": {
+        "type": "object",
+        "description": "The signals the server actually evaluated, after normalisation.",
+        "required": [
+          "durationMs", "pageDwellMs", "mouseMoves", "directionChanges", "scrollEvents",
+          "scrollDepth", "clicks", "keyPresses", "visibleRatio", "focusRatio",
+          "slotVisibleRatio"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "durationMs": { "type": "integer" },
+          "pageDwellMs": { "type": "integer" },
+          "mouseMoves": { "type": "integer" },
+          "directionChanges": { "type": "integer" },
+          "scrollEvents": { "type": "integer" },
+          "scrollDepth": { "type": "number" },
+          "clicks": { "type": "integer" },
+          "keyPresses": { "type": "integer" },
+          "visibleRatio": { "type": "number" },
+          "focusRatio": { "type": "number" },
+          "slotVisibleRatio": { "type": "number", "nullable": true }
+        }
+      },
+      "ProofSolana": {
+        "type": "object",
+        "required": ["anchor", "payment"],
+        "additionalProperties": false,
+        "properties": {
+          "anchor": { "$ref": "#/components/schemas/SolanaAnchor" },
+          "payment": {
+            "type": "object",
+            "nullable": true,
+            "description": "Verification result for a payment transaction, or null when none was supplied.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "SolanaConfirmRequest": {
+        "type": "object",
+        "required": ["signature"],
+        "additionalProperties": false,
+        "properties": {
+          "signature": {
+            "type": "string",
+            "description": "Base58 transaction signature that must decode to exactly 64 bytes."
+          },
+          "payment_context_token": {
+            "type": "string",
+            "description": "Binds the check to a settled invoice. When omitted the top-level hash is used."
+          },
+          "payment_hash": {
+            "type": "string",
+            "description": "Override the expected hash instead of resolving it from the context."
+          },
+          "recipient": {
+            "type": "string",
+            "description": "When supplied, the transfer must pay this wallet."
+          },
+          "units": {
+            "type": "integer",
+            "description": "When supplied, the transfer must equal this exact base-unit amount."
+          }
+        }
+      },
+      "SolanaConfirmResult": {
+        "type": "object",
+        "description": "Returned with **200** when every check passed and with **402** when one failed. `checks` is the authoritative explanation either way.",
+        "required": [
+          "verified", "protocol", "rail", "cluster", "signature",
+          "payment_hash", "checks", "reason", "explorerUrl", "context", "balance"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "verified": { "type": "boolean" },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "cluster": { "type": "string" },
+          "signature": { "type": "string" },
+          "payment_hash": { "type": "string" },
+          "slot": { "type": "integer", "nullable": true },
+          "confirmation_status": { "type": "string", "nullable": true },
+          "memo": { "type": "string" },
+          "memo_fields": {
+            "type": "object",
+            "nullable": true,
+            "description": "Parsed `ADPAL/v1` memo fields, or null when no memo was found.",
+            "additionalProperties": true
+          },
+          "transfers": {
+            "type": "array",
+            "description": "SOL movements observed in the transaction.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "checks": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/VerifyCheck" }
+          },
+          "reason": { "type": "string" },
+          "explorerUrl": { "type": "string", "format": "uri", "nullable": true },
+          "context": {
+            "allOf": [{ "$ref": "#/components/schemas/L402Context" }],
+            "nullable": true
+          },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "VerifyCheck": {
+        "type": "object",
+        "description": "Unlike `ProofCheck`, verification checks report a boolean because there is no partial credit on-chain.",
+        "required": ["id", "label", "passed", "detail"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "example": "exists" },
+          "label": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      },
+      "L402Context": {
+        "type": "object",
+        "required": [
+          "payment_context_token", "protocol", "version", "offer_id", "amount",
+          "currency", "state", "attempts", "reads", "createdAt", "expiresAt",
+          "settledAt", "consumedAt", "macaroon", "receipt", "proof", "lastError"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "payment_context_token": { "type": "string" },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "version": { "type": "string" },
+          "offer_id": { "type": "string" },
+          "amount": { "type": "number" },
+          "currency": { "type": "string" },
+          "state": {
+            "type": "string",
+            "description": "Negotiation state machine position.",
+            "enum": ["issued", "failed", "settled", "consumed", "expired"]
+          },
+          "attempts": { "type": "integer", "minimum": 0 },
+          "reads": { "type": "integer", "minimum": 0 },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "expiresAt": { "type": "string", "format": "date-time" },
+          "settledAt": { "type": "string", "format": "date-time", "nullable": true },
+          "consumedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "macaroon": {
+            "allOf": [{ "$ref": "#/components/schemas/Macaroon" }],
+            "nullable": true
+          },
+          "receipt": {
+            "allOf": [{ "$ref": "#/components/schemas/Receipt" }],
+            "nullable": true
+          },
+          "proof": {
+            "allOf": [{ "$ref": "#/components/schemas/Proof" }],
+            "nullable": true
+          },
+          "lastError": {
+            "type": "object",
+            "nullable": true,
+            "description": "The most recent refusal, or null.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "L402UnlockedResource": {
+        "type": "object",
+        "required": ["ok", "protocol", "version", "resource", "grant", "impression", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "version": { "type": "string" },
+          "resource": {
+            "type": "object",
+            "required": ["type", "offer_id", "title", "publisher", "page_title"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "type": "string", "example": "reading_session" },
+              "offer_id": { "type": "string" },
+              "title": { "type": "string" },
+              "publisher": { "type": "string" },
+              "page_title": { "type": "string" }
+            }
+          },
+          "grant": {
+            "type": "object",
+            "required": ["via", "credential", "caveats", "max_price", "expires_at"],
+            "additionalProperties": false,
+            "properties": {
+              "via": { "type": "string", "enum": ["macaroon"] },
+              "credential": { "type": "string", "example": "macaroon" },
+              "caveats": {
+                "type": "object",
+                "description": "Decoded caveats the grant was checked against.",
+                "additionalProperties": { "type": "string" }
+              },
+              "max_price": { "type": "string" },
+              "expires_at": { "type": "string", "format": "date-time" }
+            }
+          },
+          "impression": { "$ref": "#/components/schemas/Receipt" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "L402Sessions": {
+        "type": "object",
+        "required": ["protocol", "version", "offers", "stats", "sessions", "l402"],
+        "additionalProperties": false,
+        "properties": {
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "version": { "type": "string" },
+          "offers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/L402Offer" }
+          },
+          "stats": {
+            "type": "object",
+            "required": ["contexts", "states", "ttlMs"],
+            "additionalProperties": false,
+            "properties": {
+              "contexts": { "type": "integer", "minimum": 0 },
+              "states": {
+                "type": "object",
+                "description": "Count of contexts per state.",
+                "additionalProperties": { "type": "integer" }
+              },
+              "ttlMs": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "sessions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/L402Context" }
+          },
+          "l402": {
+            "type": "object",
+            "required": ["issuer", "ttlMs", "humanThreshold"],
+            "additionalProperties": false,
+            "properties": {
+              "issuer": { "type": "string" },
+              "ttlMs": { "type": "integer" },
+              "humanThreshold": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "L402ReceiptResponse": {
+        "type": "object",
+        "required": ["ok", "protocol", "context", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "protocol": { "type": "string", "enum": ["L402"] },
+          "context": { "$ref": "#/components/schemas/L402Context" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PayoutSplit": {
+        "type": "object",
+        "description": "How a specific payout divides between the two recipients. Distinct from the offer split: settlement also has to state the cent-level arithmetic and where the publisher's share actually goes.",
+        "required": [
+          "userRate", "publisherRate", "reader", "publisher", "total",
+          "readerCents", "publisherCents", "withinTolerance", "rail", "publisherRail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "userRate": { "type": "number", "example": 0.7 },
+          "publisherRate": { "type": "number", "example": 0.3 },
+          "reader": { "type": "number" },
+          "publisher": { "type": "number" },
+          "total": { "type": "number" },
+          "readerCents": { "type": "integer" },
+          "publisherCents": { "type": "integer" },
+          "withinTolerance": {
+            "type": "boolean",
+            "description": "True when the reader's cent amount is within one cent of a 70/30 split of the total. Two-decimal rails cannot always express the exact ratio."
+          },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "publisherRail": {
+            "type": "string",
+            "description": "The rail that carries the publisher share, or `ledger-held` when no second recipient was addressable.",
+            "example": "paypal_payouts"
+          }
+        }
+      },
+      "PayoutRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rail": {
+            "allOf": [{ "$ref": "#/components/schemas/RailName" }],
+            "description": "Overrides the server's configured rail for this request only."
+          },
+          "reason": { "type": "string", "maxLength": 60, "example": "manual" },
+          "receiverEmail": { "type": "string", "format": "email", "description": "PayPal rail only." },
+          "publisherEmail": { "type": "string", "format": "email", "description": "PayPal rail only." },
+          "payment_hash": { "type": "string", "description": "L402 hash the payout memo should commit to." },
+          "anchor_signature": { "type": "string", "description": "Proof transaction to reference in the payout memo." }
+        }
+      },
+      "PayoutResult": {
+        "type": "object",
+        "required": ["settled", "rail", "trigger", "payout", "split", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "settled": { "type": "boolean", "enum": [true] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "trigger": { "type": "string", "example": "manual" },
+          "payout": { "$ref": "#/components/schemas/PayoutRecord" },
+          "split": { "$ref": "#/components/schemas/PayoutSplit" },
+          "paypal": { "$ref": "#/components/schemas/PaypalPayoutSummary" },
+          "solana": { "$ref": "#/components/schemas/SolanaPayoutSummary" },
+          "requestedRail": {
+            "allOf": [{ "$ref": "#/components/schemas/RailName" }],
+            "description": "Present only when the requested rail was replaced by a fallback."
+          },
+          "fallback": {
+            "type": "object",
+            "description": "Present only when the requested rail could not move money and another rail was used instead.",
+            "required": ["from", "to", "code", "message"],
+            "additionalProperties": false,
+            "properties": {
+              "from": { "$ref": "#/components/schemas/RailName" },
+              "to": { "$ref": "#/components/schemas/RailName" },
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PayoutThresholdError": {
+        "type": "object",
+        "description": "The balance is below the payout threshold. The rail-specific block (`paypal` or `solana`) and `rail` appear only on the Solana path, which reports which rail it would have used.",
+        "required": ["settled", "error", "message", "threshold", "missing", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "settled": { "type": "boolean", "enum": [false] },
+          "error": { "type": "string", "enum": ["THRESHOLD_NOT_REACHED"] },
+          "message": { "type": "string" },
+          "threshold": { "type": "number" },
+          "missing": { "type": "number", "description": "Exact shortfall to the threshold." },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "paypal": { "$ref": "#/components/schemas/PaypalProfile" },
+          "solana": { "$ref": "#/components/schemas/SolanaProfile" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PayoutRailError": {
+        "type": "object",
+        "description": "The requested rail is unavailable. Both the PayPal and Solana variants are covered; `rail`, `paypal`, `solana` and `reference` appear depending on which rail refused.",
+        "required": ["settled", "error", "message", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "settled": { "type": "boolean", "enum": [false] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "error": { "type": "string", "example": "SOLANA_DISABLED" },
+          "message": { "type": "string" },
+          "reference": { "type": "string" },
+          "paypal": { "$ref": "#/components/schemas/PaypalProfile" },
+          "solana": { "$ref": "#/components/schemas/SolanaProfile" },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PayoutStatus": {
+        "type": "object",
+        "required": ["ok", "rail", "status", "payout", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "status": {
+            "type": "object",
+            "description": "Rail-reported status, passed through from PayPal or Solana.",
+            "additionalProperties": true
+          },
+          "payout": {
+            "allOf": [{ "$ref": "#/components/schemas/PayoutRecord" }],
+            "nullable": true
+          },
+          "explorerUrl": { "type": "string", "format": "uri", "description": "Solana rail only." },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PayoutStatusError": {
+        "type": "object",
+        "required": ["ok", "rail", "error", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [false] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "error": { "type": "string" },
+          "message": { "type": "string" },
+          "issues": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "PayoutRecord": {
+        "type": "object",
+        "required": [
+          "id", "at", "method", "rail", "reference", "userAmount",
+          "publisherAmount", "total", "currency", "remainder"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" },
+          "method": { "type": "string", "enum": ["paypal", "solana"] },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "reference": { "type": "string" },
+          "userAmount": { "type": "number" },
+          "publisherAmount": { "type": "number" },
+          "total": { "type": "number" },
+          "currency": { "type": "string" },
+          "remainder": {
+            "type": "object",
+            "description": "What stayed on the balance because of rounding or the demo cap.",
+            "required": ["user", "publisher"],
+            "additionalProperties": false,
+            "properties": {
+              "user": { "type": "number" },
+              "publisher": { "type": "number" }
+            }
+          },
+          "publisherDebits": {
+            "type": "array",
+            "description": "Exact per-publisher amounts debited at commit, so a failure notification can restore each one precisely. Absent on records written before this field existed.",
+            "items": {
+              "type": "object",
+              "required": ["name", "amount"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "amount": { "type": "number" }
+              }
+            }
+          },
+          "reversal": {
+            "type": "object",
+            "nullable": true,
+            "description": "Set when a rail reported a terminal failure and the balances were restored; null otherwise.",
+            "additionalProperties": false,
+            "properties": {
+              "at": { "type": "string", "format": "date-time" },
+              "reason": { "type": "string" },
+              "userAmount": { "type": "number" },
+              "publisherAmount": { "type": "number" }
+            }
+          },
+          "paypal": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true,
+            "description": "Set on the PayPal rail, null on Solana."
+          },
+          "solana": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true,
+            "description": "Set on the Solana rail, null on PayPal."
+          }
+        }
+      },
+      "PaypalPayoutSummary": {
+        "type": "object",
+        "required": [
+          "configured", "mode", "batchId", "senderBatchId", "status", "rawStatus",
+          "amount", "currency", "receiverEmail", "items", "senderEmail",
+          "selfUrl", "links", "dashboardUrl"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "configured": { "type": "boolean" },
+          "mode": { "type": "string", "example": "sandbox" },
+          "batchId": { "type": "string" },
+          "senderBatchId": { "type": "string" },
+          "status": { "type": "string" },
+          "rawStatus": { "type": "string" },
+          "amount": { "type": "number" },
+          "currency": { "type": "string" },
+          "receiverEmail": { "type": "string" },
+          "items": {
+            "type": "array",
+            "items": { "type": "object", "additionalProperties": true }
+          },
+          "senderEmail": { "type": "string" },
+          "selfUrl": { "type": "string" },
+          "links": {
+            "type": "array",
+            "items": { "type": "object", "additionalProperties": true }
+          },
+          "dashboardUrl": { "type": "string", "format": "uri" }
+        }
+      },
+      "SolanaPayoutSummary": {
+        "type": "object",
+        "required": [
+          "configured", "cluster", "currency", "mint", "decimals", "signature",
+          "slot", "status", "pending", "memo", "units", "reader", "publisher",
+          "treasury", "fee", "funded", "explorerUrl"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "configured": { "type": "boolean" },
+          "cluster": { "type": "string" },
+          "currency": { "type": "string" },
+          "mint": { "type": "string", "nullable": true },
+          "decimals": { "type": "integer" },
+          "signature": { "type": "string" },
+          "slot": { "type": "integer", "nullable": true },
+          "status": { "type": "string" },
+          "pending": { "type": "boolean" },
+          "memo": { "type": "string" },
+          "units": {
+            "type": "object",
+            "required": ["reader", "publisher", "total", "unitsPerEuro", "drift"],
+            "additionalProperties": false,
+            "properties": {
+              "reader": { "type": "integer" },
+              "publisher": { "type": "integer" },
+              "total": { "type": "integer" },
+              "unitsPerEuro": { "type": "integer" },
+              "drift": { "type": "integer", "description": "Base units lost to rounding. Zero when the split lands exactly." }
+            }
+          },
+          "reader": { "type": "object", "additionalProperties": true },
+          "publisher": { "type": "object", "additionalProperties": true },
+          "treasury": { "type": "string" },
+          "fee": { "type": "integer", "nullable": true },
+          "funded": { "type": "boolean" },
+          "explorerUrl": { "type": "string", "format": "uri" }
+        }
+      },
+      "Balance": {
+        "type": "object",
+        "required": [
+          "currency", "updatedAt", "startedAt", "threshold", "user", "publisher",
+          "advertiser", "rules", "stats", "recentOffers", "payouts", "paypal",
+          "solana", "payoutRail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "currency": { "type": "string" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "threshold": { "type": "number" },
+          "user": { "$ref": "#/components/schemas/UserBalance" },
+          "publisher": { "$ref": "#/components/schemas/PublisherBalance" },
+          "advertiser": { "$ref": "#/components/schemas/AdvertiserBudget" },
+          "rules": { "$ref": "#/components/schemas/LedgerRules" },
+          "stats": { "$ref": "#/components/schemas/LedgerStats" },
+          "recentOffers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RecentOffer" }
+          },
+          "payouts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PayoutRecord" }
+          },
+          "paypal": { "$ref": "#/components/schemas/PaypalProfile" },
+          "solana": { "$ref": "#/components/schemas/SolanaProfile" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" }
+        }
+      },
+      "UserBalance": {
+        "type": "object",
+        "required": ["balance", "lifetime", "offersAccepted", "offersRejected"],
+        "additionalProperties": false,
+        "properties": {
+          "balance": { "type": "number" },
+          "lifetime": { "type": "number" },
+          "offersAccepted": { "type": "integer", "minimum": 0 },
+          "offersRejected": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PublisherBalance": {
+        "type": "object",
+        "required": ["balance", "lifetime", "publishers"],
+        "additionalProperties": false,
+        "properties": {
+          "balance": { "type": "number" },
+          "lifetime": { "type": "number" },
+          "publishers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "balance", "lifetime", "offers"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "balance": { "type": "number" },
+                "lifetime": { "type": "number" },
+                "offers": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      },
+      "AdvertiserBudget": {
+        "type": "object",
+        "required": ["budget", "initialBudget", "spent"],
+        "additionalProperties": false,
+        "properties": {
+          "budget": { "type": "number" },
+          "initialBudget": { "type": "number" },
+          "spent": { "type": "number" }
+        }
+      },
+      "LedgerRules": {
+        "type": "object",
+        "required": [
+          "maxPrice", "defaultPrice", "userShare", "publisherShare",
+          "threshold", "humanThreshold", "payoutMode", "payoutRail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "maxPrice": { "type": "number" },
+          "defaultPrice": { "type": "number" },
+          "userShare": { "type": "number" },
+          "publisherShare": { "type": "number" },
+          "threshold": { "type": "number" },
+          "humanThreshold": { "type": "integer" },
+          "payoutMode": { "type": "string", "example": "grouped" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" }
+        }
+      },
+      "LedgerStats": {
+        "type": "object",
+        "required": ["offersTotal", "payoutsTotal", "payoutPending", "payoutRail"],
+        "additionalProperties": false,
+        "properties": {
+          "offersTotal": { "type": "integer", "minimum": 0 },
+          "payoutsTotal": { "type": "integer", "minimum": 0 },
+          "payoutPending": { "type": "boolean" },
+          "payoutRail": {
+            "allOf": [{ "$ref": "#/components/schemas/RailName" }],
+            "nullable": true
+          }
+        }
+      },
+      "RecentOffer": {
+        "type": "object",
+        "required": [
+          "id", "at", "approved", "score", "reason", "price",
+          "publisher", "pageTitle", "pageHost", "split"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" },
+          "approved": { "type": "boolean" },
+          "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "reason": { "type": "string" },
+          "price": { "type": "number" },
+          "publisher": { "type": "string" },
+          "pageTitle": { "type": "string" },
+          "pageHost": { "type": "string" },
+          "split": { "$ref": "#/components/schemas/SplitAmounts" }
+        }
+      },
+      "PaypalProfile": {
+        "type": "object",
+        "required": [
+          "configured", "mode", "receiverEmail", "publisherEmail",
+          "publisherConfigured", "senderEmail", "currency", "apiBase",
+          "dashboardUrl", "sandboxDashboardUrl", "maxPayout"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "configured": { "type": "boolean" },
+          "mode": { "type": "string", "example": "sandbox" },
+          "receiverEmail": { "type": "string" },
+          "publisherEmail": { "type": "string" },
+          "publisherConfigured": { "type": "boolean" },
+          "senderEmail": { "type": "string" },
+          "currency": { "type": "string" },
+          "apiBase": { "type": "string", "format": "uri" },
+          "dashboardUrl": { "type": "string", "format": "uri" },
+          "sandboxDashboardUrl": { "type": "string", "format": "uri" },
+          "maxPayout": { "type": "number" }
+        }
+      },
+      "Telemetry": {
+        "type": "object",
+        "required": ["seq", "events", "guards", "rules", "paypal", "l402", "advertisers", "toolkit"],
+        "additionalProperties": false,
+        "properties": {
+          "seq": { "type": "integer", "minimum": 0 },
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TelemetryEvent" }
+          },
+          "guards": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TelemetryGuard" }
+          },
+          "rules": { "$ref": "#/components/schemas/TelemetryRules" },
+          "paypal": { "$ref": "#/components/schemas/PaypalProfile" },
+          "l402": {
+            "type": "object",
+            "required": ["issuer", "scheme", "ttlMs", "agents"],
+            "additionalProperties": false,
+            "properties": {
+              "issuer": { "type": "string", "example": "adpal.simulator" },
+              "scheme": { "type": "string", "enum": ["L402"] },
+              "ttlMs": { "type": "integer", "minimum": 0 },
+              "agents": {
+                "type": "array",
+                "description": "The bidding agents the proof is scored against.",
+                "items": { "$ref": "#/components/schemas/TelemetryAgent" }
+              }
+            }
+          },
+          "advertisers": { "$ref": "#/components/schemas/Rotation" },
+          "toolkit": { "$ref": "#/components/schemas/ToolkitSummary" }
+        }
+      },
+      "TelemetryEvent": {
+        "type": "object",
+        "required": ["seq", "at", "stage", "source", "level", "title", "detail", "data"],
+        "additionalProperties": false,
+        "properties": {
+          "seq": { "type": "integer", "minimum": 0 },
+          "at": { "type": "string", "format": "date-time" },
+          "stage": { "type": "string", "example": "l402.settle" },
+          "source": { "type": "string", "example": "ledger" },
+          "level": { "type": "string", "enum": ["ok", "info", "warn", "error", "debug"] },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "data": {
+            "type": "object",
+            "nullable": true,
+            "description": "Stage-specific payload, or null for stages that carry no structured detail. Intentionally open: each stage emits a different shape.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "TelemetryGuard": {
+        "type": "object",
+        "required": ["id", "label"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" }
+        }
+      },
+      "TelemetryAgent": {
+        "type": "object",
+        "required": ["id", "name", "bid", "sponsor", "objective", "budget"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "bid": { "type": "number" },
+          "sponsor": { "type": "string" },
+          "objective": { "type": "string" },
+          "budget": { "type": "number" }
+        }
+      },
+      "ToolkitSummary": {
+        "type": "object",
+        "description": "The toolkit projection embedded in telemetry. Unlike `Toolkit` it omits `callable`, because telemetry reports what is installed rather than what is bound.",
+        "required": [
+          "present", "name", "version", "source", "license", "mcp",
+          "payoutsReference", "skills", "tools", "configured", "retry"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "present": { "type": "boolean" },
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "source": { "type": "string" },
+          "license": { "type": "string" },
+          "mcp": { "$ref": "#/components/schemas/ToolkitMcp" },
+          "payoutsReference": { "type": "string" },
+          "skills": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "tools": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ToolkitTool" }
+          },
+          "configured": { "type": "boolean" },
+          "retry": { "$ref": "#/components/schemas/ToolkitRetry" }
+        }
+      },
+      "TelemetryRules": {
+        "type": "object",
+        "required": [
+          "humanThreshold", "userShare", "publisherShare",
+          "payoutThreshold", "maxPrice", "payoutRail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "humanThreshold": { "type": "integer" },
+          "userShare": { "type": "number" },
+          "publisherShare": { "type": "number" },
+          "payoutThreshold": { "type": "number" },
+          "maxPrice": { "type": "number" },
+          "payoutRail": { "$ref": "#/components/schemas/RailName" }
+        }
+      },
+      "DevReset": {
+        "type": "object",
+        "required": ["reset", "balance"],
+        "additionalProperties": false,
+        "properties": {
+          "reset": { "type": "boolean", "enum": [true] },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "PaypalWebhookEvent": {
+        "type": "object",
+        "description": "A PayPal notification. Only `event_type` is mandatory for the route to act; everything else is read defensively, because PayPal adds fields over time and an unknown one must never break receipt.",
+        "required": ["event_type"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "description": "Event id, used to suppress redelivery." },
+          "event_type": { "type": "string", "example": "PAYMENT.PAYOUTS-ITEM.SUCCEEDED" },
+          "event_version": { "type": "string", "example": "1.0" },
+          "create_time": { "type": "string", "format": "date-time" },
+          "resource_type": { "type": "string", "example": "payouts" },
+          "resource": {
+            "type": "object",
+            "description": "The payout item or batch the event refers to.",
+            "additionalProperties": true,
+            "properties": {
+              "payout_batch_id": { "type": "string" },
+              "batch_id": { "type": "string" },
+              "payout_item_id": { "type": "string" },
+              "transaction_status": { "type": "string" },
+              "sender_batch_id": { "type": "string" }
+            }
+          }
+        }
+      },
+      "PaypalWebhookReceipt": {
+        "type": "object",
+        "description": "The acknowledgement returned to PayPal. Present for every accepted event, including ones that changed nothing.",
+        "required": [
+          "ok", "received", "event_id", "event_type", "outcome", "signature",
+          "signature_reason", "rail", "batch_id", "status", "reversal", "payout", "balance"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "received": { "type": "boolean", "enum": [true] },
+          "event_id": { "type": "string" },
+          "event_type": { "type": "string" },
+          "outcome": {
+            "type": "string",
+            "enum": ["handled", "ignored", "duplicate", "unmatched"]
+          },
+          "signature": {
+            "type": "string",
+            "enum": ["verified", "skipped"],
+            "description": "`failed` never appears on a 200: an unverified signature is rejected with 401."
+          },
+          "signature_reason": { "type": "string" },
+          "rail": { "$ref": "#/components/schemas/RailName" },
+          "batch_id": { "type": "string", "nullable": true },
+          "status": { "type": "string", "nullable": true },
+          "reversal": {
+            "allOf": [{ "$ref": "#/components/schemas/WebhookReversal" }],
+            "nullable": true
+          },
+          "payout": {
+            "allOf": [{ "$ref": "#/components/schemas/PayoutRecord" }],
+            "nullable": true
+          },
+          "balance": { "$ref": "#/components/schemas/Balance" }
+        }
+      },
+      "WebhookReversal": {
+        "type": "object",
+        "required": ["reversed", "restored"],
+        "additionalProperties": false,
+        "properties": {
+          "reversed": { "type": "boolean", "description": "True only when this event moved money back onto the ledger." },
+          "restored": { "type": "number", "description": "Total returned to reader plus publisher." }
+        }
+      }
+    }
+  }
+}

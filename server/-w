@@ -1,0 +1,34 @@
+{
+  "status": "ok",
+  "service": "adpal-simulator",
+  "version": "1.0.0",
+  "port": 3000,
+  "demoUrl": "http://localhost:3000/demo/",
+  "terminalUrl": "http://localhost:3000/terminal/",
+  "logsUrl": "http://localhost:3000/api/logs",
+  "uptimeSeconds": 4,
+  "toolkit": {
+    "present": true,
+    "version": "1.2.0",
+    "tools": 5,
+    "mcp": "https://mcp.sandbox.paypal.com/sse"
+  },
+  "agents": [
+    "agt_northbound_01",
+    "agt_lumen_02",
+    "agt_terrace_03",
+    "agt_halden_04",
+    "agt_fieldnotes_05"
+  ],
+  "rails": {
+    "active": "solana-devnet",
+    "paypal": true,
+    "solana": true
+  },
+  "solana": {
+    "cluster": "devnet",
+    "rpcUrl": "https://api.devnet.solana.com",
+    "anchorProofs": true
+  },
+  "now": "2026-10-25T19:47:37.516Z"
+}

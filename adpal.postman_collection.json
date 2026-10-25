@@ -1,0 +1,1077 @@
+{
+  "info": {
+    "_postman_id": "a7c41e02-8b6d-4f19-9d3e-5c2b70f1a844",
+    "name": "AdPal API · Dual-Rail (Solana Devnet + PayPal Sandbox)",
+    "description": "Integration suite for the AdPal attention-billing simulator and its two settlement rails.\n\n## What this exercises\n\n| Rail | Credential | Settles |\n|---|---|---|\n| `paypal_payouts` | PayPal REST Sandbox | 70/30 split as a Payouts batch |\n| `solana-devnet` | Solana Devnet | 70/30 split as one atomic transfer + memo |\n\nThe L402 protocol is the spine: a `402 Payment Required` challenge binds a `sha256(preimage)` invoice, the attention proof mints a macaroon, and the macaroon unlocks the paid resource. On the Solana rail the same 32-byte hash is anchored on-chain as a memo, so the invoice becomes publicly verifiable.\n\n## Run order matters\n\nRequests are ordered and chained through collection variables:\n\n1. **Discovery** stores the active rail and the Solana wallet profile.\n2. **L402** issues a challenge, then settles it. `payment_context_token` and `payment_hash` flow from the challenge into the settle body; `bearer_token` flows from settle into the unlock request.\n3. **Solana verification** confirms on-chain signatures against the settled hash.\n4. **Payouts** exercise both rails explicitly.\n\n## Expected non-200 statuses\n\nThree responses are intentionally not `200`:\n\n- `GET /api/l402/offer` → **402**. This endpoint *is* the gated resource.\n- `POST /api/l402/challenge` → **402**. A challenge is a refusal by definition.\n- `POST /api/l402/solana/confirm` with a bad signature → **402**.\n\n## Devnet funding\n\nThe Solana treasury needs devnet SOL to anchor proofs and move funds. When the public faucet is rate-limited, the rail degrades honestly instead of failing: the receipt records `anchor.status = \"unfunded\"`, and a Solana payout falls back to PayPal with an explicit `fallback` block. The tests accept both outcomes and assert the shape either way — a green run means \"the server behaved correctly\", not \"the faucet was available\".\n\nFund the treasury at `https://faucet.solana.com` using the `treasury` address from `GET /api/solana`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "offerId",
+      "value": "attention_session_v1",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "00 · Discovery & Health",
+      "description": "Proves the process is up, both rails are wired, and the PayPal Agent Toolkit is installed. Also records the values later folders depend on.",
+      "item": [
+        {
+          "name": "Health · GET /api/health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('identifies as adpal-simulator', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(body.service).to.eql('adpal-simulator');",
+                  "  pm.expect(body.version).to.be.a('string');",
+                  "});",
+                  "",
+                  "pm.test('both rails report ready', () => {",
+                  "  const rails = pm.response.json().rails;",
+                  "  pm.expect(rails.paypal).to.be.true;",
+                  "  pm.expect(rails.solana).to.be.true;",
+                  "  pm.expect(rails.active).to.be.oneOf(['paypal_payouts', 'solana-devnet']);",
+                  "});",
+                  "",
+                  "pm.test('solana block points at devnet', () => {",
+                  "  const s = pm.response.json().solana;",
+                  "  pm.expect(s.cluster).to.be.a('string');",
+                  "  pm.expect(s.rpcUrl).to.match(/devnet/);",
+                  "  pm.expect(s.anchorProofs).to.be.a('boolean');",
+                  "});",
+                  "",
+                  "// Chained into later folders so a single run is self-describing.",
+                  "const health = pm.response.json();",
+                  "pm.variables.set('activeRail', health.rails.active);",
+                  "pm.variables.set('solanaCluster', health.solana.cluster);",
+                  "pm.variables.set('solanaRpcUrl', health.solana.rpcUrl);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Liveness plus a capability summary: which payout rail is active, whether the PayPal credentials and the Solana rail are configured, and which agent roster is loaded."
+          },
+          "response": []
+        },
+        {
+          "name": "Toolkit · GET /api/toolkit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('toolkit is present and exposes tools', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.present).to.be.true;",
+                  "  pm.expect(b.version).to.be.a('string');",
+                  "  pm.expect(b.tools).to.be.an('array');",
+                  "  pm.expect(b.tools.length).to.be.at.least(1);",
+                  "  pm.expect(b.tools[0]).to.have.property('name');",
+                  "});",
+                  "",
+                  "pm.test('every declared tool has a callable binding', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.callable).to.be.an('array');",
+                  "  pm.expect(b.callable.length).to.eql(b.tools.length);",
+                  "  pm.expect(b.callable).to.include('paypal_create_payout');",
+                  "});",
+                  "",
+                  "pm.test('MCP endpoint is reported over https', () => {",
+                  "  pm.expect(pm.response.json().mcp.url).to.match(/^https:\\/\\//);",
+                  "});",
+                  "",
+                  "pm.variables.set('toolkitVersion', pm.response.json().version);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/toolkit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "toolkit"]
+            },
+            "description": "The PayPal Agent Toolkit capability profile. `tools` is what the checkout ships; `callable` is what this server actually bound — the two lists must agree, which is the point of the assertion."
+          },
+          "response": []
+        },
+        {
+          "name": "Agents · GET /api/agents",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('roster is non-empty and linked to agents', () => {",
+                  "  const advertisers = pm.response.json().rotation.advertisers;",
+                  "  pm.expect(advertisers).to.be.an('array');",
+                  "  pm.expect(advertisers.length).to.be.at.least(1);",
+                  "  pm.expect(advertisers[0].agent).to.have.property('id');",
+                  "  pm.expect(advertisers[0]).to.have.property('budget');",
+                  "});",
+                  "",
+                  "pm.test('both rails advertise their label', () => {",
+                  "  const rails = pm.response.json().rails;",
+                  "  pm.expect(rails.paypal.label).to.eql('paypal_payouts');",
+                  "  pm.expect(rails.solana.label).to.eql('solana-devnet');",
+                  "});",
+                  "",
+                  "pm.test('70/30 split is advertised', () => {",
+                  "  const split = pm.response.json().split;",
+                  "  pm.expect(split.userShare).to.eql(0.7);",
+                  "  pm.expect(split.publisherShare).to.eql(0.3);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/agents",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "agents"]
+            },
+            "description": "Advertiser rotation with per-campaign budgets, plus the rail readiness block that drives the payout buttons in the terminal."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "01 · Solana Devnet Rail",
+      "description": "The devnet wallet profile: treasury, reader and publisher addresses, the integer base-unit rate, live balances and funding help.",
+      "item": [
+        {
+          "name": "Solana profile · GET /api/solana",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('rail profile names the devnet cluster', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.rail).to.eql('solana-devnet');",
+                  "  pm.expect(b.cluster).to.be.a('string');",
+                  "  pm.expect(b.rpcUrl).to.match(/devnet/);",
+                  "});",
+                  "",
+                  "pm.test('all three wallet addresses are valid base58 pubkeys', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.treasury).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "  pm.expect(b.reader).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "  pm.expect(b.publisher).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "});",
+                  "",
+                  "pm.test('the euro rate is a whole number of base units', () => {",
+                  "  // Integer quantisation is what stops the 70/30 split drifting.",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.unitsPerEuro).to.be.a('number');",
+                  "  pm.expect(Number.isInteger(b.unitsPerEuro)).to.be.true;",
+                  "  pm.expect(b.unitsPerEuro).to.be.above(0);",
+                  "});",
+                  "",
+                  "pm.test('live balances and funding help are present', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.balances).to.be.an('object');",
+                  "  pm.expect(b.balances.treasury).to.be.a('number');",
+                  "  pm.expect(b.faucetUrl).to.match(/faucet\\.solana\\.com/);",
+                  "  pm.expect(b.explorerUrl).to.match(/explorer\\.solana\\.com/);",
+                  "});",
+                  "",
+                  "pm.test('memo format documents the on-chain contract', () => {",
+                  "  pm.expect(pm.response.json().memoFormat).to.include('ADPAL/v1');",
+                  "});",
+                  "",
+                  "const p = pm.response.json();",
+                  "pm.variables.set('solanaTreasury', p.treasury);",
+                  "pm.variables.set('solanaReader', p.reader);",
+                  "pm.variables.set('solanaPublisher', p.publisher);",
+                  "pm.variables.set('treasuryLamports', String(p.balances.treasury));",
+                  "pm.variables.set('unitsPerEuro', String(p.unitsPerEuro));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/solana",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "solana"]
+            },
+            "description": "Balances are read from the cluster, so this is also the fastest way to tell whether the treasury can actually pay for an anchor or a transfer. `treasuryLamports = 0` means on-chain settlement will report `unfunded` until you fund it."
+          },
+          "response": []
+        },
+        {
+          "name": "Fund treasury · POST /api/solana/fund",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('faucet attempt returns a definitive answer', () => {",
+                  "  // 200 = funded; 503 = the public faucet is rate-limited. Both are",
+                  "  // correct outcomes and neither may look like a crash.",
+                  "  pm.expect([200, 503]).to.include(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('a rate-limited faucet explains itself and links out', () => {",
+                  "  const b = pm.response.json();",
+                  "  if (pm.response.code === 503) {",
+                  "    pm.expect(b.ok).to.be.false;",
+                  "    pm.expect(b.error).to.be.a('string');",
+                  "    pm.expect(b.treasury).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "    pm.expect(b.faucetUrl).to.match(/faucet\\.solana\\.com/);",
+                  "  } else {",
+                  "    pm.expect(b.ok).to.be.true;",
+                  "    pm.expect(b.treasury).to.be.a('string');",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sol\": 1\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/solana/fund",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "solana", "fund"]
+            },
+            "description": "Asks the devnet faucet for SOL. Deliberately a manual action because the public faucet is rate-limited per IP — calling it on every settlement would only produce a wall of 429s.\n\nThis request is not required for the rest of the suite to pass; an unfunded treasury is a supported state."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "02 · L402 Protocol (402 → macaroon → 200)",
+      "description": "The full protocol handshake. The challenge's `payment_context_token` and `payment_hash` are stored and reused by the settle request; settle's `bearer_token` is reused by the unlock request.\n\nRun these in order — each one feeds the next.",
+      "item": [
+        {
+          "name": "Gated resource · GET /api/l402/offer → 402",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('402 Payment Required', () => {",
+                  "  pm.response.to.have.status(402);",
+                  "});",
+                  "",
+                  "pm.test('carries a WWW-Authenticate challenge', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.challenge).to.be.an('object');",
+                  "  pm.expect(b.challenge.www_authenticate).to.match(/^L402 /);",
+                  "  pm.expect(b.challenge.payment_hash).to.match(/^[0-9a-f]{64}$/);",
+                  "  pm.expect(b.challenge.scheme).to.eql('L402');",
+                  "});",
+                  "",
+                  "pm.test('publishes a priced offer catalogue', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.offers).to.be.an('array');",
+                  "  pm.expect(b.offers.length).to.be.at.least(1);",
+                  "  pm.expect(b.offers[0]).to.have.property('id');",
+                  "  pm.expect(b.offers[0].amount).to.be.above(0);",
+                  "});",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.variables.set('offerPaymentHash', b.challenge.payment_hash);",
+                  "pm.variables.set('wwwAuthenticate', b.challenge.www_authenticate);",
+                  "pm.variables.set('offerAmount', String(b.offers[0].amount));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/offer",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "offer"]
+            },
+            "description": "Returns **402**, not 200: this endpoint is the paid resource. The body is the L402 contract — offer list, price, and a challenge binding a `sha256(preimage)` payment hash.\n\nPresent a `Bearer` macaroon (see the unlock request) to get 200 instead."
+          },
+          "response": []
+        },
+        {
+          "name": "Challenge · POST /api/l402/challenge",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('402 with a fresh contract', () => {",
+                  "  pm.response.to.have.status(402);",
+                  "});",
+                  "",
+                  "pm.test('issues a payment context token', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.payment_context_token).to.match(/^[0-9a-f-]{36}$/);",
+                  "  pm.expect(b.payment_request.url).to.match(/\\/api\\/l402\\/settle$/);",
+                  "  pm.expect(b.expires_at).to.be.a('string');",
+                  "});",
+                  "",
+                  "pm.test('binds a 32-byte sha256 payment hash', () => {",
+                  "  pm.expect(pm.response.json().challenge.payment_hash).to.match(/^[0-9a-f]{64}$/);",
+                  "});",
+                  "",
+                  "pm.test('declares the required settlement fields', () => {",
+                  "  const fields = pm.response.json().payment_request.required_fields;",
+                  "  pm.expect(fields).to.include('payment_context_token');",
+                  "  pm.expect(fields).to.include('attention.signals');",
+                  "});",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.variables.set('payment_context_token', b.payment_context_token);",
+                  "pm.variables.set('payment_hash', b.challenge.payment_hash);",
+                  "pm.variables.set('challengeExpiresAt', b.expires_at);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"offer_id\": \"{{offerId}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/challenge",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "challenge"]
+            },
+            "description": "Explicitly starts a negotiation. Returns **402** with a new `payment_context_token` and the `payment_hash` the attention proof must commit to.\n\nThe token is stored for the settle request, so a single run chains end to end."
+          },
+          "response": []
+        },
+        {
+          "name": "Settle · POST /api/l402/settle",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 Payment settled', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('mints a verified bearer macaroon', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.bearer_token).to.be.a('string');",
+                  "  pm.expect(b.token_type).to.eql('Bearer');",
+                  "  pm.expect(b.macaroon.valid).to.be.true;",
+                  "  pm.expect(b.macaroon.caveats).to.be.above(0);",
+                  "  pm.expect(b.macaroon.caveatList).to.be.an('array');",
+                  "});",
+                  "",
+                  "pm.test('receipt commits to the same payment hash as the challenge', () => {",
+                  "  const expected = pm.variables.get('payment_hash');",
+                  "  pm.expect(pm.response.json().receipt.paymentHash).to.eql(expected);",
+                  "  pm.expect(pm.response.json().macaroon.paymentHashFull).to.eql(expected);",
+                  "});",
+                  "",
+                  "pm.test('attention proof scores above the human threshold', () => {",
+                  "  const p = pm.response.json().proof;",
+                  "  pm.expect(p.score).to.be.above(p.threshold);",
+                  "  pm.expect(p.verdict).to.be.a('string');",
+                  "  pm.expect(p.checks).to.be.an('array');",
+                  "  pm.expect(p.checks.length).to.be.at.least(1);",
+                  "});",
+                  "",
+                  "pm.test('credits the exact 70/30 split', () => {",
+                  "  const b = pm.response.json();",
+                  "  const split = b.receipt.split;",
+                  "  pm.expect(split.userRate).to.eql(0.7);",
+                  "  pm.expect(split.publisherRate).to.eql(0.3);",
+                  "  // Float-safe: 0.035 + 0.015 is not exactly 0.05 in binary.",
+                  "  pm.expect(split.user + split.publisher).to.be.closeTo(b.receipt.amount, 1e-9);",
+                  "});",
+                  "",
+                  "pm.test('records which rail will settle the credit', () => {",
+                  "  pm.expect(pm.response.json().receipt.payoutRail).to.be.oneOf(['paypal_payouts', 'solana-devnet']);",
+                  "});",
+                  "",
+                  "pm.test('solana receipt carries an explorer link either way', () => {",
+                  "  const s = pm.response.json().solana;",
+                  "  pm.expect(s.rail).to.eql('solana-devnet');",
+                  "  pm.expect(s.anchor).to.be.an('object');",
+                  "  pm.expect(s.anchor.status).to.be.oneOf(['confirmed', 'finalized', 'pending', 'unfunded', 'failed', 'disabled']);",
+                  "  pm.expect(s.anchorExplorerUrl).to.match(/explorer\\.solana\\.com/);",
+                  "});",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.variables.set('bearer_token', b.bearer_token);",
+                  "pm.variables.set('receiptReference', b.receipt.reference);",
+                  "pm.variables.set('anchorSignature', b.solana.anchorSignature || '');",
+                  "pm.variables.set('anchorStatus', b.solana.anchor.status);",
+                  "pm.variables.set('readerBalance', String(b.balance.user.balance));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payment_context_token\": \"{{payment_context_token}}\",\n  \"offer_id\": \"{{offerId}}\",\n  \"attention\": {\n    \"signals\": {\n      \"durationMs\": {{signals.durationMs}},\n      \"pageDwellMs\": {{signals.pageDwellMs}},\n      \"mouseMoves\": {{signals.mouseMoves}},\n      \"directionChanges\": {{signals.directionChanges}},\n      \"scrollEvents\": {{signals.scrollEvents}},\n      \"scrollDepth\": {{signals.scrollDepth}},\n      \"clicks\": {{signals.clicks}},\n      \"keyPresses\": {{signals.keyPresses}},\n      \"visibleRatio\": {{signals.visibleRatio}},\n      \"focusRatio\": {{signals.focusRatio}},\n      \"slotVisibleRatio\": {{signals.slotVisibleRatio}},\n      \"webdriver\": {{signals.webdriver}}\n    }\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/settle",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "settle"]
+            },
+            "description": "Submits the attention proof and settles the invoice.\n\nOn success the ledger is credited 70/30, a macaroon is minted, and the settlement queues an automatic payout on the configured rail (`PAYOUT_RAIL`, currently `solana-devnet`).\n\n**This endpoint does not choose a rail.** The rail is configured server-side, and `POST /api/payout` can override it per request — see the Payouts folder.\n\nSignal placeholders are bare JSON numbers/booleans taken from the environment. Do not quote them."
+          },
+          "response": []
+        },
+        {
+          "name": "Unlock resource · GET /api/l402/offer (Bearer) → 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 · the macaroon unlocks the paid resource', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('access is granted by a verified macaroon', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.ok).to.be.true;",
+                  "  pm.expect(b.grant.via).to.eql('macaroon');",
+                  "  pm.expect(b.grant.caveats).to.have.property('attenuation');",
+                  "});",
+                  "",
+                  "pm.test('returns the paid impression, not a fresh challenge', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.impression).to.be.an('object');",
+                  "  pm.expect(b.resource.offer_id).to.eql(pm.variables.get('offerId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{bearer_token}}",
+                "description": "The macaroon minted by the settle request. Note the scheme is `Bearer`, not `L402`."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/offer",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "offer"]
+            },
+            "description": "The same URL that returned 402 above, now returning **200** with the paid impression. This is the proof that the settlement actually granted access rather than just recording a payment."
+          },
+          "response": []
+        },
+        {
+          "name": "Sessions · GET /api/l402/sessions",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('recent contexts are listed for inspection', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.sessions).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/sessions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "sessions"]
+            },
+            "description": "Recent negotiation contexts — the same data the terminal inspector renders."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "03 · Solana On-Chain Verification",
+      "description": "Re-reads a devnet transaction from the cluster and checks it against the settled invoice: confirmation status, memo binding to `sha256(preimage)`, recipient and exact base-unit amount.\n\nThe two rejection requests are deterministic and always run. The third only meaningful when the treasury is funded and an anchor signature exists.",
+      "item": [
+        {
+          "name": "Confirm · malformed signature → 402",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('402 · rejected, not 500', () => {",
+                  "  // A signature that is 64 base58 chars but ~47 bytes makes the RPC",
+                  "  // answer WrongSize, so it must be caught locally.",
+                  "  pm.response.to.have.status(402);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test('names the format check as the failure', () => {",
+                  "  pm.expect(body.verified).to.be.false;",
+                  "  const failed = body.checks.filter((c) => !c.passed);",
+                  "  pm.expect(failed.length).to.be.at.least(1);",
+                  "  pm.expect(body.checks[0].id).to.eql('format');",
+                  "  pm.expect(body.checks[0].passed).to.be.false;",
+                  "});",
+                  "",
+                  "pm.test('echoes the signature and the invoice hash it was checked against', () => {",
+                  "  pm.expect(body.signature).to.be.a('string');",
+                  "  pm.expect(body.payment_hash).to.match(/^[0-9a-f]{64}$/);",
+                  "  pm.expect(body.reason).to.be.a('string');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"signature\": \"{{invalidSignature}}\",\n  \"payment_context_token\": \"{{payment_context_token}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/solana/confirm",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "solana", "confirm"]
+            },
+            "description": "Sends 64 base58 characters that decode to only ~47 bytes. The route must reject this with **402** and a `format` check — never a 500 from the RPC's `WrongSize` error."
+          },
+          "response": []
+        },
+        {
+          "name": "Confirm · unknown signature → 402",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('402 · not found on devnet', () => {",
+                  "  pm.response.to.have.status(402);",
+                  "});",
+                  "",
+                  "pm.test('reports per-check detail instead of a bare failure', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.verified).to.be.false;",
+                  "  pm.expect(b.reason).to.be.a('string');",
+                  "  pm.expect(b.checks).to.be.an('array');",
+                  "  const failed = b.checks.filter((c) => !c.passed);",
+                  "  pm.expect(failed.length).to.be.at.least(1);",
+                  "});",
+                  "",
+                  "pm.test('still builds an explorer link for the attempted signature', () => {",
+                  "  pm.expect(pm.response.json().explorerUrl).to.match(/explorer\\.solana\\.com\\/tx\\//);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"signature\": \"{{unknownSignature}}\",\n  \"payment_context_token\": \"{{payment_context_token}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/solana/confirm",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "solana", "confirm"]
+            },
+            "description": "A well-formed 64-byte signature that devnet has never seen. The route reads the cluster, finds nothing, and refuses with **402** — while still returning the checks array so the caller knows why."
+          },
+          "response": []
+        },
+        {
+          "name": "Confirm · anchored proof (verified when funded)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const anchor = pm.variables.get('anchorSignature');",
+                  "const status = pm.variables.get('anchorStatus');",
+                  "",
+                  "if (anchor) {",
+                  "  pm.test('200 · the received anchor verifies against the invoice hash', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "  });",
+                  "",
+                  "  pm.test('every on-chain check passed', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.verified).to.be.true;",
+                  "    const failed = b.checks.filter((c) => !c.passed);",
+                  "    pm.expect(failed.length).to.eql(0);",
+                  "  });",
+                  "",
+                  "  pm.test('memo is bound to the settled payment hash', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.payment_hash).to.eql(pm.variables.get('payment_hash'));",
+                  "    pm.expect(b.memo).to.include('ADPAL/v1');",
+                  "  });",
+                  "} else {",
+                  "  pm.test.skip('no anchor signature yet · treasury is ' + (status || 'unfunded'), () => {});",
+                  "",
+                  "  pm.test('the empty-signature request is refused rather than accepted', () => {",
+                  "    pm.expect([400, 402]).to.include(pm.response.code);",
+                  "  });",
+                  "",
+                  "  pm.test('the refusal explains what is missing', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.error).to.be.a('string');",
+                  "    pm.expect(b.message).to.be.a('string');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"signature\": \"{{anchorSignature}}\",\n  \"payment_context_token\": \"{{payment_context_token}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/l402/solana/confirm",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "l402", "solana", "confirm"]
+            },
+            "description": "Confirms the anchor signature captured from the settle response: the transaction is re-read from devnet and must commit to the same `sha256(preimage)`.\n\nWhen the treasury is unfunded there is no signature to confirm, so the script skips the positive assertion and instead checks that the empty request is refused cleanly.\n\nTo make this a real 200: fund the treasury (`POST /api/solana/fund` or the faucet link), then re-run from the Challenge request."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "04 · Payout Rails",
+      "description": "Both rails share the ledger reservation, the threshold and the 70/30 rule. Only the settlement call differs.\n\nThese requests accept **200** (paid) or **409** (`THRESHOLD_NOT_REACHED`) because the ledger is stateful and the outcome depends on it, not on the request:\n\n- A fresh reset starts the reader at €0.00, and the single settle in the L402 folder credits €0.035 against a €0.05 threshold — so a 409 is the correct answer.\n- `PAYPAL_AUTO_PAYOUT=true` fires **900ms** after a settlement crosses the threshold. By the time you click a payout button by hand, the credit has usually already been spent automatically, so a 409 again means \"already paid\", not \"broken\".\n\nBecause both outcomes are legitimate, the tests assert the response *shape* in either branch. To force a 200 by hand: switch `PAYPAL_AUTO_PAYOUT=false`, reset, settle twice, then call payout.",
+      "item": [
+        {
+          "name": "Payout · PayPal Sandbox rail",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 paid or 409 below threshold', () => {",
+                  "  pm.expect([200, 409]).to.include(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('a successful run returns a PayPal batch id', () => {",
+                  "  const b = pm.response.json();",
+                  "  if (pm.response.code === 200) {",
+                  "    pm.expect(b.settled).to.be.true;",
+                  "    pm.expect(b.rail).to.eql('paypal_payouts');",
+                  "    pm.expect(b.paypal.batchId).to.be.a('string');",
+                  "  } else {",
+                  "    pm.expect(b.error).to.eql('THRESHOLD_NOT_REACHED');",
+                  "    pm.expect(b.missing).to.be.above(0);",
+                  "    pm.expect(b.message).to.include('threshold');",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rail\": \"{{payoutRailPaypal}}\",\n  \"reason\": \"{{payoutReason}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/payout",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "payout"]
+            },
+            "description": "Forces the PayPal REST Sandbox rail regardless of the server's configured default. Moves the reader's 70% and the publisher's 30% as two Payouts items.\n\nRepeated runs drain the reader balance, so a later call will legitimately return 409 until more impressions settle or the ledger is reset."
+          },
+          "response": []
+        },
+        {
+          "name": "Payout · Solana Devnet rail",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 paid, 409 below threshold, or 503 unfunded', () => {",
+                  "  pm.expect([200, 409, 503]).to.include(pm.response.code);",
+                  "});",
+                  "",
+                  "pm.test('a successful run returns one atomic transaction', () => {",
+                  "  const b = pm.response.json();",
+                  "  if (pm.response.code === 200 && b.solana) {",
+                  "    pm.expect(b.rail).to.eql('solana-devnet');",
+                  "    pm.expect(b.solana.signature).to.be.a('string');",
+                  "    pm.expect(b.solana.units.reader + b.solana.units.publisher).to.eql(b.solana.units.total);",
+                  "    pm.expect(Number.isInteger(b.solana.units.reader)).to.be.true;",
+                  "    pm.expect(Number.isInteger(b.solana.units.publisher)).to.be.true;",
+                  "    pm.expect(b.solana.explorerUrl).to.match(/explorer\\.solana\\.com\\/tx\\//);",
+                  "  }",
+                  "});",
+                  "",
+                  "pm.test('a PayPal fallback is labelled, never silent', () => {",
+                  "  const b = pm.response.json();",
+                  "  if (b.rail === 'paypal_payouts' && b.requestedRail === 'solana-devnet') {",
+                  "    pm.expect(b.fallback.from).to.eql('solana-devnet');",
+                  "    pm.expect(b.fallback.to).to.eql('paypal_payouts');",
+                  "    pm.expect(b.fallback.code).to.be.a('string');",
+                  "  }",
+                  "});",
+                  "",
+                  "pm.test('an unfunded treasury names the shortfall', () => {",
+                  "  const b = pm.response.json();",
+                  "  if (pm.response.code === 503) {",
+                  "    pm.expect(b.error).to.be.a('string');",
+                  "    pm.expect(b.solana.treasury).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "  }",
+                  "  if (pm.response.code === 409) {",
+                  "    pm.expect(b.error).to.eql('THRESHOLD_NOT_REACHED');",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rail\": \"{{payoutRailSolana}}\",\n  \"reason\": \"{{payoutReason}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/payout",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "payout"]
+            },
+            "description": "Executes the 70/30 split as a single devnet transaction: two transfers plus a memo committing to the payout reference and the L402 hash.\n\nOne transaction means both legs succeed or neither does. Amounts are integer base units, so the split cannot drift.\n\nWhen the treasury is unfunded and `SOLANA_FALLBACK_TO_PAYPAL=true`, the response reports `requestedRail` and a `fallback` block rather than silently returning a PayPal batch id."
+          },
+          "response": []
+        },
+        {
+          "name": "Balance · GET /api/balance",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('ledger exposes the reader/publisher split and both rails', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.user.balance).to.be.a('number');",
+                  "  pm.expect(b.publisher.balance).to.be.a('number');",
+                  "  pm.expect(b.threshold).to.be.above(0);",
+                  "  pm.expect(b.solana.treasury).to.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);",
+                  "  pm.expect(b.paypal.configured).to.be.a('boolean');",
+                  "});",
+                  "",
+                  "pm.test('payout history labels the rail that settled each payout', () => {",
+                  "  const payouts = pm.response.json().payouts;",
+                  "  pm.expect(payouts).to.be.an('array');",
+                  "  for (const payout of payouts) {",
+                  "    pm.expect(payout.rail).to.be.oneOf(['paypal_payouts', 'solana-devnet']);",
+                  "    pm.expect(payout.id).to.be.a('string');",
+                  "    pm.expect(payout.method).to.be.oneOf(['paypal', 'solana']);",
+                  "  }",
+                  "});",
+                  "",
+                  "pm.test('stats report whether a payout is in flight', () => {",
+                  "  const stats = pm.response.json().stats;",
+                  "  pm.expect(stats.payoutsTotal).to.be.a('number');",
+                  "  pm.expect(stats.payoutPending).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/balance",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "balance"]
+            },
+            "description": "The ledger snapshot the terminal renders: balances, rules, stats, payout history and the redacted PayPal/Solana profiles."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "05 · PayPal Webhooks",
+      "description": "Inbound notifications from PayPal. These are the only endpoints in the collection that a *client* never calls — PayPal does.\n\nThe contract is unusual, so the tests assert it explicitly: a well-formed event that changes nothing must still answer **200**, because PayPal retries every non-2xx forever. The `outcome` field distinguishes `handled` (ledger updated) from `ignored`, `duplicate` and `unmatched`.\n\nNo signature headers are sent here. With `PAYPAL_WEBHOOK_ID` unset the route reports `signature: \"skipped\"` rather than pretending to verify — the same honesty the validator relies on. Set that variable (and `PAYPAL_WEBHOOK_STRICT=true` to refuse unverified events) to exercise the real round-trip.",
+      "item": [
+        {
+          "name": "Webhook · payout item event acknowledged",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 acknowledged', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('receipt names the event and an outcome', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.ok).to.be.true;",
+                  "  pm.expect(b.received).to.be.true;",
+                  "  pm.expect(b.event_type).to.eql('PAYMENT.PAYOUTS-ITEM.SUCCEEDED');",
+                  "  pm.expect(b.outcome).to.be.oneOf(['handled', 'ignored', 'duplicate', 'unmatched']);",
+                  "});",
+                  "",
+                  "pm.test('an unverifiable signature is reported, not assumed', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.signature).to.be.oneOf(['verified', 'skipped']);",
+                  "  pm.expect(b.signature_reason).to.be.a('string');",
+                  "});",
+                  "",
+                  "pm.test('the rail is the PayPal one and the ledger is intact', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.rail).to.eql('paypal_payouts');",
+                  "  pm.expect(b.balance.user.balance).to.be.a('number');",
+                  "  pm.expect(b.balance.publisher.balance).to.be.a('number');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"WH-DEMO-ITEM-SUCCEEDED\",\n  \"event_type\": \"PAYMENT.PAYOUTS-ITEM.SUCCEEDED\",\n  \"event_version\": \"1.0\",\n  \"resource_type\": \"payouts\",\n  \"resource\": {\n    \"payout_batch_id\": \"DEMO-BATCH-NOT-IN-LEDGER\",\n    \"payout_item_id\": \"DEMO-ITEM-1\",\n    \"transaction_status\": \"SUCCESS\",\n    \"sender_batch_id\": \"{{payoutReason}}\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/paypal",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "paypal"]
+            },
+            "description": "A payout item success notification. The batch id is deliberately not in the ledger, so a fresh run answers `outcome: \"unmatched\"` — acknowledged, nothing changed. That is the delivery-and-acknowledge contract working, not a failure. Re-posting the same event id inside a run answers `duplicate`; `POST /api/dev/reset` clears the replay guard so this request stays repeatable."
+          },
+          "response": []
+        },
+        {
+          "name": "Webhook · unknown event type is ignored safely",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 — an unknown type must not break receipt', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('outcome is ignored and no payout was touched', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.outcome).to.eql('ignored');",
+                  "  pm.expect(b.payout).to.eql(null);",
+                  "  pm.expect(b.reversal).to.eql(null);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"WH-DEMO-UNKNOWN-TYPE\",\n  \"event_type\": \"SOME.FUTURE.PAYPAL.EVENT\",\n  \"resource_type\": \"unknown\",\n  \"resource\": { \"anything\": true }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/paypal",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "paypal"]
+            },
+            "description": "PayPal adds event types over time. An unmodelled type is acknowledged with `outcome: \"ignored\"` so PayPal stops retrying it, and the ledger is left alone."
+          },
+          "response": []
+        },
+        {
+          "name": "Webhook · malformed body is refused",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 for a body that is not an event', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "});",
+                  "",
+                  "pm.test('the error names the reason', () => {",
+                  "  pm.expect(pm.response.json().error).to.eql('INVALID_EVENT');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "\"not-an-event\"",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/webhooks/paypal",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "webhooks", "paypal"]
+            },
+            "description": "Valid JSON that is not a webhook event. Parsing succeeded, so this is not a transport error — the body simply is not an event, and the route says so instead of storing nonsense."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "99 · Maintenance (destructive)",
+      "description": "Resets the simulator so the suite is repeatable. Left last and clearly labelled because it clears live state.",
+      "item": [
+        {
+          "name": "Reset ledger · POST /api/dev/reset",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('ledger is back to zero', () => {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.reset).to.be.true;",
+                  "  pm.expect(b.balance.user.balance).to.eql(0);",
+                  "  pm.expect(b.balance.publisher.balance).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/dev/reset",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "dev", "reset"]
+            },
+            "description": "**Destructive.** Clears balances, campaign budgets, L402 contexts, payout history and the Solana replay guard.\n\nRemove this request from a run when you are demoing against a ledger you want to keep."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

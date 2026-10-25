@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "AdPal",
+  "version": "1.0.0",
+  "description": "Passive ad monetization: read normally, attention verified server-side, 70/30 split, live balance.",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "AdPal — your balance",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

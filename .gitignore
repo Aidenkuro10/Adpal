@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Local configuration
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated packages
+*.zip
+*.crx
+*.pem
+
+# Solana demo keypairs (devnet only, still never commit them)
+server/.solana-devnet-keys.json

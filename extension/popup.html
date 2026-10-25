@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdPal</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">A</span>
+      <span>AdPal</span>
+    </div>
+    <div class="status" id="status" title="Connection status">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="status-text">Connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card balance">
+      <div class="label">Available balance</div>
+      <div class="amount">
+        <span class="currency">€</span><span id="user-balance">0.000</span>
+      </div>
+      <div class="progress" role="progressbar" aria-label="Progress toward the payout threshold"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="threshold-progress">
+        <div class="progress-fill" id="threshold-fill"></div>
+      </div>
+      <div class="threshold">
+        <span id="threshold-label">€0.000 / €0.100</span>
+        <span id="threshold-percent">0%</span>
+      </div>
+      <button class="primary" id="flush" type="button" disabled>Threshold: €0.100</button>
+      <p class="feedback" id="flush-feedback" hidden></p>
+    </section>
+
+    <section class="grid" aria-label="Revenue split">
+      <div class="stat">
+        <span>Publisher</span>
+        <strong id="publisher-balance">€0.000</strong>
+      </div>
+      <div class="stat">
+        <span>Advertiser budget</span>
+        <strong id="advertiser-budget">—</strong>
+      </div>
+      <div class="stat">
+        <span>Accepted offers</span>
+        <strong id="offers-count">0</strong>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>Last verification</h2>
+        <span id="last-score" class="score-label">—</span>
+      </div>
+      <div class="score">
+        <div class="score-fill" id="score-fill"></div>
+      </div>
+      <p class="muted" id="last-reason">No offers evaluated yet.</p>
+    </section>
+
+    <section class="card">
+      <h2>Autonomy rules</h2>
+      <ul class="rules" id="rules">
+        <li><span>Maximum price per offer</span><strong>€0.050</strong></li>
+        <li><span>Your share</span><strong>70%</strong></li>
+        <li><span>PayPal payout threshold</span><strong>€0.100</strong></li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>Recent activity</h2>
+        <span class="muted" id="activity-count"></span>
+      </div>
+      <ul class="activity" id="activity">
+        <li class="empty">No activity yet. Open the demo page to try it out.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <button class="link" id="open-demo" type="button">Open demo</button>
+    <span id="server-url">localhost:3000</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

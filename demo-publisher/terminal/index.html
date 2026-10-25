@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdPal — Agent Terminal</title>
+  <meta name="description" content="Live JSON stream of AdPal agent-to-agent negotiation, L402 macaroons, PayPal Sandbox batches and Solana Devnet settlement.">
+  <meta name="color-scheme" content="dark">
+  <link rel="stylesheet" href="terminal.css">
+</head>
+<body>
+
+  <!-- Top bar ------------------------------------------------------- -->
+  <header class="bar">
+    <div class="bar-left">
+      <span class="mark" aria-hidden="true">A</span>
+      <div class="bar-ident">
+        <h1>AdPal <span>Agent Terminal</span></h1>
+        <p class="bar-sub">Agent-to-agent negotiation · L402 · PayPal Sandbox · Solana Devnet</p>
+      </div>
+    </div>
+
+    <div class="bar-mid">
+      <span class="endpoint"><b>SSE</b> <code>/api/logs?live=1</code></span>
+      <span class="conn" id="conn" data-state="connecting">
+        <i aria-hidden="true"></i><span id="conn-label">connecting…</span>
+      </span>
+    </div>
+
+    <div class="bar-right">
+      <a class="bar-link" href="/demo/" target="_blank" rel="noopener">Open publication ↗</a>
+      <a class="bar-link" href="/api/telemetry" target="_blank" rel="noopener">REST snapshot ↗</a>
+    </div>
+  </header>
+
+  <div class="shell">
+
+    <!-- Log stream -------------------------------------------------- -->
+    <main class="console" aria-label="Negotiation log stream">
+
+      <div class="toolbar">
+        <div class="filters" role="group" aria-label="Filter events">
+          <button class="filter is-active" data-filter="all" type="button">
+            All <span id="count-all">0</span>
+          </button>
+          <button class="filter" data-filter="l402" type="button">
+            L402 <span id="count-l402">0</span>
+          </button>
+          <button class="filter" data-filter="attention" type="button">
+            Attention <span id="count-attention">0</span>
+          </button>
+          <button class="filter" data-filter="paypal" type="button">
+            PayPal <span id="count-paypal">0</span>
+          </button>
+          <button class="filter" data-filter="solana" type="button">
+            Solana <span id="count-solana">0</span>
+          </button>
+          <button class="filter" data-filter="negotiation" type="button">
+            Negotiation <span id="count-negotiation">0</span>
+          </button>
+        </div>
+
+        <div class="tools">
+          <label class="switch">
+            <input type="checkbox" id="follow" checked>
+            <span>Follow tail</span>
+          </label>
+          <button class="tool" id="expand-all" type="button">Expand</button>
+          <button class="tool" id="collapse-all" type="button">Collapse</button>
+          <button class="tool" id="pause" type="button" aria-pressed="false">Pause</button>
+          <button class="tool" id="clear" type="button">Clear</button>
+          <button class="tool" id="reset-run" type="button" title="Clear the stream and reset the simulator ledger">New run</button>
+          <button class="tool is-primary" id="download" type="button">Export .jsonl</button>
+        </div>
+      </div>
+
+      <div class="stream" id="stream" role="log" aria-live="polite" aria-label="Structured JSON events">
+        <div class="empty" id="empty">
+          <p class="empty-kicker">Act 1 · standing by</p>
+          <p class="empty-title">Waiting for reader attention…</p>
+          <p class="empty-body">
+            Open <code>/demo/</code> in a second window and read. Hold a sponsored
+            placement in view for about six seconds; the extension submits the
+            attention proof and every step of the negotiation appears here as raw
+            JSON — 402 challenge, macaroon, 70/30 split, PayPal batch.
+          </p>
+          <p class="empty-body empty-body-quiet">
+            The stream is opened from the current sequence, so a refreshed terminal
+            starts clean instead of replaying the previous run.
+          </p>
+        </div>
+      </div>
+
+      <footer class="statusline">
+        <span id="stat-events">0 events</span>
+        <span id="stat-seq">seq 0</span>
+        <span id="stat-errors">0 errors</span>
+        <span id="stat-last">—</span>
+        <span class="statusline-spacer"></span>
+        <span id="stat-paused" hidden>paused · buffer is not updating the view</span>
+      </footer>
+    </main>
+
+    <!-- Live inspector rail ----------------------------------------- -->
+    <aside class="rail" aria-label="Live pipeline state">
+
+      <section class="card card-runbook" id="card-runbook">
+        <header class="card-head">
+          <h2>Demo runbook</h2>
+          <span class="card-tag" id="runbook-state">act 1 / 4</span>
+        </header>
+        <ol class="acts" id="acts">
+          <li class="act is-current" data-act="attention">
+            <span class="act-dot" aria-hidden="true"></span>
+            <div class="act-body">
+              <strong>Reader attention</strong>
+              <span>Read /demo/, hold a placement in view for 6 s.</span>
+            </div>
+          </li>
+          <li class="act" data-act="challenge">
+            <span class="act-dot" aria-hidden="true"></span>
+            <div class="act-body">
+              <strong>402 challenge</strong>
+              <span>Offer, €0.020 price, payment hash.</span>
+            </div>
+          </li>
+          <li class="act" data-act="macaroon">
+            <span class="act-dot" aria-hidden="true"></span>
+            <div class="act-body">
+              <strong>Macaroon + split</strong>
+              <span>Caveats verified, 70/30 credited.</span>
+            </div>
+          </li>
+          <li class="act" data-act="payout">
+            <span class="act-dot" aria-hidden="true"></span>
+            <div class="act-body">
+              <strong>Rail settlement</strong>
+              <span>PayPal batch or one Solana 70/30 transfer.</span>
+            </div>
+          </li>
+        </ol>
+        <p class="card-note" id="runbook-note">Waiting for reader attention…</p>
+      </section>
+
+      <section class="card" id="card-attention">
+        <header class="card-head">
+          <h2>Viewport attention</h2>
+          <span class="card-tag" id="attention-phase">idle</span>
+        </header>
+        <div class="score">
+          <strong id="attention-value">0</strong><span>/100</span>
+        </div>
+        <div class="score-track" aria-hidden="true"><i id="attention-fill"></i></div>
+        <dl class="kv">
+          <div><dt>Placement</dt><dd id="attention-slot">—</dd></div>
+          <div><dt>Active reading</dt><dd id="attention-active">—</dd></div>
+          <div><dt>Article depth</dt><dd id="attention-depth">—</dd></div>
+          <div><dt>Session</dt><dd id="attention-session">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="card" id="card-agent">
+        <header class="card-head">
+          <h2>Negotiation</h2>
+          <span class="card-tag" id="agent-state">awaiting offer</span>
+        </header>
+        <dl class="kv">
+          <div><dt>Offer</dt><dd class="mono" id="agent-offer">—</dd></div>
+          <div><dt>Advertiser agent</dt><dd class="mono" id="agent-id">—</dd></div>
+          <div><dt>Bid</dt><dd id="agent-bid">—</dd></div>
+          <div><dt>Creative</dt><dd id="agent-creative">—</dd></div>
+          <div><dt>Human score</dt><dd id="agent-score">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="card" id="card-l402">
+        <header class="card-head">
+          <h2>L402 macaroon</h2>
+          <span class="card-tag" id="l402-state">no token</span>
+        </header>
+        <dl class="kv">
+          <div><dt>Offer</dt><dd class="mono" id="l402-offer">—</dd></div>
+          <div><dt>Context token</dt><dd class="mono" id="l402-context">—</dd></div>
+          <div><dt>Token id</dt><dd class="mono" id="l402-id">—</dd></div>
+          <div><dt>Caveats</dt><dd id="l402-caveats">—</dd></div>
+          <div><dt>Payment hash</dt><dd class="mono" id="l402-hash">—</dd></div>
+          <div><dt>Expires</dt><dd id="l402-expiry">—</dd></div>
+          <div><dt>Signature</dt><dd id="l402-signature">—</dd></div>
+        </dl>
+        <p class="card-note" id="l402-note">Waiting for the first 402 challenge.</p>
+      </section>
+
+      <section class="card" id="card-paypal">
+        <header class="card-head">
+          <h2>PayPal Sandbox</h2>
+          <span class="card-tag" id="paypal-mode">sandbox</span>
+        </header>
+        <div class="balance">
+          <span>Reader balance</span>
+          <strong id="paypal-balance">€0.000</strong>
+        </div>
+
+        <dl class="kv kv-tight">
+          <div><dt>Payable now</dt><dd class="mono" id="paypal-payable">€0.00</dd></div>
+          <div><dt>Threshold</dt><dd class="mono" id="paypal-threshold">€0.050</dd></div>
+          <div><dt>Publisher · 30%</dt><dd class="mono" id="paypal-publisher">€0.000</dd></div>
+        </dl>
+
+        <div class="paypal-actions">
+          <button class="action is-primary" id="payout-request" type="button" disabled>
+            Request payout
+          </button>
+          <button class="action" id="payout-refresh" type="button" disabled>
+            Refresh batch
+          </button>
+        </div>
+        <p class="action-note" id="payout-note" role="status">
+          Payouts are created by the server through the PayPal REST Payouts API.
+        </p>
+
+        <dl class="kv">
+          <div><dt>Batch</dt><dd class="mono" id="paypal-batch">—</dd></div>
+          <div><dt>Status</dt><dd><span class="pill" id="paypal-status">not sent</span></dd></div>
+          <div><dt>Amount</dt><dd id="paypal-amount">—</dd></div>
+          <div><dt>Recipient</dt><dd class="mono" id="paypal-recipient">—</dd></div>
+          <div><dt>OAuth2</dt><dd id="paypal-oauth">not requested</dd></div>
+        </dl>
+        <p class="card-note" id="paypal-note">
+          PayPal batches stream here with credentials redacted; on-chain payouts appear below.
+          <a class="card-link" id="paypal-dashboard" href="https://www.sandbox.paypal.com/" target="_blank" rel="noopener">Open Sandbox ↗</a>
+        </p>
+      </section>
+
+      <section class="card" id="card-solana">
+        <header class="card-head">
+          <h2>Solana Devnet</h2>
+          <span class="card-tag" id="solana-state">checking</span>
+        </header>
+        <div class="balance">
+          <span>Treasury</span>
+          <strong id="solana-balance">— SOL</strong>
+        </div>
+        <dl class="kv kv-tight">
+          <div><dt>Cluster</dt><dd class="mono" id="solana-cluster">devnet · SOL</dd></div>
+          <div><dt>Treasury</dt><dd class="mono" id="solana-treasury">—</dd></div>
+          <div><dt>Reader · 70%</dt><dd class="mono" id="solana-reader">—</dd></div>
+          <div><dt>Publisher · 30%</dt><dd class="mono" id="solana-publisher">—</dd></div>
+          <div><dt>Rate</dt><dd class="mono" id="solana-rate">—</dd></div>
+        </dl>
+
+        <div class="paypal-actions">
+          <button class="action is-primary" id="payout-solana" type="button" disabled>
+            Pay on Solana
+          </button>
+          <button class="action" id="solana-fund" type="button">
+            Fund devnet
+          </button>
+        </div>
+        <p class="action-note" id="solana-note">
+          One devnet transaction carries both 70/30 legs and the L402 memo.
+        </p>
+
+        <dl class="kv">
+          <div><dt>Proof hash</dt><dd class="mono" id="solana-hash">—</dd></div>
+          <div><dt>Anchor tx</dt><dd class="mono" id="solana-anchor">—</dd></div>
+          <div><dt>Payout tx</dt><dd class="mono" id="solana-payout">—</dd></div>
+          <div><dt>Status</dt><dd><span class="pill" id="solana-status">no tx</span></dd></div>
+        </dl>
+        <p class="card-note">
+          Hash, amount and recipient are re-read from the cluster before a proof counts.
+          <a class="card-link" id="solana-explorer" href="https://explorer.solana.com/?cluster=devnet" target="_blank" rel="noopener">Explorer ↗</a>
+          <a class="card-link" id="solana-faucet" href="https://faucet.solana.com" target="_blank" rel="noopener">Faucet ↗</a>
+        </p>
+      </section>
+
+      <section class="card card-quiet">
+        <header class="card-head">
+          <h2>Stream</h2>
+        </header>
+        <dl class="kv">
+          <div><dt>Endpoint</dt><dd class="mono">/api/logs</dd></div>
+          <div><dt>Transport</dt><dd>Server-Sent Events</dd></div>
+          <div><dt>Mode</dt><dd>live from now</dd></div>
+          <div><dt>Buffer</dt><dd id="stream-buffer">0 events</dd></div>
+          <div><dt>Connection</dt><dd id="stream-conn">connecting</dd></div>
+        </dl>
+        <p class="card-note">
+          Disconnecting is safe: the server replays from
+          <code>Last-Event-ID</code> when the stream reconnects.
+          <em>New run</em> clears the view and resets the ledger.
+        </p>
+      </section>
+
+      <section class="card card-quiet">
+        <header class="card-head">
+          <h2>Agent toolkit</h2>
+          <span class="card-tag" id="toolkit-state">loading</span>
+        </header>
+        <dl class="kv">
+          <div><dt>PayPal AI Toolkit</dt><dd id="toolkit-version">—</dd></div>
+          <div><dt>MCP server</dt><dd class="mono" id="toolkit-mcp">—</dd></div>
+          <div><dt>Tools</dt><dd id="toolkit-tools">—</dd></div>
+          <div><dt>Auto payout</dt><dd id="toolkit-auto">—</dd></div>
+        </dl>
+        <p class="card-note">
+          The advertiser agent authorizes campaign spend; the protocol agent
+          routes each settled invoice to the Payouts API.
+        </p>
+      </section>
+
+    </aside>
+  </div>
+
+  <script src="terminal.js"></script>
+</body>
+</html>

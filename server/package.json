@@ -1,0 +1,28 @@
+{
+  "name": "adpal-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AdPal simulator: attention scoring, a 70/30 revenue split, and grouped payouts.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "adpal",
+    "attention",
+    "simulator",
+    "express"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

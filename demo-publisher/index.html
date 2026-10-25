@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Attention Revolution — The Courier</title>
+  <meta name="description" content="The Courier — an independent publication on media, technology and the economics of attention. A fictional demo edition.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!--
+    The publication view of the AdPal demo.
+
+    This page is editorial only: a bento-grid front page and a reading column
+    with a sticky sidebar. There is no telemetry panel, no protocol badge and no
+    "you earned" toast.
+
+    Sponsored placements are pre-allocated, not injected. Each `.adpal-slot`
+    reserves its final height in CSS from the first paint, so when the extension
+    mounts an approved creative the surrounding text never moves: the unit fades
+    into a box that was always there. Placements live inside bento cards or in
+    the sidebar rail — never in the middle of a paragraph flow.
+
+    The agent terminal (SSE, L402, PayPal) is a separate surface at /terminal/.
+  -->
+  <a class="skip-link" href="#story">Skip to the story</a>
+
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="wordmark" href="#top">The Courier</a>
+      <nav class="topnav" aria-label="Sections">
+        <a href="#story" class="is-active">Media</a>
+        <a href="#numbers">Numbers</a>
+        <a href="#issue">Technology</a>
+        <a href="#invoice">Business</a>
+        <a href="#more">Culture</a>
+      </nav>
+      <div class="masthead-actions">
+        <span class="edition">Weekend edition</span>
+        <a class="subscribe" href="#newsletter">Subscribe</a>
+      </div>
+    </div>
+    <div class="read-progress" role="presentation"><span id="read-progress-bar"></span></div>
+  </header>
+
+  <main class="page" id="top">
+
+    <!-- Front page: bento grid of stories, quick takes and one stat card -->
+    <section class="front" aria-label="Front page">
+      <div class="bento">
+
+        <article class="card card-lead">
+          <div class="card-top">
+            <span class="eyebrow">Cover story</span>
+            <span class="card-meta">Media · 8 min read</span>
+          </div>
+
+          <h1 class="headline">The Attention Revolution</h1>
+
+          <p class="deck">
+            For thirty years the web has taken attention for free. A small group of
+            publishers is now testing an older idea in a new form: put a price on
+            the look, and pay the person who gave it.
+          </p>
+
+          <div class="byline">
+            <span class="avatar" aria-hidden="true">MA</span>
+            <div class="byline-text">
+              <span class="byline-name">Margot Alder</span>
+              <span class="byline-meta">Media &amp; technology · October 25, 2026</span>
+            </div>
+            <a class="jump" href="#story">Read the essay <span aria-hidden="true">↓</span></a>
+          </div>
+
+          <div class="lead-art" aria-hidden="true">
+            <span class="lead-art-glow"></span>
+            <span class="lead-art-rings"></span>
+            <span class="lead-art-label">The attention economy, re-priced</span>
+          </div>
+        </article>
+
+        <aside class="card card-quicktake">
+          <span class="eyebrow eyebrow-light">Quick take</span>
+          <blockquote>
+            “The most valuable thing on a web page is not the banner. It is the
+            two seconds of attention the banner interrupts.”
+          </blockquote>
+          <span class="quicktake-meta">From the cover essay</span>
+        </aside>
+
+        <aside class="card card-numbers" id="numbers">
+          <div class="card-top">
+            <span class="eyebrow">By the numbers</span>
+            <span class="card-meta">Attention</span>
+          </div>
+
+          <div class="stat">
+            <strong class="stat-figure">1.1<span class="stat-unit">s</span></strong>
+            <p class="stat-copy">
+              Median time a display banner spends actually in view. The average
+              reader stays for four minutes.
+            </p>
+          </div>
+
+          <dl class="mini-stats">
+            <div><dt>Click-through, display</dt><dd>0.1%</dd></div>
+            <div><dt>Reader share of a paid look</dt><dd>70%</dd></div>
+          </dl>
+
+          <!-- Placement 1 · reserved line inside the stat card -->
+          <div class="adpal-slot" id="adpal-slot" data-adpal-slot="1" data-adpal-layout="inline"></div>
+        </aside>
+
+      </div>
+    </section>
+
+    <!-- The essay ------------------------------------------------------ -->
+    <article class="story" id="story">
+
+      <div class="story-head">
+        <span class="eyebrow">Essay</span>
+        <h2 class="story-title">A grey rectangle, and what it cost us</h2>
+      </div>
+
+      <div class="prose">
+        <p class="lead">
+          The first banner ad went live in October 1994. It was a grey rectangle
+          the size of a business card, it asked a disarmingly simple question
+          about your desktop, and nearly half the people who saw it clicked. That
+          number has never been repeated — for the entirely predictable reason
+          that the web spent the next thirty years making the deal worse for
+          everyone except the people selling it.
+        </p>
+
+        <p>
+          The modern page is a small miracle of extraction. Before the first
+          paragraph arrives, a dozen companies have already bid on the right to
+          interrupt it. Your scroll position, your device, your approximate
+          location and the fact that you paused on a paragraph about mortgages are
+          all packaged, priced and sold in the time it takes a browser to render a
+          typeface. The publisher receives a fraction of a cent. You receive a
+          slightly slower page.
+        </p>
+      </div>
+
+      <!--
+        The sidebar rail. On wide screens it is the second column of the story
+        grid, pinned while the essay scrolls; on narrow screens it becomes a
+        block above the first section. Placement 2 lives here, in a frame that is
+        reserved from first paint.
+      -->
+      <aside class="story-rail" aria-label="Sidebar">
+        <div class="adpal-slot" data-adpal-slot="2" data-adpal-layout="rail"></div>
+
+        <section class="rail-list" aria-labelledby="rail-most-read">
+          <h2 class="rail-title" id="rail-most-read">Most read</h2>
+          <ol>
+            <li><a href="#deal"><span aria-hidden="true">01</span>The worst deal in media</a></li>
+            <li><a href="#model"><span aria-hidden="true">02</span>What if the ad paid you?</a></li>
+            <li><a href="#invoice"><span aria-hidden="true">03</span>The invoice for your attention</a></li>
+            <li><a href="#awkward"><span aria-hidden="true">04</span>The awkward part</a></li>
+          </ol>
+        </section>
+
+        <section class="rail-note">
+          <span class="eyebrow">From the series</span>
+          <p>Three essays on attention, pricing and the cost of a free web.</p>
+        </section>
+      </aside>
+
+      <h2 id="deal">The worst deal in media</h2>
+
+      <div class="prose">
+        <p>
+          Somewhere between the pop-up and the pre-roll, the transaction changed
+          shape. You stopped being the audience and became the inventory. The
+          product was never the newspaper, the feed or the video: it was the
+          reliable, measurable fact that you would look at something for a moment
+          before scrolling away.
+        </p>
+
+        <p>
+          It is worth saying plainly what that arrangement asks of you. It asks
+          for your time, your attention and a surprisingly detailed record of your
+          behaviour — and it returns, at best, an article you did not pay for. The
+          bargain is not dishonest. It is simply unexamined, in the way that all
+          very old bargains become.
+        </p>
+      </div>
+
+      <figure class="pullquote">
+        <blockquote>
+          The most valuable thing on a web page is not the banner. It is the two
+          seconds of attention the banner interrupts.
+        </blockquote>
+        <figcaption>Margot Alder · The Courier</figcaption>
+      </figure>
+
+      <h2 id="model">What if the ad paid you?</h2>
+
+      <div class="prose">
+        <p>
+          A few publishers have started testing the opposite arrangement. It
+          begins with an uncomfortable premise: attention is labour, and labour
+          should be paid. Not metaphorically, not in “exposure”, not in a coupon
+          for a service you did not ask for. Paid, in the same way a freelancer is
+          paid for an afternoon of work, into an account with a balance and a
+          statement.
+        </p>
+
+        <p>
+          The mechanism is deliberately boring, which is the highest compliment
+          one can pay a payment system. A publisher declares a placement. The
+          reader scrolls past it. Something measures whether a human being was
+          actually there — not a click, not a hover, not a timer that runs while
+          the tab sits in the background — and if the answer is yes, an invoice is
+          issued and split before the week is out.
+        </p>
+
+        <p>
+          Two things follow. The first is that the reader stops being inventory
+          and becomes a counterparty, with a price and a receipt. The second is
+          subtler: a page paid per verified look is a page paid to be readable,
+          because the only way to earn the next impression is to deserve the
+          current one.
+        </p>
+      </div>
+
+      <!-- Mid-article bento row: three short reads, one carrying placement 3 -->
+      <section class="row-bento" id="issue" aria-label="More from this issue">
+
+        <article class="card card-mini">
+          <span class="eyebrow">Technology</span>
+          <h3 class="mini-title">The web is getting slower, again</h3>
+          <p class="mini-copy">
+            Consent banners, tag managers and auction wrappers have quietly added
+            a megabyte back to the median page. Speed was the one advantage the
+            open web never had to argue for.
+          </p>
+          <span class="mini-meta">4 min read</span>
+        </article>
+
+        <article class="card card-mini">
+          <span class="eyebrow">Business</span>
+          <h3 class="mini-title">Who actually pays for the news?</h3>
+          <p class="mini-copy">
+            Subscriptions concentrated the money in a handful of titles. The
+            rest of the industry is still looking for a unit small enough to sell
+            and large enough to matter.
+          </p>
+          <span class="mini-meta">6 min read</span>
+
+          <!-- Placement 3 · reserved line inside a small card -->
+          <div class="adpal-slot" data-adpal-slot="3" data-adpal-layout="inline"></div>
+        </article>
+
+        <article class="card card-mini">
+          <span class="eyebrow">Culture</span>
+          <h3 class="mini-title">Every app wants to be a feed</h3>
+          <p class="mini-copy">
+            A timeline is a promise that something better is one scroll away.
+            It is also the cheapest interface ever designed, which is why nothing
+            ever gets replaced by anything else.
+          </p>
+          <span class="mini-meta">5 min read</span>
+        </article>
+
+      </section>
+
+      <h2 id="invoice">The invoice for your attention</h2>
+
+      <div class="prose">
+        <p>
+          A single impression is worth two cents. That is not a life-changing sum,
+          and nobody involved pretends otherwise. What matters is that it is
+          <em>legible</em>: it has a unit, a recipient, a split and a timestamp.
+          You can look at it and say what was bought and who was paid.
+        </p>
+
+        <p>
+          Legibility changes behaviour on both sides of the transaction. The
+          advertiser can no longer buy a thousand impressions and hope; it buys
+          attention that was measured. The publisher cannot bury the placement
+          behind three interstitials; the placement has to be seen to be paid. And
+          the reader, for the first time, has a line item with their name on it —
+          small, but not imaginary.
+        </p>
+      </div>
+
+      <h2 id="awkward">The awkward part</h2>
+
+      <div class="prose">
+        <p>
+          Here is the objection that any honest version of this essay has to
+          confront: it is still advertising. A paid impression is still an
+          interruption. Handing the reader a receipt does not make the banner
+          disappear, and a market for attention does not automatically produce
+          better journalism — it produces more of whatever gets looked at.
+        </p>
+
+        <p>
+          The counter-argument is not that advertising has become virtuous. It is
+          that the current arrangement hides its costs, and a hidden cost is a
+          cost that can grow without limit. A placement that names its price,
+          measures its audience with consent and pays the person doing the looking
+          is at least a transaction you can refuse. That is a lower bar than
+          “fixed”, and a much higher one than what we have now.
+        </p>
+
+        <p>
+          The first banner asked whether you had ever clicked on a banner. The
+          answer, for most of us, is no. The more interesting question is what
+          happens when the banner has to prove it is being seen before it can
+          appear at all.
+        </p>
+      </div>
+
+      <div class="closing">
+        <span class="closing-label">The takeaway</span>
+        <p>
+          The internet did not become hostile by accident. It became hostile
+          because attention was free to take and impossible to invoice. Putting a
+          price on the look — and paying the person who gave it — is a modest fix
+          for a very old problem: the banner is not going away, but it might, at
+          last, start paying rent.
+        </p>
+      </div>
+
+      <!-- Placement 4 · reserved partner strip at the foot of the essay -->
+      <div class="adpal-slot adpal-slot-wide" data-adpal-slot="4" data-adpal-layout="banner"></div>
+
+      <div class="author-card">
+        <span class="avatar avatar-lg" aria-hidden="true">MA</span>
+        <div>
+          <strong>Margot Alder</strong>
+          <span>Covering media, advertising and the economics of attention.
+            This article is fictional and was written for the AdPal demo.</span>
+        </div>
+      </div>
+
+      <section class="related" id="more" aria-label="More from The Courier">
+        <h2>More from The Courier</h2>
+        <div class="related-grid">
+          <a class="related-card" href="#deal">
+            <span class="eyebrow">Analysis</span>
+            <strong>The cookie is dead. The fingerprint is doing fine.</strong>
+            <span class="mini-meta">6 min read</span>
+          </a>
+          <a class="related-card" href="#model">
+            <span class="eyebrow">Protocol</span>
+            <strong>Everything I learned reading a payments specification twice</strong>
+            <span class="mini-meta">9 min read</span>
+          </a>
+          <a class="related-card" href="#invoice">
+            <span class="eyebrow">Money</span>
+            <strong>What a reader is actually worth, line by line</strong>
+            <span class="mini-meta">4 min read</span>
+          </a>
+          <a class="related-card" href="#awkward">
+            <span class="eyebrow">Ideas</span>
+            <strong>The case against fixing advertising</strong>
+            <span class="mini-meta">7 min read</span>
+          </a>
+        </div>
+      </section>
+
+    </article>
+  </main>
+
+  <footer class="site-footer" id="newsletter">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <span class="wordmark">The Courier</span>
+        <p>
+          An entirely fictional publication, created for the AdPal demo. Every
+          article, byline and statistic on this page is illustrative.
+        </p>
+      </div>
+
+      <div class="footer-news">
+        <span class="eyebrow">The Courier Weekly</span>
+        <p>One essay, every Saturday. No trackers, no data sold.</p>
+        <form class="news-form" id="newsletter-form">
+          <label class="sr-only" for="news-email">Email address</label>
+          <input id="news-email" type="email" placeholder="you@example.com" autocomplete="email" required>
+          <button type="submit">Subscribe</button>
+        </form>
+        <span class="news-note" id="news-note">Demo form — nothing is sent anywhere.</span>
+      </div>
+
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="#story">Media</a>
+        <a href="#numbers">Numbers</a>
+        <a href="#issue">Technology</a>
+        <a href="#invoice">Business</a>
+        <a href="#more">Culture</a>
+      </nav>
+    </div>
+    <div class="footer-legal">
+      <span>© 2026 The Courier</span>
+      <span>Legal notice · Privacy · Contact</span>
+    </div>
+  </footer>
+
+  <script src="reader.js"></script>
+</body>
+</html>

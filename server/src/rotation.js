@@ -79,21 +79,63 @@ class AdvertiserRotation {
   }
 
   /**
-   * Picks the next advertiser for a slot.
+   * Profiles that can still fund this placement, in roster order.
    *
-   * @param {{ slotKey?: string, price?: number, excludeCreativeId?: string }} input
-   * @returns {null | { creative: object, advertiser: object, reason: string }}
+   * `excludeShown` removes the creative this slot just displayed. `pick()` uses
+   * the full list because a spent-out roster must still fall back to the last
+   * advertiser; `candidates()` excludes it because the cognition layer should
+   * only rank profiles the rotation is willing to show next.
    */
-  pick({ slotKey = 'page', price = this.minPrice, excludeCreativeId = '' } = {}) {
-    const lastInSlot = this.lastBySlot.get(slotKey) || '';
+  eligibleEntries({ price = this.minPrice, slotKey = 'page', excludeCreativeId = '', excludeShown = false } = {}) {
+    const minimum = Math.max(0.01, Number(price) || 0);
     const excluded = new Set(
-      [lastInSlot, String(excludeCreativeId || '')].filter(Boolean)
+      excludeShown
+        ? [this.lastBySlot.get(slotKey) || '', String(excludeCreativeId || '')].filter(Boolean)
+        : []
     );
 
-    const eligible = this.roster.filter(
-      (entry) => entry.budget + 1e-9 >= Math.max(0.01, Number(price) || 0)
+    return this.roster.filter(
+      (entry) => entry.budget + 1e-9 >= minimum && !excluded.has(entry.id)
     );
+  }
+
+  /**
+   * Profiles the advertiser agents may reason over for this placement.
+   * Read-only: nothing is reserved, spent or rotated by calling it.
+   */
+  candidates({ slotKey = 'page', price = this.minPrice, excludeCreativeId = '' } = {}) {
+    return this.eligibleEntries({
+      slotKey,
+      price,
+      excludeCreativeId,
+      excludeShown: true
+    }).map((entry) => ({
+      agent: { ...entry.agent },
+      sponsor: entry.sponsor,
+      creative: this.creatives[this.roster.indexOf(entry)],
+      objective: entry.objective,
+      budgetRemaining: round4(entry.budget),
+      impressions: entry.impressions
+    }));
+  }
+
+  /**
+   * Picks the next advertiser for a slot.
+   *
+   * `prefer` lets the cognition layer name the winner it reasoned to. The
+   * rotation still owns eligibility and the no-repeat rule, so a stale or
+   * ineligible preference can never break the placement invariants.
+   *
+   * @param {{ slotKey?: string, price?: number, excludeCreativeId?: string, prefer?: string }} input
+   * @returns {null | { creative: object, advertiser: object, reason: string }}
+   */
+  pick({ slotKey = 'page', price = this.minPrice, excludeCreativeId = '', prefer = '' } = {}) {
+    const eligible = this.eligibleEntries({ price });
     if (eligible.length === 0) return null;
+
+    const excluded = new Set(
+      [this.lastBySlot.get(slotKey) || '', String(excludeCreativeId || '')].filter(Boolean)
+    );
 
     // Least-shown first, then round-robin order so the sequence stays legible
     // in the terminal instead of jumping around the roster.
@@ -109,7 +151,9 @@ class AdvertiserRotation {
     // Prefer a profile this slot has not just shown; fall back to any eligible
     // one when the only remaining budget belongs to the previous advertiser.
     const fresh = ordered.find((entry) => !excluded.has(entry.id));
-    const chosen = fresh || ordered[0];
+    const named = prefer ? ordered.find((entry) => entry.agent.id === prefer) : null;
+    const reasoned = named && !excluded.has(named.id) ? named : null;
+    const chosen = reasoned || fresh || ordered[0];
 
     const index = this.roster.findIndex((entry) => entry.agent.id === chosen.agent.id);
     this.cursor = (index + 1) % this.roster.length;
@@ -123,9 +167,11 @@ class AdvertiserRotation {
         objective: chosen.objective,
         budgetRemaining: round4(chosen.budget)
       },
-      reason: fresh
-        ? 'rotation · least-shown eligible advertiser'
-        : 'rotation · only advertiser with budget left'
+      reason: reasoned
+        ? 'agent reasoning · highest relevant bid'
+        : fresh
+          ? 'rotation · least-shown eligible advertiser'
+          : 'rotation · only advertiser with budget left'
     };
   }
 

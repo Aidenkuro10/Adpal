@@ -88,6 +88,26 @@ module.exports = Object.freeze({
   demoDir: path.join(__dirname, '..', '..', 'demo-publisher'),
 
   /* ------------------------------------------------------------------ */
+  /* Agent cognition (bid reasoning + attention explanation)            */
+  /* ------------------------------------------------------------------ */
+  agent: Object.freeze({
+    // `local` runs the deterministic reasoner. `openai`, `anthropic` or
+    // `gemini` send the same task to a hosted model and fall back to the local
+    // reasoner on any failure. See src/agent-cognition.js.
+    provider: textFromEnv('AGENT_PROVIDER', 'local').toLowerCase(),
+    model: textFromEnv('AGENT_MODEL', ''),
+    // Falls back to the provider-native env vars when AGENT_API_KEY is unset.
+    apiKey: textFromEnv('AGENT_API_KEY', ''),
+    baseUrl: textFromEnv('AGENT_BASE_URL', ''),
+    enabled: textFromEnv('AGENT_ENABLED', 'true').toLowerCase() !== 'false',
+    // Minimum relevance an advertiser needs before it will spend money.
+    minRelevance: clamp(numberFromEnv('AGENT_MIN_RELEVANCE', 0.35), 0, 1),
+    timeoutMs: Math.round(clamp(numberFromEnv('AGENT_TIMEOUT_MS', 6000), 1000, 30000)),
+    maxTokens: Math.round(clamp(numberFromEnv('AGENT_MAX_TOKENS', 512), 64, 4096)),
+    temperature: clamp(numberFromEnv('AGENT_TEMPERATURE', 0.4), 0, 1)
+  }),
+
+  /* ------------------------------------------------------------------ */
   /* L402 macaroons (agent negotiation)                                 */
   /* ------------------------------------------------------------------ */
   l402: Object.freeze({

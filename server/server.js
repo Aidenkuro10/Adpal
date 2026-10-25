@@ -25,6 +25,7 @@ const { AdvertiserRotation } = require('./src/rotation');
 const paypal = require('./src/paypal');
 const solana = require('./src/solana');
 const toolkit = require('./src/paypal-agent-toolkit');
+const agentCognition = require('./src/agent-cognition');
 const { L402Issuer, describe, parse: parseMacaroon } = require('./src/l402');
 const l402Contract = require('./src/l402-contract');
 const { serveView } = require('./src/view-assets');
@@ -147,6 +148,121 @@ function emit(event) {
   return telemetry.emit(event);
 }
 
+/**
+ * Publishes the advertiser agents' reasoning on the SSE stream.
+ *
+ * Two events are emitted per impression:
+ *
+ *  - `agent.reasoning` — the whole auction: every agent's scored bid, the step
+ *    trace and the token/latency cost of the call.
+ *  - `agent.bid` — the winner's natural-language case, in `detail`, so it is
+ *    readable without expanding JSON.
+ *
+ * Both carry a `cognition` envelope so the terminal can render any agent
+ * thought with one component, whichever provider produced it.
+ */
+function emitBidReasoning(negotiation, { slotKey = '', price = 0, pageTitle = '' } = {}) {
+  if (!negotiation) return;
+  const cognition = agentCognition.cognitionEnvelope(negotiation);
+  const bidding = negotiation.bids.filter((bid) => bid.verdict === 'bid').length;
+  const tokens = negotiation.usage?.totalTokens ?? 0;
+
+  emit({
+    stage: 'agent.reasoning',
+    source: 'advertiser.agent',
+    level: negotiation.winner ? 'ok' : 'warn',
+    title: `Bid reasoning · ${bidding}/${negotiation.bids.length} agent${negotiation.bids.length === 1 ? '' : 's'} bidding`,
+    detail:
+      `${negotiation.provider} · ${negotiation.model} · ${tokens} tokens ` +
+      `(${negotiation.usage?.promptTokens ?? 0} prompt + ${negotiation.usage?.completionTokens ?? 0} completion)` +
+      `${negotiation.usage?.estimated ? ' est' : ''} · ${negotiation.latencyMs} ms` +
+      (negotiation.fallback
+        ? ` · fallback from ${negotiation.fallbackProvider || 'hosted'}`
+        : negotiation.degraded
+          ? ' · degraded to local'
+          : ''),
+    data: {
+      phase: 'negotiate',
+      slotKey,
+      price,
+      pageTitle,
+      pageProfile: negotiation.pageProfile,
+      floor: negotiation.floor,
+      winnerId: negotiation.winnerId,
+      bids: negotiation.bids,
+      cognition
+    }
+  });
+
+  const winnerBid = negotiation.bids.find((bid) => bid.agentId === negotiation.winnerId);
+  if (!winnerBid) return;
+
+  emit({
+    stage: 'agent.bid',
+    source: 'advertiser.agent',
+    level: 'ok',
+    title: `Bid rationale · ${winnerBid.sponsor}`,
+    detail: winnerBid.rationale,
+    data: {
+      phase: 'bid',
+      agentId: winnerBid.agentId,
+      agent: winnerBid.name,
+      sponsor: winnerBid.sponsor,
+      objective: winnerBid.objective,
+      verdict: winnerBid.verdict,
+      bid: winnerBid.bid,
+      relevance: winnerBid.relevance,
+      confidence: winnerBid.confidence,
+      components: winnerBid.components,
+      evidence: winnerBid.evidence,
+      rationale: winnerBid.rationale,
+      // The auction trace was already published by `agent.reasoning`; repeating
+      // it here would double every step in the stream. The envelope still
+      // carries provider/model/token cost for this specific rationale.
+      cognition: { ...cognition, steps: [] }
+    }
+  });
+
+  console.log(
+    `[agent] ${winnerBid.sponsor} bids €${winnerBid.bid.toFixed(3)} · relevance ${winnerBid.relevance.toFixed(2)} · ${negotiation.provider}/${negotiation.model}`
+  );
+}
+
+/**
+ * Publishes the verification agent's reading of the telemetry.
+ *
+ * The narrative explains the heuristic; it never replaces it. `assessment.score`
+ * and `assessment.approved` are copied from `heuristic.js`, so the money
+ * decision cannot be talked into a different verdict by a model.
+ */
+function emitAttentionReasoning(assessment) {
+  if (!assessment) return;
+
+  emit({
+    stage: 'agent.attention',
+    source: 'attention.agent',
+    level: assessment.approved ? 'ok' : 'warn',
+    title: `Attention reasoning · ${assessment.verdict}`,
+    detail: assessment.narrative,
+    data: {
+      phase: 'attention',
+      verdict: assessment.verdict,
+      approved: assessment.approved,
+      score: assessment.score,
+      threshold: assessment.threshold,
+      confidence: assessment.confidence,
+      disagreement: assessment.disagreement,
+      signature: assessment.signature,
+      narrative: assessment.narrative,
+      cognition: agentCognition.cognitionEnvelope(assessment)
+    }
+  });
+
+  console.log(
+    `[agent] attention ${assessment.verdict} · confidence ${assessment.confidence} · ${assessment.narrative.slice(0, 150)}`
+  );
+}
+
 /*
  * PayPal Agent Toolkit bridge.
  *
@@ -235,6 +351,7 @@ app.get('/api/health', (_req, res) => {
       mcp: TOOLKIT.mcp?.url || null
     },
     agents: rotation.roster.map((entry) => entry.agent.id),
+    cognition: agentCognition.publicProfile(),
     rails: {
       active: config.payoutRail,
       paypal: paypal.isConfigured(),
@@ -338,6 +455,7 @@ app.get('/api/agents', (_req, res) => {
     split: { userShare: config.userShare, publisherShare: config.publisherShare },
     autoPayout: config.paypal.autoPayout,
     payoutRail: config.payoutRail,
+    cognition: agentCognition.publicProfile(),
     rails: {
       paypal: { ready: paypal.isConfigured(), label: RAILS.PAYPAL },
       solana: { ready: solana.isEnabled(), label: RAILS.SOLANA, profile: solana.publicProfile() }
@@ -376,6 +494,7 @@ app.get('/api/telemetry', (req, res) => {
       payoutRail: config.payoutRail
     },
     paypal: paypal.publicProfile(),
+    cognition: agentCognition.publicProfile(),
     l402: {
       issuer: 'adpal.simulator',
       scheme: 'L402',
@@ -478,6 +597,7 @@ app.get('/api/logs', (req, res) => {
       })),
       autoPayout: config.paypal.autoPayout,
       payoutRail: config.payoutRail,
+      cognition: agentCognition.publicProfile(),
       toolkit: {
         present: TOOLKIT.present,
         version: TOOLKIT.version,
@@ -999,6 +1119,15 @@ async function handleL402Settle(req, res) {
     }
   });
 
+  // The verification agent reads the same telemetry and explains it. This runs
+  // before the approval branch so a refused session is justified too.
+  const settleReasoning = await agentCognition.assessAttention({
+    signals,
+    heuristic: evaluation,
+    page: { title: context.pageTitle, host: context.pageHost || context.publisher }
+  });
+  emitAttentionReasoning(settleReasoning);
+
   if (!evaluation.approved) {
     l402Sessions.recordFailure(context, 'ATTENTION_NOT_VERIFIED', evaluation.reason, {
       score: evaluation.score,
@@ -1022,14 +1151,73 @@ async function handleL402Settle(req, res) {
     });
   }
 
-  // Rotation picks the advertiser that funds this settlement; the agent
-  // toolkit authorizes the spend before the ledger is credited.
+  // The advertiser agents reason over the offer's page context before anyone
+  // commits money: the winner funds the settlement, the toolkit authorizes it.
   const slotKey = `l402-${context.payment_context_token.slice(0, 8)}`;
-  const placement = rotation.pick({
+  const lastCreativeId = sanitizeText(body.slot?.lastCreativeId, 60);
+  const candidates = rotation.candidates({
     slotKey,
     price: offer.amount,
-    excludeCreativeId: sanitizeText(body.slot?.lastCreativeId, 60)
+    excludeCreativeId: lastCreativeId
   });
+
+  let settlementNegotiation = null;
+  let placement = null;
+
+  if (candidates.length > 0) {
+    settlementNegotiation = await agentCognition.negotiate({
+      page: {
+        title: context.pageTitle,
+        host: context.pageHost || context.publisher,
+        slot: slotKey
+      },
+      price: offer.amount,
+      candidates
+    });
+    emitBidReasoning(settlementNegotiation, {
+      slotKey,
+      price: offer.amount,
+      pageTitle: context.pageTitle
+    });
+
+    if (settlementNegotiation.winnerId) {
+      placement = rotation.pick({
+        slotKey,
+        price: offer.amount,
+        excludeCreativeId: lastCreativeId,
+        prefer: settlementNegotiation.winnerId
+      });
+    } else {
+      l402Sessions.recordFailure(
+        context,
+        'NO_RELEVANT_ADVERTISER',
+        'No advertiser agent judged the placement relevant.',
+        { floor: settlementNegotiation.floor }
+      );
+      return sendContract(req, res, {
+        offerId: context.offer_id,
+        context,
+        error: {
+          code: 'NO_RELEVANT_ADVERTISER',
+          message: 'No advertiser agent judged this placement relevant enough to fund.',
+          retryable: true,
+          floor: settlementNegotiation.floor,
+          bids: settlementNegotiation.bids.map((bid) => ({
+            agentId: bid.agentId,
+            sponsor: bid.sponsor,
+            relevance: bid.relevance,
+            verdict: bid.verdict
+          }))
+        }
+      });
+    }
+  } else {
+    placement = rotation.pick({
+      slotKey,
+      price: offer.amount,
+      excludeCreativeId: lastCreativeId
+    });
+  }
 
   if (!placement) {
     l402Sessions.recordFailure(context, 'NO_ADVERTISER_BUDGET', 'Every advertiser campaign is spent.', {
@@ -2041,6 +2229,21 @@ app.post('/api/offer', async (req, res) => {
     }
   });
 
+  /*
+   * Agent cognition over the telemetry.
+   *
+   * The heuristic above decides; this layer explains the decision in prose so
+   * the terminal shows a reasoning trace ("reading cadence", "pointer
+   * dynamics", "viewport discipline") instead of a bare boolean. It runs before
+   * the approval branch, so a rejected session gets a justification too.
+   */
+  const attentionReasoning = await agentCognition.assessAttention({
+    signals: body.signals || {},
+    heuristic: evaluation,
+    page: { title: pageTitle, host: pageHost || publisher }
+  });
+  emitAttentionReasoning(attentionReasoning);
+
   if (!evaluation.approved) {
     const offer = ledger.recordRejection({
       score: evaluation.score,
@@ -2101,21 +2304,80 @@ app.post('/api/offer', async (req, res) => {
   }
 
   /*
-   * Multi-advertiser rotation.
+   * Multi-advertiser rotation, now driven by agent reasoning.
    *
    * The slot key comes from the placement the extension reported, so each
    * placement rotates independently and never shows the advertiser it just
    * showed. The rotation only returns profiles whose campaign budget can still
-   * cover this impression; the advertiser agent then authorizes the spend
-   * through the PayPal Agent Toolkit before any money is moved.
+   * cover this impression; every eligible advertiser agent then reads the page
+   * context and returns a scored bid with a written justification, and the
+   * highest relevant bid wins the slot. The advertiser agent still authorizes
+   * the spend through the PayPal Agent Toolkit before any money is moved.
    */
   const slotIndex = sanitizeText(String(body.slot?.index ?? ''), 12);
   const slotKey = slotIndex ? `slot-${slotIndex}` : 'page';
-  const placement = rotation.pick({
+  const lastCreativeId = sanitizeText(body.slot?.lastCreativeId, 60);
+
+  const candidates = rotation.candidates({
     slotKey,
     price,
-    excludeCreativeId: sanitizeText(body.slot?.lastCreativeId, 60)
+    excludeCreativeId: lastCreativeId
   });
+
+  let negotiation = null;
+  let placement = null;
+
+  if (candidates.length > 0) {
+    negotiation = await agentCognition.negotiate({
+      page: { title: pageTitle, host: pageHost || publisher, slot: slotKey },
+      price,
+      candidates
+    });
+    emitBidReasoning(negotiation, { slotKey, price, pageTitle });
+
+    if (negotiation.winnerId) {
+      placement = rotation.pick({
+        slotKey,
+        price,
+        excludeCreativeId: lastCreativeId,
+        prefer: negotiation.winnerId
+      });
+    } else {
+      // Every agent looked at the page and declined. Withholding the impression
+      // is the product working: nobody should be shown an ad no agent would
+      // fund, and the reasoning above says exactly why.
+      emit({
+        stage: 'decision',
+        source: 'advertiser.agent',
+        level: 'warn',
+        title: 'Offer withheld · no relevant bid',
+        detail: `All ${negotiation.bids.length} advertiser agents declined at the ${negotiation.floor.toFixed(2)} relevance floor`,
+        data: {
+          floor: negotiation.floor,
+          bids: negotiation.bids,
+          pageProfile: negotiation.pageProfile
+        }
+      });
+      console.log('[agent] withheld · no advertiser cleared the relevance floor');
+
+      return res.status(402).json({
+        error: 'NO_RELEVANT_ADVERTISER',
+        message: 'No advertiser agent judged this placement relevant enough to fund.',
+        floor: negotiation.floor,
+        bids: negotiation.bids.map((bid) => ({
+          agentId: bid.agentId,
+          sponsor: bid.sponsor,
+          relevance: bid.relevance,
+          verdict: bid.verdict
+        })),
+        balance: snapshot()
+      });
+    }
+  } else {
+    // Nothing eligible to reason over (every candidate is the creative this
+    // slot just showed). Fall back to the rotation's own rules.
+    placement = rotation.pick({ slotKey, price, excludeCreativeId: lastCreativeId });
+  }
 
   if (!placement) {
     emit({

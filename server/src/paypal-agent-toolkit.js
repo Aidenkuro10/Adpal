@@ -23,6 +23,9 @@
 const fs = require('fs');
 const path = require('path');
 
+const config = require('./config');
+const { planRecipients } = require('./payout-recipients');
+
 const TOOLKIT_DIR = path.resolve(__dirname, '..', '..', 'AI-Toolkit-main', 'AI-Toolkit-main');
 
 /** Retry policy for PayPal's documented 400 POST/min payouts rate limit. */
@@ -367,6 +370,13 @@ async function authorizeAdvertiserSpend({ advertiser, price }) {
  * reservation's 70% share, the publisher item is its 30% share, and both travel
  * in the same batch with their own `sender_item_id`. The toolkit's documented
  * contract is then applied by `paypal_create_payout`.
+ *
+ * Only addresses the batch may legally pay become items. PayPal rejects the
+ * whole batch when any item is addressed to the sending account
+ * (`SELF_PAY_NOT_ALLOWED`), so a publisher receiver that resolves to the payer
+ * would also cancel the reader's payment. The caller withholds that leg from
+ * the reservation, and it is dropped here too, so the batch and the debit keep
+ * describing one transfer instead of debiting money nothing moved.
  */
 async function routeSettlement({
   reservation,
@@ -377,17 +387,20 @@ async function routeSettlement({
   message,
   userShare = 0.7
 }) {
+  const plan = planRecipients({ receiverEmail, publisherEmail, paypal: config.paypal });
+  const reader = plan.reader || String(receiverEmail || '').trim();
+
   const items = [
     {
-      receiver: receiverEmail,
+      receiver: reader,
       amount: reservation.userAmount,
       note: `Reader share 70% · ${reservation.reference}`
     }
   ];
 
-  if (publisherEmail && publisherEmail.toLowerCase() !== receiverEmail.toLowerCase()) {
+  if (plan.publisher && reservation.publisherAmount >= 0.01) {
     items.push({
-      receiver: publisherEmail,
+      receiver: plan.publisher,
       amount: reservation.publisherAmount,
       note: `Publisher share 30% · ${reservation.reference}`
     });

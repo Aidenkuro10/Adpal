@@ -196,15 +196,30 @@ module.exports = Object.freeze({
     clientId: textFromEnv('PAYPAL_CLIENT_ID', ''),
     clientSecret: textFromEnv('PAYPAL_CLIENT_SECRET', ''),
     businessEmail: paypalBusinessEmail,
+    // Every other address on the same PayPal business account. PayPal refuses
+    // a payout to the payer by account, not by string, so an alias is enough
+    // to make an apparently-distinct receiver a self-payment.
+    senderAliases: textFromEnv('PAYPAL_SENDER_ALIASES', '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
     // Where the reader share is sent. Defaults to the demo business account so
     // the sandbox flow works out of the box; set PAYPAL_RECEIVER_EMAIL to a
-    // personal Sandbox account to see the money land in that wallet.
+    // personal Sandbox account to see the money land in that wallet. If it
+    // resolves to the sending account, the payout is refused before it is
+    // submitted rather than rejected by PayPal as SELF_PAY_NOT_ALLOWED.
     receiverEmail: textFromEnv('PAYPAL_RECEIVER_EMAIL', paypalBusinessEmail),
-    // Receiver of the publisher's 30% share in the same batch. Defaults to the
-    // business account: a Payouts batch can send to more than one receiver, and
-    // PayPal accepts its own account as an item, so the split is actually moved
-    // instead of being left on the ledger.
-    publisherEmail: textFromEnv('PAYPAL_PUBLISHER_EMAIL', paypalBusinessEmail),
+    /*
+     * Receiver of the publisher's 30% share in the same batch.
+     *
+     * Empty by default, and that is deliberate. It used to default to the
+     * business account — the account the batch is sent *from* — which PayPal
+     * rejects as SELF_PAY_NOT_ALLOWED, taking the reader's 70% down with it.
+     * With no second receiver, the publisher share stays accrued on the ledger
+     * (preparePayout's `payPublisher: false`) where it can be settled later;
+     * it is never debited without a transfer to match.
+     */
+    publisherEmail: textFromEnv('PAYPAL_PUBLISHER_EMAIL', ''),
     currency: textFromEnv('PAYPAL_CURRENCY', 'EUR').toUpperCase(),
     // Guard rail so a demo can never move a large amount of sandbox money.
     maxPayout: Math.max(0.01, numberFromEnv('PAYPAL_MAX_PAYOUT', 5)),

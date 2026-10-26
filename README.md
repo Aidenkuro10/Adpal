@@ -106,6 +106,7 @@ Adpal/
 │       ├── l402.js         L402 challenge + HMAC-chained macaroon verifier
 │       ├── l402-contract.js 402 offer contract + payment-context store
 │       ├── paypal.js       OAuth2 + Payouts client (payload observer)
+│       ├── payout-recipients.js  Recipient planning; refuses self-payment
 │       ├── solana.js       Devnet rail: anchor, verify, 70/30 transaction
 │       └── telemetry.js    Event ring buffer with live subscribers
 ├── AI-Toolkit-main/        Official PayPal AI Toolkit checkout (MCP + skills)
@@ -393,9 +394,49 @@ are triggered by the settlement itself:
   extension popup, curl) and runs the *same* code path;
 - it fetches an OAuth2 token from `https://api-m.sandbox.paypal.com/v1/oauth2/token`, then creates a batch with `POST /v1/payments/payouts`, paying the reader share to `PAYPAL_RECEIVER_EMAIL`;
 - the publisher's 30% travels in the same batch as a second item, paid to
-  `PAYPAL_PUBLISHER_EMAIL` (defaults to the business account, which PayPal
-  accepts as a payout receiver);
+  `PAYPAL_PUBLISHER_EMAIL` **only when that is a third, distinct account**. If
+  it is unset, equal to the reader, or equal to the sending account, the share
+  stays accrued on the ledger and the reservation does not debit it — the batch
+  then contains the reader item alone;
 - the response contains the real `payout_batch_id` and `batch_status`, which the terminal shows verbatim.
+
+#### Self-payment is refused before the request
+
+PayPal will not let a batch pay the account it was sent from. The rejection is
+`SELF_PAY_NOT_ALLOWED`, it applies to the **whole batch**, and it used to be
+reachable by default: `PAYPAL_PUBLISHER_EMAIL` fell back to the business
+account, which is the payer, so every 70/30 batch carried a 30% item addressed
+to itself. PayPal rejected the batch, the reader's 70% never moved either, and
+the reservation had to be cancelled.
+
+`server/src/payout-recipients.js` decides the recipients before anything is
+reserved, and all three call sites use it (`runPaypalPayout`,
+`routeSettlement`, `paypal.createPayout`):
+
+| receiver | outcome |
+| --- | --- |
+| reader is the sending account | `409 SELF_PAY_NOT_ALLOWED`, nothing reserved, balances untouched |
+| publisher is the sender, the reader, or unset | that item is withheld; 30% stays accrued, no debit |
+| reader and publisher are distinct non-senders | both items travel in one batch |
+
+Three details make it safe rather than merely quiet:
+
+- **The ledger and the batch are planned together.** Withholding the publisher
+  item sets `payPublisher: false`, so the reservation never debits money that no
+  transfer will move. `split.publisherRail` reads `ledger-held` instead of
+  pretending the 30% left.
+- **Sender aliases count.** PayPal matches the payer by account, not by string,
+  so `PAYPAL_SENDER_ALIASES` lists any other confirmed email on the business
+  account. Comparison is case-insensitive.
+- **One exact recovery.** An alias we were never told about is only discoverable
+  from PayPal's response. On `SELF_PAY_NOT_ALLOWED` the reservation is
+  cancelled, re-prepared without the publisher leg, and the batch is sent again
+  — the reader is still paid, the 30% stays accrued, and nothing has to be
+  reversed.
+
+```bash
+npm run check:self-pay    # recipient decisions, no network
+```
 
 All PayPal calls go through the tools defined in
 `server/src/paypal-agent-toolkit.js`: `paypal_get_token`,
@@ -1330,9 +1371,10 @@ copy .env.example .env      # Windows (cmd)
 | `PAYPAL_ALLOW_LIVE` | `false` | Opt in to Live. Sandbox is enforced otherwise: mode, API host and signing host always move together |
 | `PAYPAL_CLIENT_ID` | — | REST app client id from the PayPal developer dashboard |
 | `PAYPAL_CLIENT_SECRET` | — | REST app secret (server-side only, never sent to the page) |
-| `PAYPAL_BUSINESS_EMAIL` | `sb-jokak53538300@business.example.com` | Sandbox account the batch is sent from |
-| `PAYPAL_RECEIVER_EMAIL` | business email | Recipient of the reader (70%) share |
-| `PAYPAL_PUBLISHER_EMAIL` | business email | Recipient of the publisher (30%) share, in the same batch |
+| `PAYPAL_BUSINESS_EMAIL` | `sb-jokak53538300@business.example.com` | Sandbox account the batch is sent from. PayPal refuses a payout to this account |
+| `PAYPAL_SENDER_ALIASES` | *(empty)* | Other confirmed emails on that same account (comma-separated), so they are also treated as the sender |
+| `PAYPAL_RECEIVER_EMAIL` | business email | Recipient of the reader (70%) share. Must be a *different* account, or the payout is refused before submission |
+| `PAYPAL_PUBLISHER_EMAIL` | *(empty)* | Recipient of the publisher (30%) share. Empty, equal to the reader, or equal to the sender means the share stays accrued on the ledger instead of being debited |
 | `PAYPAL_CURRENCY` | `EUR` | Payout currency |
 | `PAYPAL_MAX_PAYOUT` | `5` | Guard rail: largest amount a single demo payout may move |
 | `PAYPAL_TIMEOUT_MS` | `15000` | Abort a PayPal HTTP call after this long |
@@ -1370,7 +1412,7 @@ copy .env.example .env      # Windows (cmd)
 
 PayPal credentials are only read by the server. The page and the extension never receive them: the terminal gets the mode, the recipient, and the batch result, nothing more. OAuth tokens are truncated to a prefix before they reach the log.
 
-If a payout stays `PENDING`, that is the sandbox's own processing state. `POST /api/payout` reports exactly what PayPal returned; the **Refresh** action in the terminal re-reads the batch with `GET /v1/payments/payouts/{id}`. Paying the business account itself is useful as a demo, but the batch only completes when the recipient is a separate **personal** Sandbox account — set `PAYPAL_RECEIVER_EMAIL` to that address.
+If a payout stays `PENDING`, that is the sandbox's own processing state. `POST /api/payout` reports exactly what PayPal returned; the **Refresh** action in the terminal re-reads the batch with `GET /v1/payments/payouts/{id}`. The batch only completes when every recipient is a **personal** Sandbox account distinct from `PAYPAL_BUSINESS_EMAIL`: the business account is the payer, and PayPal refuses to pay it (`SELF_PAY_NOT_ALLOWED`). Point `PAYPAL_RECEIVER_EMAIL` at one personal account, and `PAYPAL_PUBLISHER_EMAIL` at a second if you want the 30% to move too — otherwise it stays accrued on the ledger, which is visible in `split.publisherRail`.
 
 The price actually requested is defined in `demo-publisher/adpal-agent.js` for the publication and in `extension/content.js` for third-party pages (`CONFIG.price`, €0.05 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
 

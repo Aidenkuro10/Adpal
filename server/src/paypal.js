@@ -12,6 +12,7 @@
  */
 
 const config = require('./config');
+const { isSelfPay, normalizeEmail, planRecipients, describeHold } = require('./payout-recipients');
 
 const { paypal } = config;
 
@@ -104,6 +105,14 @@ function isConfigured() {
 
 /** Safe-to-expose payout settings for the terminal. */
 function publicProfile() {
+  /*
+   * The batch PayPal will actually accept, resolved once here so the terminal,
+   * the API responses and the payout path all describe the same recipients.
+   * `publisherEmail` being empty does not mean the 30% is lost — it means it
+   * stays accrued, which `publisherHold` spells out.
+   */
+  const plan = planRecipients({ paypal });
+
   return {
     configured: isConfigured(),
     mode: paypal.mode,
@@ -120,6 +129,13 @@ function publicProfile() {
     receiverEmail: paypal.receiverEmail,
     publisherEmail: paypal.publisherEmail,
     publisherConfigured: Boolean(paypal.publisherEmail),
+    // What a batch can actually carry. `readerSelfPay` makes the payout
+    // impossible, not just degraded, so it is surfaced rather than inferred.
+    readerSelfPay: plan.readerSelfPay,
+    publisherPayable: Boolean(plan.publisher),
+    publisherHold: plan.publisherHold,
+    publisherHoldReason: describeHold(plan),
+    selfPayAddresses: plan.senderEmails,
     senderEmail: paypal.businessEmail,
     currency: paypal.currency,
     apiBase: paypal.apiBase,
@@ -310,6 +326,51 @@ function normalizePayoutItems(input, currency) {
       status: 400,
       code: 'PAYPAL_RECEIVER_MISSING'
     });
+  }
+
+  /*
+   * Self-payment is refused before the request leaves the process.
+   *
+   * PayPal answers SELF_PAY_NOT_ALLOWED for an item addressed to the payer, and
+   * it rejects the *whole* batch — so one bad publisher item also cancels the
+   * reader's payment. Catching it here turns a round trip that can only fail
+   * into an actionable error, and keeps the failure from looking like a PayPal
+   * outage in the terminal.
+   *
+   * The callers that build the split (`runPaypalPayout`, `routeSettlement`)
+   * already withhold a self-addressed publisher leg, so reaching this guard
+   * means a caller passed an item directly.
+   */
+  const selfPayItems = items.filter((item) => isSelfPay(item.receiver, paypal));
+  if (selfPayItems.length > 0) {
+    const addresses = [...new Set(selfPayItems.map((item) => item.receiver))].join(', ');
+    throw new PayPalError(
+      `PayPal refuses a payout to the sending account (${addresses}). ` +
+        'A batch cannot pay the account it was sent from.',
+      {
+        status: 400,
+        code: 'SELF_PAY_NOT_ALLOWED',
+        issues: selfPayItems.map((item) => ({
+          issue: 'SELF_PAY_NOT_ALLOWED',
+          description: `Item receiver ${item.receiver} is the sending account.`,
+          field: 'items.receiver'
+        }))
+      }
+    );
+  }
+
+  // Two items to one address is the same circular transfer in miniature, and
+  // PayPal would fold them into one receiver anyway.
+  const seen = new Set();
+  for (const item of items) {
+    const key = normalizeEmail(item.receiver);
+    if (seen.has(key)) {
+      throw new PayPalError(
+        `A payout batch cannot contain two items for the same receiver (${item.receiver}).`,
+        { status: 400, code: 'PAYPAL_DUPLICATE_RECEIVER' }
+      );
+    }
+    seen.add(key);
   }
 
   return items;
@@ -561,6 +622,13 @@ function errorFromResponse(response, data) {
 /** Turns raw PayPal issue codes into something a judge can read. */
 function friendlyIssue(issue) {
   switch (issue) {
+    // Sending to the account the batch is authenticated as is circular, and
+    // PayPal rejects the entire batch — the reader's leg included.
+    case 'SELF_PAY_NOT_ALLOWED':
+      return (
+        'PayPal refuses a payout to the sending account. Set PAYPAL_RECEIVER_EMAIL / ' +
+        'PAYPAL_PUBLISHER_EMAIL to a different PayPal account than PAYPAL_BUSINESS_EMAIL.'
+      );
     case 'RECEIVER_UNREGISTERED':
     case 'PAYEE_ACCOUNT_INVALID':
       return 'The recipient email is not a confirmed PayPal Sandbox account.';

@@ -25,6 +25,7 @@ const { Telemetry } = require('./src/telemetry');
 const { CREATIVES, creativePayload } = require('./src/creatives');
 const { AdvertiserRotation } = require('./src/rotation');
 const paypal = require('./src/paypal');
+const { planRecipients, describeHold, isSelfPayError } = require('./src/payout-recipients');
 const solana = require('./src/solana');
 const toolkit = require('./src/paypal-agent-toolkit');
 const agentCognition = require('./src/agent-cognition');
@@ -3023,12 +3024,103 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     };
   }
 
-  const receiver = sanitizeText(receiverEmail, 120) || profile.receiverEmail;
-  const publisher = sanitizeText(publisherEmail, 120) || profile.publisherEmail || '';
-  // Only move the publisher share when a distinct second receiver exists.
-  const paysPublisher = Boolean(publisher) && publisher.toLowerCase() !== receiver.toLowerCase();
+  /*
+   * Decide the recipients *before* reserving anything.
+   *
+   * PayPal rejects a batch that pays the account it was sent from
+   * (SELF_PAY_NOT_ALLOWED), and it rejects the whole batch — so a 30% publisher
+   * item addressed to the payer would also cancel the reader's 70%. Two things
+   * follow:
+   *
+   *  - the publisher leg is only reserved when it has a distinct, non-sender
+   *    receiver, because the ledger must never debit money that no transfer
+   *    will move (`preparePayout`'s `payPublisher`);
+   *  - a reader whose own address is the sending account makes the batch
+   *    impossible, so it is refused here, before a reservation exists,
+   *    leaving nothing to cancel or revert.
+   */
+  const plan = planRecipients({
+    receiverEmail: sanitizeText(receiverEmail, 120),
+    publisherEmail: sanitizeText(publisherEmail, 120),
+    paypal: config.paypal
+  });
 
-  const prepared = ledger.preparePayout({
+  if (!plan.payable) {
+    const message = plan.reader && plan.readerSelfPay
+      ? `PAYPAL_RECEIVER_EMAIL (${plan.reader}) is the sending account ` +
+        `(${plan.senderEmails.join(', ')}). PayPal refuses a payout to the payer, ` +
+        'so nothing was submitted and no balance was touched. Set it to a different ' +
+        'Sandbox personal account.'
+      : 'No reader receiver email is configured. Set PAYPAL_RECEIVER_EMAIL to a ' +
+        'Sandbox personal account.';
+
+    // An automatic attempt repeats on every impression, so the refusal is
+    // reported once per window instead of on every trigger.
+    if (shouldLogRefusal(`selfpay:reader:${plan.reader}`)) {
+      emit({
+        stage: 'payout',
+        source: 'ledger',
+        level: 'error',
+        title: plan.readerSelfPay ? 'Payout refused · receiver is the sender' : 'Payout refused · receiver missing',
+        detail: message,
+        data: {
+          trigger,
+          reason,
+          code: plan.readerSelfPay ? 'SELF_PAY_NOT_ALLOWED' : 'PAYPAL_RECEIVER_MISSING',
+          receiver: plan.reader || null,
+          senderEmails: plan.senderEmails,
+          moved: 0
+        }
+      });
+    }
+
+    return {
+      status: 409,
+      body: {
+        settled: false,
+        error: plan.readerSelfPay ? 'SELF_PAY_NOT_ALLOWED' : 'PAYPAL_RECEIVER_MISSING',
+        message,
+        receiverEmail: plan.reader || null,
+        senderEmail: config.paypal.businessEmail,
+        paypal: profile,
+        // Explicit: the refusal happened before any reservation, so the
+        // balances are exactly as they were.
+        balance: snapshot()
+      }
+    };
+  }
+
+  const receiver = plan.reader;
+  const publisher = plan.publisher;
+  const paysPublisher = Boolean(publisher);
+
+  /*
+   * The publisher share can be legitimately unpayable while the reader's is
+   * fine. Say so once per window: otherwise the terminal silently shows a 30%
+   * that never leaves, and the ledger's carried balance looks like a bug.
+   */
+  if (plan.publisherHold) {
+    const holdKey = `publisher-hold:${plan.publisherHold}:${plan.reader}`;
+    if (shouldLogRefusal(holdKey)) {
+      emit({
+        stage: 'payout',
+        source: 'ledger',
+        level: 'warn',
+        title: 'Publisher share held on the ledger',
+        detail: describeHold(plan),
+        data: {
+          trigger,
+          reason,
+          code: plan.publisherHold,
+          receiver: plan.reader,
+          publisherEmail: sanitizeText(publisherEmail, 120) || profile.publisherEmail || null,
+          senderEmails: plan.senderEmails
+        }
+      });
+    }
+  }
+
+  let prepared = ledger.preparePayout({
     maxAmount: profile.maxPayout,
     payPublisher: paysPublisher,
     rail: RAILS.PAYPAL
@@ -3071,7 +3163,7 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     };
   }
 
-  const { reservation } = prepared;
+  let { reservation } = prepared;
 
   emit({
     stage: 'payout',
@@ -3098,57 +3190,113 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
   });
 
   let routed;
-  try {
-    // The protocol agent owns the split and the Payouts call; the toolkit
-    // applies the documented request shape (idempotent sender_item_id,
-    // PayPal-Request-Id, retry on 429).
-    routed = await toolkit.routeSettlement({
-      reservation,
-      receiverEmail: receiver,
-      publisherEmail: paysPublisher ? publisher : '',
-      currency: profile.currency,
-      userShare: config.userShare,
-      subject: 'Your AdPal attention payout',
-      message:
-        'Thanks for reading The Courier. This is your 70% share of the ad that was shown while you were reading.'
-    });
-  } catch (error) {
-    ledger.cancelPayout(error?.message || 'PayPal request failed');
+  /*
+   * One recovery attempt is allowed, and only for the self-payment refusal.
+   *
+   * PayPal identifies self-payment by account, and the REST credentials do not
+   * expose an account's full address list — so the payer may own an alias this
+   * process was never configured with. When that happens the batch is rejected
+   * before anything moves, which makes the recovery exact: cancel the
+   * reservation, re-reserve with the publisher leg withheld, and send the batch
+   * that can succeed. The reader is still paid, the 30% stays accrued on the
+   * ledger instead of being debited for a transfer that never happened, and
+   * nothing has to be reversed.
+   */
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      // The protocol agent owns the split and the Payouts call; the toolkit
+      // applies the documented request shape (idempotent sender_item_id,
+      // PayPal-Request-Id, retry on 429).
+      routed = await toolkit.routeSettlement({
+        reservation,
+        receiverEmail: receiver,
+        publisherEmail: reservation.publisherAmount >= 0.01 ? publisher : '',
+        currency: profile.currency,
+        userShare: config.userShare,
+        subject: 'Your AdPal attention payout',
+        message:
+          'Thanks for reading The Courier. This is your 70% share of the ad that was shown while you were reading.'
+      });
+      break;
+    } catch (error) {
+      ledger.cancelPayout(error?.message || 'PayPal request failed');
 
-    const detail = error instanceof paypal.PayPalError
-      ? `${error.code} · ${error.message}`
-      : error?.message || 'Unknown PayPal error';
+      const retryable =
+        attempt === 0 &&
+        reservation.publisherAmount >= 0.01 &&
+        isSelfPayError(error);
 
-    emit({
-      stage: 'payout',
-      source: 'adserver.agent',
-      level: 'error',
-      title: 'PayPal payout failed',
-      detail,
-      data: {
-        trigger,
-        code: error?.code || 'PAYPAL_ERROR',
-        issues: error?.issues || [],
-        debugId: error?.debugId || '',
-        reference: reservation.reference
+      if (retryable) {
+        /*
+         * Drop only the publisher leg. The reader leg was never the refused
+         * item (that case is refused before reserving), and re-preparing keeps
+         * the debit and the batch in step.
+         */
+        const replanned = ledger.preparePayout({
+          maxAmount: profile.maxPayout,
+          payPublisher: false,
+          rail: RAILS.PAYPAL
+        });
+
+        if (replanned.ok) {
+          emit({
+            stage: 'payout',
+            source: 'adserver.agent',
+            level: 'warn',
+            title: 'Payout re-planned · publisher leg withheld',
+            detail:
+              `${error?.code || 'SELF_PAY_NOT_ALLOWED'} · the publisher receiver belongs to the ` +
+              `sending account, so the 30% stays accrued on the ledger and only the reader is paid.`,
+            data: {
+              trigger,
+              code: 'SELF_PAY_NOT_ALLOWED',
+              receiver,
+              publisherEmail: publisher || null,
+              senderEmails: plan.senderEmails,
+              withheldPublisherAmount: reservation.publisherAmount
+            }
+          });
+
+          reservation = replanned.reservation;
+          continue;
+        }
       }
-    });
 
-    console.error(`[payout] failed · ${detail}`);
+      const detail = error instanceof paypal.PayPalError
+        ? `${error.code} · ${error.message}`
+        : error?.message || 'Unknown PayPal error';
 
-    return {
-      status: error?.status || 502,
-      body: {
-        settled: false,
-        error: error?.code || 'PAYPAL_ERROR',
-        message: detail,
-        issues: error?.issues || [],
-        debugId: error?.debugId || '',
-        reference: reservation.reference,
-        paypal: profile,
-        balance: snapshot()
-      }
-    };
+      emit({
+        stage: 'payout',
+        source: 'adserver.agent',
+        level: 'error',
+        title: 'PayPal payout failed',
+        detail,
+        data: {
+          trigger,
+          code: error?.code || 'PAYPAL_ERROR',
+          issues: error?.issues || [],
+          debugId: error?.debugId || '',
+          reference: reservation.reference
+        }
+      });
+
+      console.error(`[payout] failed · ${detail}`);
+
+      return {
+        status: error?.status || 502,
+        body: {
+          settled: false,
+          error: error?.code || 'PAYPAL_ERROR',
+          message: detail,
+          issues: error?.issues || [],
+          debugId: error?.debugId || '',
+          reference: reservation.reference,
+          paypal: profile,
+          balance: snapshot()
+        }
+      };
+    }
   }
 
   const { batch, items, split } = routed;
@@ -3951,10 +4099,36 @@ function printBanner(port) {
   console.log(`  Logs       ${base}/api/logs  (SSE)`);
   console.log(`  Split      ${Math.round(config.userShare * 100)}% user · ${Math.round(config.publisherShare * 100)}% publisher`);
   console.log(`  Threshold  €${money(config.payoutThreshold)} · offer cap €${money(config.maxOfferPrice)}`);
+  const payoutPlan = planRecipients({ paypal: config.paypal });
   console.log(
-    `  Payouts    ${config.paypal.mode} · ${config.paypal.receiverEmail}` +
+    `  Payouts    ${config.paypal.mode} · ${payoutPlan.reader || '(no receiver)'}` +
+      (payoutPlan.publisher ? ` + ${payoutPlan.publisher}` : ' · publisher accrued') +
       (paypal.isConfigured() ? '' : ' · credentials missing')
   );
+
+  /*
+   * Self-payment, stated before anything tries it.
+   *
+   * PayPal refuses a payout to the account it was sent from, and it refuses the
+   * whole batch — so this is not a degraded mode, it is a configuration that
+   * cannot pay anyone. Naming it here turns a failed settlement (and a cancelled
+   * reservation) into a one-line fix before the demo starts.
+   */
+  if (payoutPlan.readerSelfPay) {
+    console.log(
+      `  Note       PAYPAL_RECEIVER_EMAIL (${payoutPlan.reader}) is the sending account.` +
+        '\n             PayPal refuses a payout to the payer (SELF_PAY_NOT_ALLOWED): every' +
+        '\n             payout will be refused before submission. Set it to another Sandbox account.'
+    );
+  }
+
+  /*
+   * A publisher leg held back is normal when no second account is configured,
+   * but it changes what the 30% means, so it is stated rather than implied.
+   */
+  if (payoutPlan.publisherHold) {
+    console.log(`  Note       ${describeHold(payoutPlan)}`);
+  }
 
   /*
    * Webhook environment, stated at boot.

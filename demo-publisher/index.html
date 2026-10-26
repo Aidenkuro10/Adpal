@@ -16,10 +16,16 @@
     "you earned" toast.
 
     Sponsored placements are pre-allocated, not injected. Each `.adpal-slot`
-    reserves its final height in CSS from the first paint, so when the extension
-    mounts an approved creative the surrounding text never moves: the unit fades
-    into a box that was always there. Placements live inside bento cards or in
-    the sidebar rail — never in the middle of a paragraph flow.
+    reserves its final height in CSS from the first paint, so when an approved
+    creative is mounted the surrounding text never moves: the unit fades into a
+    box that was always there. Placements live inside bento cards or in the
+    sidebar rail — never in the middle of a paragraph flow.
+
+    `adpal-agent.js` drives all of this from the page itself: presence
+    heartbeats, attention measurement and the offer request are same-origin
+    fetches, so the hosted deployment works with no extension installed. The
+    extension still owns third-party pages, and the two agents explicitly stand
+    down for each other rather than double-counting one reading session.
 
     The agent terminal (SSE, L402, PayPal) is a separate surface at /terminal/.
   -->
@@ -402,6 +408,7 @@
     </div>
   </footer>
 
+  <script src="adpal-agent.js"></script>
   <script src="reader.js"></script>
 </body>
 </html>

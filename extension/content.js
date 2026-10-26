@@ -27,6 +27,19 @@
   if (window.__adpalContentLoaded) return;
   window.__adpalContentLoaded = true;
 
+  /* Only one agent may measure a page.
+   *
+   * A publisher that ships its own agent (`demo-publisher/adpal-agent.js`) marks
+   * the document with `data-adpal-page-agent`. That script is part of the page,
+   * so it runs during parsing — before this content script's `document_idle` —
+   * and it owns the placements from then on. Yielding here is what stops one
+   * reading session from being negotiated twice and paid twice.
+   *
+   * The flag below is the other half of that handshake: a page agent that loads
+   * late sees it and stands down instead. */
+  if (document.documentElement.dataset.adpalPageAgent === '1') return;
+  document.documentElement.dataset.adpalExtension = '1';
+
   const SLOT_SELECTOR = '#adpal-slot, [data-adpal-slot]';
 
   const CONFIG = {
@@ -770,19 +783,32 @@
    * so nothing can be bought or paid out on behalf of a reader who is not there.
    */
   function startPresence() {
+    // Page-scoped heartbeat: closing the tab clears it, a hidden tab reports
+    // `hidden` rather than pretending to be a reader, and a bfcache restore
+    // starts it again.
+    let timer = 0;
+
     const currentState = () =>
       document.visibilityState === 'visible' ? 'active' : 'hidden';
 
     const beat = () => sendPresence(currentState());
 
-    beat();
+    /** Restarts the heartbeat after a bfcache restore, where `pagehide` cleared it. */
+    const resume = () => {
+      window.clearInterval(timer);
+      timer = window.setInterval(beat, CONFIG.presenceIntervalMs);
+    };
 
-    // The interval is page-scoped: closing the page clears it, and a hidden tab
-    // reports `hidden` rather than pretending to be a reader.
-    const timer = window.setInterval(beat, CONFIG.presenceIntervalMs);
+    beat();
+    resume();
 
     document.addEventListener('visibilitychange', beat, { passive: true });
-    window.addEventListener('pageshow', beat);
+    window.addEventListener('pageshow', () => {
+      // A restored page comes back with no interval and no server-side record,
+      // so it re-beats immediately before resuming the regular loop.
+      resume();
+      beat();
+    });
     window.addEventListener('pagehide', () => {
       window.clearInterval(timer);
       sendPresence('closing');

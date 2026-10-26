@@ -704,6 +704,10 @@ app.post('/api/client-event', (req, res) => {
   const data = body.data && typeof body.data === 'object' ? body.data : null;
   const host = sanitizeText(body.host, 120);
   const clientId = sanitizeText(body.client, 64);
+  // The /demo/ page posts its own telemetry; a third-party page is relayed by
+  // the extension's service worker. Labelling the stream keeps the terminal
+  // honest about where a reading session came from.
+  const channel = body.channel === 'web' ? 'web' : 'extension';
 
   // Any extension activity is also proof of life: a reader who is mid-session
   // should not lose presence just because the dedicated ping is in flight.
@@ -716,11 +720,11 @@ app.post('/api/client-event', (req, res) => {
 
   emit({
     stage: kind,
-    source: 'extension.agent',
+    source: channel === 'web' ? 'web.agent' : 'extension.agent',
     level,
     title,
     detail: detail || (host ? `on ${host}` : ''),
-    data: { ...(data || {}), client: sanitizeText(body.client, 24) || 'extension', host }
+    data: { ...(data || {}), client: sanitizeText(body.client, 24) || channel, host, channel }
   });
 
   res.json({ ok: true });
@@ -2242,6 +2246,16 @@ app.post('/api/offer', async (req, res) => {
   const clientId = sanitizeText(body.clientId, 64) || req.ip || 'anonymous';
   const now = Date.now();
 
+  /* Which surface is asking.
+   *
+   * The extension cannot POST cross-origin, so it relays through its service
+   * worker; the /demo/ page agent posts same-origin to this exact route. The
+   * only thing that differs is the label on the stream — the scoring, the
+   * presence gate and the ledger are identical, which is the point: the web
+   * path is not a simulation of the extension, it is the same protocol. */
+  const channel = body.channel === 'web' ? 'web' : 'extension';
+  const channelSource = channel === 'web' ? 'web.agent' : 'extension.agent';
+
   /*
    * The presence gate.
    *
@@ -2262,7 +2276,7 @@ app.post('/api/offer', async (req, res) => {
         lastPresenceWarnAt.set(key, now);
         emit({
           stage: 'presence',
-          source: 'extension.agent',
+          source: channelSource,
           level: 'warn',
           title: 'Offer refused · no active reader',
           detail: `${alive.reason} · an impression requires a live /demo/ session`,
@@ -2270,7 +2284,8 @@ app.post('/api/offer', async (req, res) => {
             client: clientLabel(clientId),
             reason: alive.reason,
             ageMs: alive.ageMs,
-            activeReaders: alive.activeCount
+            activeReaders: alive.activeCount,
+            channel
           }
         });
       }
@@ -2331,7 +2346,7 @@ app.post('/api/offer', async (req, res) => {
 
   emit({
     stage: 'request',
-    source: 'extension.agent',
+    source: channelSource,
     level: 'info',
     title: 'Offer requested',
     detail: `€${money(price)} · ${publisher} · ${pageTitle}`,
@@ -2340,7 +2355,8 @@ app.post('/api/offer', async (req, res) => {
       publisher,
       pageTitle,
       slot: slotDetected ? 'declared' : 'unknown',
-      client: clientLabel(clientId)
+      client: clientLabel(clientId),
+      channel
     }
   });
 

@@ -2,11 +2,16 @@
 
 A runnable prototype of advertising that pays for **attention** instead of personal data.
 
-The reader experience is fully passive: no “click to earn” button, no countdown, no overlay. A publisher declares an ad slot, the extension measures attention in the background, the server validates it, and only then does a clean creative appear. The reader's share is credited automatically.
+The reader experience is fully passive: no “click to earn” button, no countdown, no overlay. A publisher declares an ad slot, an agent measures attention in the background, the server validates it, and only then does a clean creative appear. The reader's share is credited automatically.
+
+The agent has two homes, and neither is required by the other:
+
+- **`demo-publisher/adpal-agent.js`** — the page-side agent. It runs from the publication itself, so **`/demo/` works standalone** on any host, including a hosted deployment, with no extension, no permissions and no install step. Same-origin `fetch()` to `/api/presence`, `/api/offer` and `/api/client-event`.
+- **`extension/`** — the Manifest V3 extension, for pages the publisher does not control. It measures the same way and relays through its service worker.
 
 The repository contains three independent parts:
 
-1. **`extension/`** — a Chrome Manifest V3 extension that measures attention passively and renders the approved creative inside the declared ad slot.
+1. **`extension/`** — a Chrome Manifest V3 extension that measures attention passively and renders the approved creative inside the declared ad slot, on third-party pages.
 2. **`server/`** — a Node.js/Express simulator: a “human vs script” heuristic, a rotating ad-server agent pool (five advertiser profiles), the **70% user / 30% publisher** split, balances, real PayPal Sandbox payouts through the official **PayPal AI Toolkit**, and a telemetry feed.
 3. **`demo-publisher/`** — the presentation layer, split into two dedicated views: **`/demo/`** is a clean fictional newspaper (editorial only, no telemetry UI), and **`/terminal/`** is a dark agent terminal that streams the negotiation as raw JSON over SSE.
 
@@ -20,13 +25,13 @@ The repository contains three independent parts:
 ┌──────────────────────────── Reader page (http/https) ─────────────────────┐
 │  #adpal-slot — reserved frame, empty until attention is validated         │
 │                                                                           │
-│  content.js (invisible, no buttons, no panels)                            │
+│  adpal-agent.js on /demo/ · content.js on other pages (invisible, no UI)   │
 │    ├── passive tracker: duration · mouse · scroll · visibility · focus     │
 │    ├── 6 s measurement window, started only after natural engagement       │
 │    ├── Shadow DOM creative, rendered only on `approved: true`             │
 │    └── aggregated session samples relayed to the server every 8 s          │
 └───────────────────────────────┬───────────────────────────────────────────┘
-                                │ chrome.runtime.sendMessage
+                                │ same-origin fetch (/demo/) · sendMessage (extension)
 ┌───────────────────────────────▼───────────────────────────────────────────┐
 │  background.js — MV3 service worker                                       │
 │  chrome.storage.local cache · anonymous client ID · HTTP calls            │
@@ -109,6 +114,7 @@ Adpal/
 ├── demo-publisher/
 │   ├── index.html          Publication: editorial only, no debug panels
 │   ├── style.css           Newspaper layout
+│   ├── adpal-agent.js      Page-side agent: presence, attention, offer, creative
 │   ├── reader.js           Reading-progress indicator
 │   └── terminal/
 │       ├── index.html      Agent terminal (dedicated view)
@@ -196,7 +202,9 @@ $env:NODE_ENV = 'production'; node server.js
 With `NODE_ENV=production`, pages are sent `public, max-age=0, must-revalidate`
 with validators enabled, and a `?v=` URL is served `immutable` for a year.
 
-### 2. Load the extension
+### 2. (Optional) Load the extension
+
+**`/demo/` does not need this step.** The publication ships its own page agent, so presence, measurement and creative rendering all happen in the page with the server running. Install the extension only if you want AdPal to work on pages the publisher does not control.
 
 1. Open `chrome://extensions`.
 2. Turn on **Developer mode** (top right).
@@ -205,6 +213,8 @@ with validators enabled, and a `?v=` URL is served `immutable` for a year.
 5. Pin the **AdPal** icon to the toolbar.
 
 After changing extension code, click **Reload** on the AdPal card in `chrome://extensions`, then reload the demo tab.
+
+> On `/demo/` the two agents defer to each other: the page agent claims the document during parsing, and the content script sees that claim at `document_idle` and stands down (the reverse guard also exists). One reading session is never negotiated twice, so an impression can never be paid twice.
 
 > The service worker and popup need the server. If it is stopped, the popup shows **Offline** and the terminal stays disconnected.
 
@@ -217,7 +227,7 @@ Go to **[http://localhost:3000/demo/](http://localhost:3000/demo/)** and read no
    > **Act 1** — `/terminal/` starts clean: *“Waiting for reader attention…”*.
 
 2. Move the mouse and scroll for a few seconds, as any reader would.
-3. The extension measures a **6-second window in the background** for whichever placement is on screen. The phase moves from *Measuring* to *Validating*.
+3. The page agent measures a **6-second window in the background** for whichever placement is on screen. The phase moves from *Measuring* to *Validating*.
 4. The server runs the bot checks, scores the session, mints an **L402 macaroon**, and records the 70/30 split.
 
    > **Act 2/3** — `/terminal/` streams the `402 Payment Required` challenge, the attention proof, the macaroon caveats and the revenue split as raw JSON.
@@ -360,7 +370,7 @@ The service worker posts the report to `POST /api/offer`. The server:
 4. withholds the offer if any guard rail fires or the score is below `HUMAN_THRESHOLD`;
 5. otherwise debits the advertiser budget, assigns a creative, and credits **70% to the reader** and **30% to the publisher**.
 
-The extension renders the creative only when the response contains `approved: true`. On rejection the slot simply stays empty.
+The agent renders the creative only when the response contains `approved: true`. On rejection the slot simply stays empty.
 
 ### The payout
 
@@ -663,7 +673,7 @@ PayPal credentials are redacted before they reach this stream: OAuth tokens are 
 
 ### `POST /api/client-event`
 
-Silent sink for the content script's aggregated session samples (`kind`, `level`, `title`, `detail`, `data`, `host`). The publication page renders none of it; it exists so the terminal can show what the extension measured while the reader was simply reading.
+Silent sink for the agent's aggregated session samples (`kind`, `level`, `title`, `detail`, `data`, `host`, `channel`). The publication page renders none of it; it exists so the terminal can show what the agent measured while the reader was simply reading. `channel` is `web` when `/demo/` posted the sample itself and `extension` when it was relayed by the service worker, and it selects the `source` on the stream (`web.agent` / `extension.agent`).
 
 ### `POST /api/offer`
 
@@ -759,7 +769,7 @@ Errors: `400 INVALID_PRICE`, `400 PRICE_TOO_HIGH`, `429 RATE_LIMITED` (one reque
 
 ## L402 protocol surface
 
-`POST /api/offer` is the endpoint the extension uses: it submits signals and gets a decision in one call. Agents, scripts and auditors get a separate, explicit **L402 negotiation**, modelled on CrawlerPal's FastAPI reference server (`server/main.py` + `client/main.py`).
+`POST /api/offer` is the endpoint both agents use: it submits signals and gets a decision in one call. `/demo/` posts it same-origin from the page; the extension relays it through its service worker. Agents, scripts and auditors get a separate, explicit **L402 negotiation**, modelled on CrawlerPal's FastAPI reference server (`server/main.py` + `client/main.py`).
 
 The difference from the reference is that AdPal never sniffs the `User-Agent`. The publication lives at `/demo/` and the contract only at `/api/l402/*`, so a browser can never be mistaken for an agent and an agent can never be served the article.
 
@@ -1327,7 +1337,7 @@ PayPal credentials are only read by the server. The page and the extension never
 
 If a payout stays `PENDING`, that is the sandbox's own processing state. `POST /api/payout` reports exactly what PayPal returned; the **Refresh** action in the terminal re-reads the batch with `GET /v1/payments/payouts/{id}`. Paying the business account itself is useful as a demo, but the batch only completes when the recipient is a separate **personal** Sandbox account — set `PAYPAL_RECEIVER_EMAIL` to that address.
 
-The price actually requested is defined in `extension/content.js` (`CONFIG.price`, €0.05 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
+The price actually requested is defined in `demo-publisher/adpal-agent.js` for the publication and in `extension/content.js` for third-party pages (`CONFIG.price`, €0.05 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
 
 The simulator **never fails because of a busy port**. If `PORT` is already taken (a stale terminal, another app), it walks forward through `PORT_SCAN_RANGE` following ports and prints the one it settled on:
 
@@ -1348,9 +1358,9 @@ The extension does not need reconfiguration when that happens. It resolves the s
 
 Every response is validated against `GET /api/health` (`service === 'adpal-simulator'`), so an unrelated app on a scanned port is never mistaken for the simulator. On a network failure the worker re-discovers once and replays the request, which also covers a server restarted on a different port.
 
-The publication is served by the simulator itself, so all of its API calls are relative and follow the active port automatically. The terminal header shows the live host (e.g. `localhost:3001`) and its SSE endpoint.
+The publication is served by the simulator itself, so all of its API calls are relative and follow the active port automatically — `/demo/` needs no server discovery at all. The terminal header shows the live host (e.g. `localhost:3001`) and its SSE endpoint.
 
-The passive loop timings live in `CONFIG` at the top of `extension/content.js`:
+The passive loop timings live in `CONFIG` at the top of `demo-publisher/adpal-agent.js` for the page, and at the top of `extension/content.js` for third-party pages. The two are kept in step deliberately; a different window on one surface would make the same reading session score differently depending on which agent measured it.
 
 | Key | Default | Purpose |
 | --- | --- | --- |

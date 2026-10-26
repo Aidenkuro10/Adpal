@@ -8,7 +8,7 @@
  * This page is editorial only. AdPal telemetry lives at /terminal/, a separate
  * surface. The four `.adpal-slot` placements are publisher-declared and each
  * one occupies a frame reserved in CSS before any creative exists, so a
- * delivered unit fades in without moving a single paragraph. The extension
+ * delivered unit fades in without moving a single paragraph. `adpal-agent.js`
  * mounts a Shadow DOM inside them only after an attention proof has been
  * accepted server-side.
  */
@@ -707,7 +707,7 @@ em {
  *  - `rail` / `banner` — a standalone frame with the paper's hairline card
  *    styling and a quiet "Partner" label while it waits.
  *
- * `data-adpal-state="filled"` is set by the extension the moment a creative is
+ * `data-adpal-state="filled"` is set by the agent the moment a creative is
  * mounted; it drops the reserved frame's own chrome so the unit's card is the
  * only surface (no double border) and hides the placeholder label.
  */

@@ -1655,6 +1655,11 @@ const TERMINAL_FAILURES = new Set(['FAILED', 'RETURNED', 'BLOCKED', 'CANCELED', 
  * same item event twice would double-reverse a failed payout, so each event id
  * is remembered. The map is bounded by insertion order — an unbounded Set in a
  * long-running demo is just a slow leak.
+ *
+ * An id is *claimed* before dispatch and finalised after, so two deliveries of
+ * the same event arriving in the same second cannot both be applied: the second
+ * one sees a claim in flight and answers `duplicate`. A claim is released if
+ * dispatch throws, so a transient fault still allows PayPal's retry to work.
  */
 const seenWebhookEvents = new Map();
 
@@ -1666,6 +1671,53 @@ function rememberWebhookEvent(id, record) {
     const oldest = seenWebhookEvents.keys().next().value;
     seenWebhookEvents.delete(oldest);
   }
+}
+
+/** True when this event id is already known (in flight or finished). */
+function webhookEventState(id) {
+  return id ? seenWebhookEvents.get(id) || null : null;
+}
+
+/** Reserves an event id for this delivery. Returns the prior record if taken. */
+function claimWebhookEvent(id) {
+  const prior = webhookEventState(id);
+  if (prior) return prior;
+  rememberWebhookEvent(id, { state: 'processing', at: new Date().toISOString() });
+  return null;
+}
+
+/** Marks a claim as completed, keeping its outcome for a later redelivery. */
+function finalizeWebhookEvent(id, record) {
+  if (!id) return;
+  rememberWebhookEvent(id, { ...record, state: 'done', at: new Date().toISOString() });
+}
+
+/** Drops a claim so a retry of the same event can still be applied. */
+function releaseWebhookEvent(id) {
+  if (id) seenWebhookEvents.delete(id);
+}
+
+/**
+ * Rate limiter for refusals that will repeat on every retry.
+ *
+ * A configuration mismatch produces an identical log line for each redelivery.
+ * Once per window is enough to diagnose it; once per delivery would bury the
+ * terminal and make the stream look like the failure it is describing.
+ */
+const refusalLogAt = new Map();
+
+function shouldLogRefusal(key) {
+  const now = Date.now();
+  const windowMs = config.paypal.webhook.retryAfterSec * 1000;
+  const last = refusalLogAt.get(key) || 0;
+  if (now - last < windowMs) return false;
+  refusalLogAt.set(key, now);
+  if (refusalLogAt.size > 100) {
+    for (const [entry, at] of refusalLogAt) {
+      if (now - at > windowMs * 2) refusalLogAt.delete(entry);
+    }
+  }
+  return true;
 }
 
 /*
@@ -1777,6 +1829,8 @@ async function handlePaypalWebhook(req, res) {
     signature = {
       status: 'unavailable',
       attempted: true,
+      code: error?.code || 'WEBHOOK_VERIFY_FAILED',
+      httpStatus: error?.status ?? null,
       reason: error?.message || 'Signature verification could not be completed.'
     };
   }
@@ -1793,15 +1847,68 @@ async function handlePaypalWebhook(req, res) {
         eventType,
         code: 'WEBHOOK_VERIFICATION_UNAVAILABLE',
         httpStatus: signature.httpStatus ?? null,
-        paypalCode: signature.code || null
+        paypalCode: signature.code || null,
+        apiBase: config.paypal.apiBase
       }
     });
     // 503 is retryable on purpose: the event is probably genuine, we simply
     // could not prove it. Dropping it with a 401 would lose a real notification.
-    return res.status(503).json({
-      error: 'WEBHOOK_VERIFICATION_UNAVAILABLE',
-      message: signature.reason || 'Signature verification could not be performed.'
-    });
+    return res
+      .status(503)
+      .set('Retry-After', String(config.paypal.webhook.retryAfterSec))
+      .json({
+        error: 'WEBHOOK_VERIFICATION_UNAVAILABLE',
+        message: signature.reason || 'Signature verification could not be performed.',
+        mode: config.paypal.mode,
+        api_base: config.paypal.apiBase
+      });
+  }
+
+  /*
+   * Cross-environment delivery: the notification is signed by the environment
+   * this server is not configured for, so no retry can ever verify it.
+   *
+   * Answering 401 here — as if the signature had been checked and refused —
+   * was the loop: PayPal reads 401 as "rejected", redelivers, and the 401 is
+   * repeated with nothing in the log naming the actual cause. This answers 503
+   * with a long Retry-After so the event survives a configuration fix instead
+   * of being consumed, and logs it once per window rather than once per retry.
+   */
+  if (signature.status === 'mismatch') {
+    const mismatchKey = `mismatch:${signature.environmentMismatch?.notification || 'unknown'}`;
+    if (shouldLogRefusal(mismatchKey)) {
+      reportWebhook({
+        stage: 'paypal.webhook',
+        source: 'paypal.webhook',
+        level: 'error',
+        title: 'Webhook refused · environment mismatch',
+        detail: signature.reason || 'The notification belongs to the other PayPal environment.',
+        data: {
+          eventId,
+          eventType,
+          code: 'WEBHOOK_ENVIRONMENT_MISMATCH',
+          serverMode: config.paypal.mode,
+          apiBase: config.paypal.apiBase,
+          notificationEnv: signature.environmentMismatch?.notification || 'unknown',
+          webhookId: config.paypal.webhook.id ? `${config.paypal.webhook.id.slice(0, 6)}…` : '',
+          fix:
+            `register the webhook id in ${config.paypal.mode}, or set PAYPAL_MODE to match the ` +
+            'environment that owns it (live also needs PAYPAL_ALLOW_LIVE=true)',
+          logWindowSec: config.paypal.webhook.retryAfterSec
+        }
+      });
+    }
+
+    return res
+      .status(503)
+      .set('Retry-After', String(config.paypal.webhook.retryAfterSec))
+      .json({
+        error: 'WEBHOOK_ENVIRONMENT_MISMATCH',
+        message: signature.reason || 'The notification belongs to the other PayPal environment.',
+        mode: config.paypal.mode,
+        api_base: config.paypal.apiBase,
+        notification_environment: signature.environmentMismatch?.notification || 'unknown'
+      });
   }
 
   if (signature.status === 'failed') {
@@ -1811,7 +1918,14 @@ async function handlePaypalWebhook(req, res) {
       level: 'error',
       title: 'Webhook rejected · signature not verified',
       detail: `${eventType} · ${signature.reason || 'verification failed'}`,
-      data: { eventId, eventType, code: 'WEBHOOK_SIGNATURE_INVALID' }
+      data: {
+        eventId,
+        eventType,
+        code: signature.code || 'WEBHOOK_SIGNATURE_INVALID',
+        verificationStatus: signature.verificationStatus || null,
+        mode: config.paypal.mode,
+        apiBase: config.paypal.apiBase
+      }
     });
     return res.status(401).json({
       error: 'WEBHOOK_SIGNATURE_INVALID',
@@ -1835,15 +1949,23 @@ async function handlePaypalWebhook(req, res) {
   }
 
   // --- replay guard -------------------------------------------------
-  if (eventId && seenWebhookEvents.has(eventId)) {
-    const prior = seenWebhookEvents.get(eventId);
+  /*
+   * Claim before dispatch. A redelivery of a finished event is a duplicate; a
+   * second copy arriving while the first is still being applied is also a
+   * duplicate, which is what stops two concurrent deliveries from double-
+   * reversing one failed payout.
+   */
+  const prior = claimWebhookEvent(eventId);
+  if (prior) {
     reportWebhook({
       stage: 'paypal.webhook',
       source: 'paypal.webhook',
       level: 'info',
-      title: 'Webhook redelivered · already processed',
+      title: prior.state === 'processing'
+        ? 'Webhook redelivered · already in flight'
+        : 'Webhook redelivered · already processed',
       detail: `${eventType} · ${eventId}`,
-      data: { eventId, eventType, firstSeenAt: prior?.at || null }
+      data: { eventId, eventType, state: prior.state || 'done', firstSeenAt: prior.at || null }
     });
     return res.json({
       ok: true,
@@ -1888,16 +2010,39 @@ async function handlePaypalWebhook(req, res) {
   let payout = null;
   let reversal = null;
 
-  if (status) {
-    const result = webhookReconciler.receive({
-      eventId,
-      eventType,
-      status,
-      identifiers
+  /*
+   * The ledger work is wrapped so a throw cannot leave the event id claimed
+   * forever: an unhandled failure means the event was not applied, and PayPal's
+   * retry must be allowed to apply it. Every known input is handled inside
+   * `receive`, so this only guards against a genuine defect.
+   */
+  try {
+    if (status) {
+      const result = webhookReconciler.receive({
+        eventId,
+        eventType,
+        status,
+        identifiers
+      });
+      payout = result.payout;
+      reversal = result.reversal;
+      outcome = result.outcome;
+    }
+  } catch (error) {
+    releaseWebhookEvent(eventId);
+    reportWebhook({
+      stage: 'paypal.webhook',
+      source: 'paypal.webhook',
+      level: 'error',
+      title: 'Webhook not applied · internal error',
+      detail: `${eventType} · ${error?.message || 'unknown error'}`,
+      data: { eventId, eventType, code: 'WEBHOOK_APPLY_FAILED' }
     });
-    payout = result.payout;
-    reversal = result.reversal;
-    outcome = result.outcome;
+    // 500 is retryable and the claim is gone, so the retry will be applied.
+    return res.status(500).json({
+      error: 'WEBHOOK_APPLY_FAILED',
+      message: 'The notification could not be applied to the ledger; it will be retried.'
+    });
   }
 
   reportWebhook({
@@ -1929,11 +2074,22 @@ async function handlePaypalWebhook(req, res) {
       status,
       reversal,
       payoutId: payout?.id || null,
-      pendingWebhooks: webhookReconciler.size
+      pendingWebhooks: webhookReconciler.size,
+      mode: config.paypal.mode
     }
   });
 
-  if (eventId) rememberWebhookEvent(eventId, { type: eventType, at: new Date().toISOString(), outcome });
+  /*
+   * A held event was not applied — it is waiting for its payout to be
+   * committed. Release its claim instead of finalising it, so a redelivery
+   * after the buffer's TTL can still be applied. Applying a status twice is
+   * idempotent in the ledger, so nothing can be credited twice.
+   */
+  if (outcome === 'deferred') {
+    releaseWebhookEvent(eventId);
+  } else {
+    finalizeWebhookEvent(eventId, { type: eventType, outcome });
+  }
 
   res.set('Cache-Control', 'no-store');
   return res.json({
@@ -3820,12 +3976,124 @@ function printBanner(port) {
     console.log('             notifications are acknowledged unverified; set PAYPAL_WEBHOOK_ID');
   }
 
+  /*
+   * A live configuration that was silently demoted must be visible, or the
+   * operator will read "sandbox" in every PayPal error and never look here.
+   */
+  if (config.paypal.liveDowngraded) {
+    console.log(
+      '  Note       PAYPAL_MODE=live was ignored: sandbox is enforced.' +
+        '\n             Set PAYPAL_ALLOW_LIVE=true only when the credentials, the webhook id' +
+        '\n             and the signing host all belong to Live.'
+    );
+  }
+
   if (shifted) {
     console.log(`  Note       port ${config.port} was busy, using ${port}`);
     console.log('             (the extension discovers this port automatically)');
   }
   console.log('  Stop       Ctrl+C');
   console.log('');
+
+  // Network checks run after the banner so a slow PayPal never delays boot.
+  void auditPaypalWebhook();
+}
+
+/**
+ * Proves at boot that the webhook PayPal calls is this deployment.
+ *
+ * Two mismatches are silent at delivery time and both look like "the webhook is
+ * broken":
+ *
+ *  1. the id is registered in the other environment → PayPal answers 404 on the
+ *     lookup and FAILURE on every verification;
+ *  2. the id is valid but its callback URL points at a previous hostname →
+ *     PayPal delivers somewhere this process will never see.
+ *
+ * Both are reported on stdout (which is the log surface on a hosting platform)
+ * and on the terminal stream. Never fatal, never blocking, and skipped entirely
+ * when there is not enough configuration to judge.
+ */
+async function auditPaypalWebhook() {
+  if (!paypal.isConfigured() || !config.paypal.webhook.id) return;
+
+  const hook = await paypal.describeWebhook();
+
+  if (!hook.ok) {
+    const detail = hook.skipped
+      ? hook.reason
+      : `${hook.reason}${hook.code ? ` · ${hook.code}` : ''}`;
+    console.error(`  [webhook] ! ${detail}`);
+    reportWebhook({
+      stage: 'paypal.webhook',
+      source: 'paypal.webhook',
+      level: 'error',
+      title: 'Webhook configuration problem',
+      detail,
+      data: {
+        mode: config.paypal.mode,
+        apiBase: config.paypal.apiBase,
+        webhookId: config.paypal.webhook.id,
+        lookupStatus: hook.status ?? null,
+        code: 'WEBHOOK_LOOKUP_FAILED'
+      }
+    });
+    return;
+  }
+
+  const expected = config.paypal.webhook.expectedUrl;
+  const registered = String(hook.url || '');
+  const matches = !expected || registered === expected;
+
+  if (!matches) {
+    const sameHost = safeHost(registered) && safeHost(registered) === safeHost(expected);
+    const detail =
+      `PayPal calls ${registered || '(no url)'} but this deployment is ${expected}` +
+      (sameHost ? ' · same host, different path' : ' · a different host will never reach this process');
+    console.error(`  [webhook] ! ${detail}`);
+    reportWebhook({
+      stage: 'paypal.webhook',
+      source: 'paypal.webhook',
+      level: 'error',
+      title: 'Webhook endpoint mismatch',
+      detail,
+      data: {
+        registeredUrl: registered,
+        expectedUrl: expected,
+        mode: config.paypal.mode,
+        apiBase: config.paypal.apiBase,
+        code: 'WEBHOOK_URL_MISMATCH'
+      }
+    });
+    return;
+  }
+
+  reportWebhook({
+    stage: 'paypal.webhook',
+    source: 'paypal.webhook',
+    level: 'ok',
+    title: 'Webhook endpoint verified',
+    detail:
+      `${config.paypal.mode} · ${hook.id} · ${registered}` +
+      (hook.eventTypes.includes('*') ? ' · all events' : ` · ${hook.eventTypes.length} event types`),
+    data: {
+      webhookId: hook.id,
+      url: registered,
+      expectedUrl: expected || null,
+      eventTypes: hook.eventTypes,
+      mode: config.paypal.mode,
+      apiBase: config.paypal.apiBase
+    }
+  });
+}
+
+/** Hostname of a URL, or '' when it is not one. Used only for diagnostics. */
+function safeHost(value) {
+  try {
+    return new URL(String(value || '')).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
 }
 
 startListening(config.port);

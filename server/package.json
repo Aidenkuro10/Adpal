@@ -11,6 +11,8 @@
     "check:accounting": "node scripts/accounting-check.js",
     "check:webhooks": "node scripts/webhook-reconcile-check.js",
     "check:webhooks:e2e": "node scripts/webhook-e2e.js",
+    "check:webhooks:signature": "node scripts/webhook-signature-check.js",
+    "check:paypal-env": "node scripts/paypal-env-check.js",
     "check:stream": "node scripts/sse-latency.js"
   },
   "engines": {

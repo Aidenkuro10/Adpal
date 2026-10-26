@@ -469,6 +469,7 @@ is idempotent: the reversal runs once.
 ```bash
 node scripts/webhook-reconcile-check.js   # 18 checks, no network
 node scripts/webhook-e2e.js http://localhost:3101   # real batch, real deliveries
+node scripts/webhook-signature-check.js             # signature/refusal mapping
 ```
 
 The end-to-end check needs a second server with `PAYPAL_WEBHOOK_ID` blanked, so
@@ -1202,15 +1203,25 @@ from the exact bytes PayPal signed. Verification itself is a round-trip to
 | no id, no credentials | not checked | `200`, `signature: "skipped"` |
 | id configured, PayPal says `FAILURE` | refused | `401` `WEBHOOK_SIGNATURE_INVALID` |
 | id configured, verification API unreachable | held | `503` `WEBHOOK_VERIFICATION_UNAVAILABLE` |
+| notification signed by the other environment | refused, retryable | `503` `WEBHOOK_ENVIRONMENT_MISMATCH` |
+| `paypal-cert-url` is not a PayPal host | refused | `401` `WEBHOOK_SIGNATURE_INVALID` |
 | `PAYPAL_WEBHOOK_STRICT=true`, nothing to verify against | refused | `503` `WEBHOOK_UNVERIFIED` |
 
-The middle two rows matter operationally. Once an id is configured, *every*
-notification must carry a signature PayPal confirms, so an unsigned request is
-refused — which also means the Postman and health-check probes accept either
-`200` or `401` depending on how the server is configured. And a failure of the
-verification *call* is deliberately not reported as a rejected signature: `401`
-tells PayPal the event is bad and it retries indefinitely, so an outage becomes
-an infinite retry loop with the real cause hidden.
+The rows matter operationally. Once an id is configured, *every* notification
+must carry a signature PayPal confirms, so an unsigned request is refused — which
+also means the Postman and health-check probes accept either `200` or `401`
+depending on how the server is configured. And a failure of the verification
+*call* is deliberately not reported as a rejected signature: `401` tells PayPal
+the event is bad and it retries indefinitely, so an outage becomes an infinite
+retry loop with the real cause hidden.
+
+The environment-mismatch row is the same reasoning applied to configuration. A
+notification signed by Live can never verify against a Sandbox server, so a
+`401` there is a lie about the signature: PayPal reads it as "rejected" and
+redelivers while the real cause — a webhook id or mode belonging to the other
+environment — never appears. It answers `503` with a long `Retry-After` instead,
+which keeps the event available for a configuration fix, and the refusal is
+logged once per window rather than once per retry.
 
 ### Seeing webhooks in the logs
 
@@ -1261,15 +1272,35 @@ At runtime the same conclusion is guarded from the notification itself. PayPal
 stamps each event with `paypal-cert-url`, whose host names the environment that
 sent it, so a Live event reaching a Sandbox-configured server is refused before
 the network round trip and logged as `Webhook environment mismatch` rather than
-an anonymous `FAILURE`. An unrecognised cert host is *not* treated as a
-mismatch — it falls through to normal verification, because proxies exist and a
-misread header must never reject a genuine event.
+an anonymous `FAILURE`.
+
+The comparison is against the exact hostnames PayPal signs from
+(`api.sandbox.paypal.com` / `api-m.sandbox.paypal.com` for Sandbox,
+`api.paypal.com` / `api-m.paypal.com` for Live), over HTTPS. A host that is
+neither is refused outright rather than forwarded: a substring test would let
+`api.sandbox.paypal.com.evil.example` through, and no genuine PayPal delivery
+uses anything outside those four names.
+
+Sandbox is enforced rather than merely defaulted. `PAYPAL_MODE=live` is ignored
+unless `PAYPAL_ALLOW_LIVE=true`, because that one variable moves the API host,
+the signing host and which webhook ids are valid; a half-flipped environment
+verifies nothing and retries forever. A demotion is printed at boot.
 
 The boot banner states all three values on one line, so a mixed deployment is
 visible at deploy time:
 
 ```
   Webhooks   sandbox · https://api-m.sandbox.paypal.com · id 09V249…
+```
+
+After the banner, one non-blocking check asks PayPal for the registered webhook
+and compares its callback URL with this deployment (`RENDER_EXTERNAL_URL`, or
+`PUBLIC_BASE_URL`), which catches the other silent failure — a valid id whose
+URL still points at a previous hostname, so nothing is ever delivered:
+
+```
+[webhook] ! Webhook endpoint mismatch · PayPal calls https://adpal.onrender.com/api/webhooks/paypal
+            but this deployment is https://old-adpal.example.com/api/webhooks/paypal
 ```
 
 ---
@@ -1295,7 +1326,8 @@ copy .env.example .env      # Windows (cmd)
 | `USER_SHARE` | `0.7` | User share (the remainder goes to the publisher) |
 | `ADVERTISER_BUDGET` | `50` | Simulated initial advertiser budget |
 | `HUMAN_THRESHOLD` | `50` | Minimum score required to approve an offer |
-| `PAYPAL_MODE` | `sandbox` | `sandbox` or `live` (the demo only ever uses sandbox) |
+| `PAYPAL_MODE` | `sandbox` | `sandbox` or `live`. Live is ignored unless `PAYPAL_ALLOW_LIVE=true` |
+| `PAYPAL_ALLOW_LIVE` | `false` | Opt in to Live. Sandbox is enforced otherwise: mode, API host and signing host always move together |
 | `PAYPAL_CLIENT_ID` | — | REST app client id from the PayPal developer dashboard |
 | `PAYPAL_CLIENT_SECRET` | — | REST app secret (server-side only, never sent to the page) |
 | `PAYPAL_BUSINESS_EMAIL` | `sb-jokak53538300@business.example.com` | Sandbox account the batch is sent from |
@@ -1304,6 +1336,7 @@ copy .env.example .env      # Windows (cmd)
 | `PAYPAL_CURRENCY` | `EUR` | Payout currency |
 | `PAYPAL_MAX_PAYOUT` | `5` | Guard rail: largest amount a single demo payout may move |
 | `PAYPAL_TIMEOUT_MS` | `15000` | Abort a PayPal HTTP call after this long |
+| `PAYPAL_AUTH_BACKOFF_MS` | `30000` | Do not re-try refused credentials for this long; stops a webhook retry storm from hammering `/v1/oauth2/token` |
 | `PAYPAL_AUTO_PAYOUT` | `true` | Create the batch automatically when a settled invoice crosses the threshold |
 | `PAYPAL_AUTO_PAYOUT_DELAY_MS` | `0` | Pause between the settlement event and the PayPal call; `0` keeps them on the same tick |
 | `PAYPAL_AUTO_PAYOUT_MIN_INTERVAL_MS` | `15000` | Minimum gap between two automatic batches |
@@ -1312,6 +1345,8 @@ copy .env.example .env      # Windows (cmd)
 | `PAYPAL_WEBHOOK_ID` | *(empty)* | Webhook id from the PayPal dashboard. Without it, notifications are accepted but reported `unverified` |
 | `PAYPAL_WEBHOOK_STRICT` | `false` | `true` refuses unverified notifications (503) instead of accepting them — use outside a sandbox demo |
 | `PAYPAL_WEBHOOK_REPLAY_WINDOW` | `500` | Event ids remembered to suppress PayPal's retries |
+| `PAYPAL_WEBHOOK_RETRY_AFTER` | `300` | `Retry-After` for a refusal only a configuration fix can change; also the minimum gap between identical refusal log lines |
+| `PUBLIC_BASE_URL` | *(empty)* | Public origin this deployment is reachable on, for the boot-time callback-URL check. Render's `RENDER_EXTERNAL_URL` is used when unset |
 | `PAYOUT_RAIL` | `paypal_payouts` | Active automatic rail: `paypal_payouts` or `solana-devnet` |
 | `SOLANA_ENABLED` | `true` | Enable the devnet rail |
 | `SOLANA_CLUSTER` | `devnet` | Label used in explorer links |

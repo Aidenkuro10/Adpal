@@ -23,6 +23,18 @@ const REQUEST_TIMEOUT_MS = Math.max(3000, paypal.timeoutMs);
 let tokenCache = { token: '', expiresAt: 0 };
 
 /**
+ * Last credential failure, replayed until `until`.
+ *
+ * A 401 invalid_client is not transient: the same credentials against the same
+ * host will be refused again. PayPal retries a refused webhook, so without this
+ * every retry would spend another token request on a known-bad configuration.
+ * Cleared by the next success, and bypassed with `force`.
+ *
+ * @type {{ until: number, code: string, message: string, status: number }}
+ */
+let authFailure = { until: 0, code: '', message: '', status: 0 };
+
+/**
  * Optional observer used by the terminal view. It receives redacted request and
  * response payloads for every PayPal call so a judge can inspect the real rail
  * without ever leaking a bearer token or client secret.
@@ -95,6 +107,16 @@ function publicProfile() {
   return {
     configured: isConfigured(),
     mode: paypal.mode,
+    // Reported so a mixed configuration is visible from the page, not only
+    // from the server's stdout.
+    modeRequested: paypal.modeRequested,
+    liveAllowed: paypal.liveAllowed,
+    liveDowngraded: paypal.liveDowngraded,
+    environment: paypal.mode,
+    certHosts: [...paypal.certHosts],
+    webhookId: paypal.webhook?.id ? `${paypal.webhook.id.slice(0, 6)}…` : '',
+    webhookStrict: Boolean(paypal.webhook?.strict),
+    expectedWebhookUrl: paypal.webhook?.expectedUrl || '',
     receiverEmail: paypal.receiverEmail,
     publisherEmail: paypal.publisherEmail,
     publisherConfigured: Boolean(paypal.publisherEmail),
@@ -128,6 +150,19 @@ async function accessToken({ force = false } = {}) {
     return tokenCache.token;
   }
 
+  /*
+   * A known-bad credential set is replayed rather than re-tested. The error is
+   * identical to the one PayPal returned, with the code intact, so a caller
+   * can still tell an auth failure from an outage.
+   */
+  if (!force && Date.now() < authFailure.until) {
+    throw new PayPalError(
+      `${authFailure.message} (not retried for another ` +
+        `${Math.max(1, Math.ceil((authFailure.until - Date.now()) / 1000))}s)`,
+      { status: authFailure.status, code: authFailure.code }
+    );
+  }
+
   const response = await request(`${paypal.apiBase}/v1/oauth2/token`, {
     method: 'POST',
     headers: {
@@ -140,10 +175,60 @@ async function accessToken({ force = false } = {}) {
 
   const data = await readJson(response);
 
+  if (!response.ok || !data?.access_token) {
+    const failure = new PayPalError(
+      data?.error_description || 'PayPal refused the OAuth2 credentials.',
+      {
+        status: 502,
+        code: data?.error || 'PAYPAL_AUTH_FAILED',
+        raw: data
+      }
+    );
+
+    /*
+     * Remember the refusal so a retry storm cannot hammer the token endpoint.
+     * The message names the environment, because "invalid_client" against the
+     * wrong API host is by far the most common cause and the bare PayPal error
+     * never says so.
+     */
+    authFailure = {
+      until: Date.now() + paypal.authFailureBackoffMs,
+      code: failure.code,
+      status: failure.status,
+      message:
+        `${failure.message} · obtained against the ${paypal.mode} host ` +
+        `${paypal.apiBase}; credentials are environment-specific`
+    };
+
+    publish('paypal.oauth', {
+      level: 'error',
+      title: 'OAuth2 token refused',
+      detail: `POST /v1/oauth2/token · HTTP ${response.status} · ${failure.code} · ${paypal.mode}`,
+      data: {
+        request: {
+          method: 'POST',
+          url: `${paypal.apiBase}/v1/oauth2/token`,
+          headers: { Authorization: 'Basic <client_id:client_secret redacted>' },
+          body: { grant_type: 'client_credentials' }
+        },
+        response: {
+          status: response.status,
+          ...correlationOf(response),
+          body: { error: data?.error || '', error_description: data?.error_description || '' }
+        },
+        backoffMs: paypal.authFailureBackoffMs
+      }
+    });
+
+    throw failure;
+  }
+
+  authFailure = { until: 0, code: '', message: '', status: 0 };
+
   publish('paypal.oauth', {
-    level: response.ok ? 'info' : 'error',
-    title: response.ok ? 'OAuth2 token issued' : 'OAuth2 token refused',
-    detail: `POST /v1/oauth2/token · HTTP ${response.status}`,
+    level: 'info',
+    title: 'OAuth2 token issued',
+    detail: `POST /v1/oauth2/token · HTTP ${response.status} · ${paypal.mode}`,
     data: {
       request: {
         method: 'POST',
@@ -157,29 +242,16 @@ async function accessToken({ force = false } = {}) {
       response: {
         status: response.status,
         ...correlationOf(response),
-        body: response.ok
-          ? {
-              token_type: data?.token_type || 'Bearer',
-              expires_in: Number(data?.expires_in) || null,
-              scope: data?.scope || '',
-              access_token: redactToken(data?.access_token),
-              app_id: data?.app_id || ''
-            }
-          : { error: data?.error || '', error_description: data?.error_description || '' }
+        body: {
+          token_type: data.token_type || 'Bearer',
+          expires_in: Number(data.expires_in) || null,
+          scope: data.scope || '',
+          access_token: redactToken(data.access_token),
+          app_id: data.app_id || ''
+        }
       }
     }
   });
-
-  if (!response.ok || !data?.access_token) {
-    throw new PayPalError(
-      data?.error_description || 'PayPal refused the OAuth2 credentials.',
-      {
-        status: 502,
-        code: 'PAYPAL_AUTH_FAILED',
-        raw: data
-      }
-    );
-  }
 
   const expiresInMs = (Number(data.expires_in) || 300) * 1000;
   tokenCache = {
@@ -532,29 +604,52 @@ function round2(value) {
 }
 
 /**
+ * The two environments PayPal publishes signing certificates from.
+ *
+ * Declared once, at module scope, so classification does not depend on which
+ * environment this server happens to be configured for — the point of the check
+ * is to identify the *other* one.
+ */
+const PAYPAL_CERT_HOSTS = Object.freeze({
+  sandbox: Object.freeze(['api.sandbox.paypal.com', 'api-m.sandbox.paypal.com']),
+  live: Object.freeze(['api.paypal.com', 'api-m.paypal.com'])
+});
+
+/**
  * Which PayPal environment a notification came from, read from its
  * `paypal-cert-url` header.
  *
- * PayPal serves Sandbox and Live from different hosts, and stamps the
- * notification with the host that owns the certificate. That makes the header a
- * reliable signal for the one mistake that is otherwise invisible: a Live
- * webhook pointed at a Sandbox-configured server (or the reverse). In that case
- * verification can only ever return FAILURE, which is indistinguishable from a
- * forged signature — so it is worth detecting explicitly.
+ * PayPal serves Sandbox and Live from different hosts and stamps each
+ * notification with the host that owns the signing certificate. That makes the
+ * header the one signal that identifies the mistake which is otherwise
+ * invisible: a Live webhook pointed at a Sandbox-configured server (or the
+ * reverse). Verification can then only ever return FAILURE — the same answer a
+ * forged signature gets — so the notification is retried forever while the real
+ * cause stays unlogged.
  *
- * Returns 'unknown' for a missing or unrecognised host, and the caller then
- * falls through to normal verification rather than guessing.
+ * The match is against the exact hostnames PayPal publishes, per environment
+ * (`config.paypal.certHosts`). A substring test would be a hole: any attacker
+ * can serve a certificate from a host whose name merely contains "sandbox".
+ *
+ * Returns 'sandbox', 'live', or 'unknown' for a host that is neither. The
+ * caller treats 'unknown' as a refusal, because PayPal always signs with one of
+ * the four hosts below.
  */
 function environmentOfCertUrl(certUrl) {
   let host = '';
   try {
-    host = new URL(String(certUrl || '')).hostname.toLowerCase();
+    const url = new URL(String(certUrl || ''));
+    // PayPal only ever serves these over TLS; a plaintext cert URL is a forgery
+    // or a mangling proxy, and neither is worth classifying.
+    if (url.protocol !== 'https:') return 'unknown';
+    host = url.hostname.toLowerCase().replace(/\.$/, '');
   } catch {
     return 'unknown';
   }
   if (!host) return 'unknown';
-  if (host.includes('sandbox')) return 'sandbox';
-  if (/^(api|api-m)\.paypal\.com$/.test(host)) return 'live';
+
+  if (PAYPAL_CERT_HOSTS.sandbox.includes(host)) return 'sandbox';
+  if (PAYPAL_CERT_HOSTS.live.includes(host)) return 'live';
   return 'unknown';
 }
 
@@ -566,19 +661,28 @@ function environmentOfCertUrl(certUrl) {
  * re-serialised copy, so the payload forwarded below is byte-faithful and a
  * local signature check could be added later without re-plumbing the route.
  *
- * Returns one of three outcomes rather than throwing for the "cannot check"
- * case, because a missing webhook id is a configuration gap, not a failure:
+ * The outcomes are kept distinct on purpose, because they call for different
+ * HTTP answers and only one of them means "do not trust this event":
  *
- *   { status: 'verified' }    PayPal confirmed the signature
- *   { status: 'failed'    }   PayPal rejected it — the caller must not trust the event
- *   { status: 'unavailable' } the check itself failed (network, 4xx/5xx, outage);
- *                             the signature is neither trusted nor disproved
- *   { status: 'skipped'   }   no credentials or no webhook id; nothing was checked
+ *   { status: 'verified'    } PayPal confirmed the signature
+ *   { status: 'failed'      } PayPal rejected it — the event must not be applied
+ *   { status: 'mismatch'    } the notification belongs to the other environment,
+ *                             so it can never verify here. Our configuration is
+ *                             wrong, not the signature. Retryable.
+ *   { status: 'unavailable' } the check itself could not run (network, rejected
+ *                             credentials, outage). Neither trusted nor disproved.
+ *   { status: 'skipped'     } no credentials or no webhook id; nothing was checked
+ *
+ * `mismatch` exists because folding it into `failed` is what turns one
+ * misconfigured variable into an endless retry loop: the route answered 401,
+ * PayPal read that as "rejected" and redelivered, and the actual cause — a
+ * Sandbox id on a Live endpoint or the reverse — never appeared as an error.
  *
  * @param {{ headers: Record<string, string>, event: object }} input
  */
 async function verifyWebhookSignature({ headers, event }) {
   const webhookId = paypal.webhook?.id || '';
+  const certUrl = String(headers['paypal-cert-url'] || '').trim();
 
   if (!isConfigured() || !webhookId) {
     return {
@@ -591,18 +695,39 @@ async function verifyWebhookSignature({ headers, event }) {
   }
 
   /*
-   * Refuse a notification from the other environment before spending a round
-   * trip on it. A Sandbox webhook id is unknown to the Live API and vice versa,
-   * so verification would answer FAILURE and every event would be retried
-   * forever with no hint as to why. Failing closed with the real reason is both
-   * safer and diagnosable.
+   * Classify the signing host before spending a round trip on it.
+   *
+   * A host that is neither PayPal's Sandbox nor its Live certificate host is
+   * not something to forward: PayPal always signs from one of four hostnames,
+   * so anything else is a forgery or a mangling proxy sitting in front of the
+   * deployment, and forwarding it just asks PayPal to say no.
    */
-  const notificationEnv = environmentOfCertUrl(headers['paypal-cert-url']);
+  const notificationEnv = environmentOfCertUrl(certUrl);
+
+  if (certUrl && notificationEnv === 'unknown') {
+    const reason =
+      `The notification names a certificate host this server does not recognise ` +
+      `(${certUrl.slice(0, 160)}). PayPal signs from ` +
+      `${PAYPAL_CERT_HOSTS.sandbox.concat(PAYPAL_CERT_HOSTS.live).join(' or ')}.`;
+    publish('paypal.webhook.verify', {
+      level: 'error',
+      title: 'Webhook rejected · unrecognised certificate host',
+      detail: reason,
+      data: { serverMode: paypal.mode, apiBase: paypal.apiBase, certUrl, webhookId }
+    });
+    return { status: 'failed', attempted: false, reason, code: 'CERT_URL_UNTRUSTED' };
+  }
+
+  /*
+   * Cross-environment delivery. A Sandbox webhook id is unknown to the Live API
+   * and vice versa, so verification can only answer FAILURE; failing closed
+   * here keeps that answer out of the signature path and names the real cause.
+   */
   if (notificationEnv !== 'unknown' && notificationEnv !== paypal.mode) {
     const reason =
       `This server is configured for ${paypal.mode} (${paypal.apiBase}) but the notification ` +
-      `came from ${notificationEnv} (${String(headers['paypal-cert-url']).trim()}). ` +
-      `Webhook ids and credentials are environment-specific, so it can never verify here.`;
+      `came from ${notificationEnv} (${certUrl}). Webhook ids, credentials and signing hosts ` +
+      `are environment-specific, so it can never verify here.`;
     publish('paypal.webhook.verify', {
       level: 'error',
       title: 'Webhook environment mismatch',
@@ -611,21 +736,23 @@ async function verifyWebhookSignature({ headers, event }) {
         serverMode: paypal.mode,
         apiBase: paypal.apiBase,
         notificationEnv,
-        certUrl: headers['paypal-cert-url'] || '',
-        webhookId
+        certUrl,
+        webhookId,
+        fix: `register the webhook in ${paypal.mode}, or point PAYPAL_MODE at the environment that owns this id`
       }
     });
     return {
-      status: 'failed',
+      status: 'mismatch',
       attempted: false,
       reason,
+      code: 'WEBHOOK_ENVIRONMENT_MISMATCH',
       environmentMismatch: { server: paypal.mode, notification: notificationEnv }
     };
   }
 
   const body = {
     auth_algo: headers['paypal-auth-algo'] || '',
-    cert_url: headers['paypal-cert-url'] || '',
+    cert_url: certUrl,
     transmission_id: headers['paypal-transmission-id'] || '',
     transmission_sig: headers['paypal-transmission-sig'] || '',
     transmission_time: headers['paypal-transmission-time'] || '',
@@ -641,11 +768,28 @@ async function verifyWebhookSignature({ headers, event }) {
     return {
       status: 'failed',
       attempted: false,
+      code: 'SIGNATURE_HEADERS_MISSING',
       reason: `The notification is missing signature headers: ${missing.join(', ')}.`
     };
   }
 
-  const token = await accessToken();
+  /*
+   * Credentials are fetched here rather than by the caller so a rejected app
+   * keeps its own code. `accessToken` caches the refusal for a while, which is
+   * what stops a webhook retry storm from hammering /v1/oauth2/token.
+   */
+  let token = '';
+  try {
+    token = await accessToken();
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      attempted: true,
+      code: error?.code || 'PAYPAL_AUTH_FAILED',
+      reason: `${error?.message || 'PayPal credentials could not be used.'} · ${paypal.mode} host ${paypal.apiBase}`
+    };
+  }
+
   const response = await request(`${paypal.apiBase}/v1/notifications/verify-webhook-signature`, {
     method: 'POST',
     headers: {
@@ -706,9 +850,111 @@ async function verifyWebhookSignature({ headers, event }) {
     status: verified ? 'verified' : 'failed',
     attempted: true,
     verificationStatus,
-    reason: verified ? '' : `PayPal returned verification_status=${verificationStatus}.`,
+    code: verified ? '' : 'SIGNATURE_REJECTED',
+    reason: verified
+      ? ''
+      : `PayPal returned verification_status=${verificationStatus} for a ${paypal.mode} ` +
+        `notification verified against ${paypal.apiBase} with webhook id ${webhookId}.`,
     correlationId: correlationOf(response).correlationId
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Environment diagnostics                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The environment this process will talk to, and what it will accept.
+ *
+ * Exposed so the banner, the terminal and the env-check script all describe the
+ * same thing instead of each deriving it.
+ */
+function describeEnvironment() {
+  return {
+    mode: paypal.mode,
+    modeRequested: paypal.modeRequested,
+    liveAllowed: paypal.liveAllowed,
+    liveDowngraded: paypal.liveDowngraded,
+    apiBase: paypal.apiBase,
+    certHosts: [...paypal.certHosts],
+    webhookId: paypal.webhook?.id || '',
+    webhookStrict: Boolean(paypal.webhook?.strict),
+    expectedWebhookUrl: paypal.webhook?.expectedUrl || ''
+  };
+}
+
+/**
+ * Reads the registered webhook from PayPal, to prove the id and the callback URL
+ * belong to this environment and to this deployment.
+ *
+ * Two failures this catches, neither of which says anything useful at delivery
+ * time:
+ *  - the id was registered in the other environment, so verification can never
+ *    succeed (PayPal answers 404 here, FAILURE there);
+ *  - the id is valid but its `url` still points at an old hostname, so PayPal
+ *    delivers nowhere and the server logs nothing at all.
+ *
+ * Never throws: this is a startup diagnostic, and a demo must boot even when
+ * PayPal is unreachable.
+ */
+async function describeWebhook() {
+  const id = paypal.webhook?.id || '';
+  if (!isConfigured()) {
+    return { ok: false, skipped: true, reason: 'PayPal credentials are missing.' };
+  }
+  if (!id) {
+    return { ok: false, skipped: true, reason: 'PAYPAL_WEBHOOK_ID is not set.' };
+  }
+
+  try {
+    const token = await accessToken();
+    const response = await request(
+      `${paypal.apiBase}/v1/notifications/webhooks/${encodeURIComponent(id)}`,
+      {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+      }
+    );
+    const data = await readJson(response);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        skipped: false,
+        status: response.status,
+        mode: paypal.mode,
+        apiBase: paypal.apiBase,
+        reason:
+          response.status === 404
+            ? `The webhook id does not exist in ${paypal.mode} (${paypal.apiBase}). ` +
+              'It was probably registered in the other environment.'
+            : `PayPal returned HTTP ${response.status} for the webhook lookup.`,
+        code: data?.name || ''
+      };
+    }
+
+    return {
+      ok: true,
+      skipped: false,
+      status: response.status,
+      mode: paypal.mode,
+      apiBase: paypal.apiBase,
+      id: data?.id || id,
+      url: data?.url || '',
+      eventTypes: Array.isArray(data?.event_types)
+        ? data.event_types.map((entry) => entry.name).filter(Boolean)
+        : []
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      skipped: false,
+      mode: paypal.mode,
+      apiBase: paypal.apiBase,
+      reason: error?.message || 'The webhook lookup could not be completed.',
+      code: error?.code || ''
+    };
+  }
 }
 
 module.exports = {
@@ -719,6 +965,8 @@ module.exports = {
   getPayout,
   verifyWebhookSignature,
   environmentOfCertUrl,
+  describeEnvironment,
+  describeWebhook,
   observe,
   PayPalError,
   normalizeBatchStatus

@@ -29,7 +29,56 @@ function textFromEnv(name, fallback) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : fallback;
 }
 
-const paypalMode = textFromEnv('PAYPAL_MODE', 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox';
+/*
+ * PayPal environment — sandbox is enforced, live is an explicit opt-in.
+ *
+ * The three moving parts of a PayPal integration are configured independently
+ * and they must agree: the credentials, the API host, and the webhook id. A
+ * mismatch is silent at runtime and looks exactly like an attack — PayPal
+ * answers `verification_status=FAILURE` for every event signed by the other
+ * environment, so the server rejects real notifications and PayPal retries them
+ * forever.
+ *
+ * Because PAYPAL_MODE also moves the API host and the certificate host, a typo
+ * there half-flips the integration. So live mode is gated behind
+ * PAYPAL_ALLOW_LIVE=true: without it, a request for live stays on sandbox and
+ * `liveDowngraded` records why. `PAYPAL_HOSTS` is the single definition of both
+ * environments; nothing else in the codebase hard-codes a PayPal host.
+ */
+const paypalModeRequested =
+  textFromEnv('PAYPAL_MODE', 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox';
+const paypalLiveAllowed = textFromEnv('PAYPAL_ALLOW_LIVE', 'false').toLowerCase() === 'true';
+const paypalMode = paypalModeRequested === 'live' && !paypalLiveAllowed ? 'sandbox' : paypalModeRequested;
+
+const PAYPAL_HOSTS = Object.freeze({
+  sandbox: Object.freeze({
+    apiBase: 'https://api-m.sandbox.paypal.com',
+    // Hosts PayPal signs notification certificates with, for this environment.
+    // Used to refuse a notification from the other environment before spending
+    // a verification round trip on it — see environmentOfCertUrl in paypal.js.
+    certHosts: Object.freeze(['api.sandbox.paypal.com', 'api-m.sandbox.paypal.com']),
+    dashboardUrl: 'https://www.sandbox.paypal.com/'
+  }),
+  live: Object.freeze({
+    apiBase: 'https://api-m.paypal.com',
+    certHosts: Object.freeze(['api.paypal.com', 'api-m.paypal.com']),
+    dashboardUrl: 'https://www.paypal.com/'
+  })
+});
+
+const paypalEnv = PAYPAL_HOSTS[paypalMode];
+
+/*
+ * The URL PayPal should be calling. Render injects RENDER_EXTERNAL_URL, and a
+ * deployment can pin PUBLIC_BASE_URL; without that evidence the check is
+ * skipped rather than guessed. Compared against the registered callback URL at
+ * boot: a webhook still pointing at a previous hostname is the other silent
+ * failure — the event is never delivered at all.
+ */
+const publicBaseUrl = (
+  textFromEnv('PUBLIC_BASE_URL', '') || textFromEnv('RENDER_EXTERNAL_URL', '')
+).replace(/\/+$/, '');
+
 const paypalBusinessEmail = textFromEnv(
   'PAYPAL_BUSINESS_EMAIL',
   'sb-jokak53538300@business.example.com'
@@ -136,14 +185,16 @@ module.exports = Object.freeze({
   /* ------------------------------------------------------------------ */
   paypal: Object.freeze({
     mode: paypalMode,
+    // What PAYPAL_MODE asked for, before the sandbox gate. Differs from `mode`
+    // only when live was requested without PAYPAL_ALLOW_LIVE=true.
+    modeRequested: paypalModeRequested,
+    liveAllowed: paypalLiveAllowed,
+    liveDowngraded: paypalModeRequested === 'live' && paypalMode === 'sandbox',
+    apiBase: paypalEnv.apiBase,
+    certHosts: paypalEnv.certHosts,
+    dashboardUrl: paypalEnv.dashboardUrl,
     clientId: textFromEnv('PAYPAL_CLIENT_ID', ''),
     clientSecret: textFromEnv('PAYPAL_CLIENT_SECRET', ''),
-    apiBase:
-      paypalMode === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com',
-    dashboardUrl:
-      paypalMode === 'live'
-        ? 'https://www.paypal.com/'
-        : 'https://www.sandbox.paypal.com/',
     businessEmail: paypalBusinessEmail,
     // Where the reader share is sent. Defaults to the demo business account so
     // the sandbox flow works out of the box; set PAYPAL_RECEIVER_EMAIL to a
@@ -158,6 +209,18 @@ module.exports = Object.freeze({
     // Guard rail so a demo can never move a large amount of sandbox money.
     maxPayout: Math.max(0.01, numberFromEnv('PAYPAL_MAX_PAYOUT', 5)),
     timeoutMs: Math.round(clamp(numberFromEnv('PAYPAL_TIMEOUT_MS', 15000), 3000, 60000)),
+    /*
+     * OAuth failure backoff.
+     *
+     * A rejected credential set (wrong environment, revoked app) fails
+     * identically on every attempt. PayPal retries a refused webhook, so
+     * without a backoff each retry buys another failed token call — a loop that
+     * hammers the very endpoint that is already unhappy. Within this window the
+     * cached failure is returned instead of calling PayPal again.
+     */
+    authFailureBackoffMs: Math.round(
+      clamp(numberFromEnv('PAYPAL_AUTH_BACKOFF_MS', 30000), 5000, 600000)
+    ),
     // L402-driven settlement: when attention proof settles an invoice and the
     // reader balance crosses the threshold, the protocol agent creates the
     // Payouts batch without a human pressing a button. It still requires a live
@@ -188,7 +251,18 @@ module.exports = Object.freeze({
       id: textFromEnv('PAYPAL_WEBHOOK_ID', ''),
       strict: textFromEnv('PAYPAL_WEBHOOK_STRICT', 'false').toLowerCase() === 'true',
       // Bounded replay guard: PayPal retries, and an unbounded Set is a leak.
-      replayWindow: Math.round(clamp(numberFromEnv('PAYPAL_WEBHOOK_REPLAY_WINDOW', 500), 50, 5000))
+      replayWindow: Math.round(clamp(numberFromEnv('PAYPAL_WEBHOOK_REPLAY_WINDOW', 500), 50, 5000)),
+      // What this deployment believes PayPal calls. Empty unless the platform
+      // or PUBLIC_BASE_URL told us; used only for the boot-time check.
+      expectedUrl: publicBaseUrl ? `${publicBaseUrl}/api/webhooks/paypal` : '',
+      /*
+       * A refused notification that can never succeed is a configuration error,
+       * not a transient one. Answering 503 with Retry-After keeps the event
+       * available for a fix instead of burning PayPal's retry budget in
+       * seconds; the same value is the minimum interval between two identical
+       * refusal logs, so a retry storm cannot flood the terminal.
+       */
+      retryAfterSec: Math.round(clamp(numberFromEnv('PAYPAL_WEBHOOK_RETRY_AFTER', 300), 10, 3600))
     })
   }),
 

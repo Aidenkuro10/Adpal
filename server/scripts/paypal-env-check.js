@@ -99,6 +99,10 @@ async function listWebhooks(base, bearer) {
     console.log(`  configured mode   ${paypal.mode}`);
     console.log(`  configured apiBase ${paypal.apiBase}`);
     console.log(`  webhook id        ${paypal.webhook.id || '(unset)'}`);
+    if (paypal.liveDowngraded) {
+      console.log('  note              PAYPAL_MODE=live is being ignored: sandbox is enforced.');
+      console.log('                    Set PAYPAL_ALLOW_LIVE=true to leave sandbox.');
+    }
     console.log('');
   }
 
@@ -170,6 +174,22 @@ async function listWebhooks(base, bearer) {
       'registered callback URL',
       hook.url || 'none'
     );
+    /*
+     * A webhook id can be perfectly valid and still deliver nowhere, because
+     * the callback URL is frozen at registration. Comparing it with the host
+     * this deployment is reachable on is the only way to see that before
+     * PayPal's traffic silently goes to a dead hostname.
+     */
+    const expected = paypal.webhook.expectedUrl;
+    if (expected) {
+      note(
+        hook.url === expected,
+        'callback URL matches this deployment',
+        hook.url === expected ? expected : `registered ${hook.url || 'none'} vs this deployment ${expected}`
+      );
+    } else {
+      note(null, 'callback URL matches this deployment', 'skipped: set PUBLIC_BASE_URL to compare');
+    }
     note(
       hook.events.includes('*') ||
         hook.events.some((name) => name.startsWith('PAYMENT.PAYOUTS')),

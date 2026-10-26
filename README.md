@@ -1,1671 +1,540 @@
 # AdPal
 
-A runnable prototype of advertising that pays for **attention** instead of personal data.
+**An open protocol where autonomous AI agents negotiate, verify, and settle the
+price of human attention — 70% to the reader, 30% to the publisher, 0% to a platform.**
 
-The reader experience is fully passive: no “click to earn” button, no countdown, no overlay. A publisher declares an ad slot, an agent measures attention in the background, the server validates it, and only then does a clean creative appear. The reader's share is credited automatically.
+AdPal is not an ad network with a chatbot bolted on. It is a multi-agent
+financial system: bidding agents representing brands reason about a page and
+commit budget, a verification agent reads behavioural telemetry and writes the
+justification for a payment, and a protocol agent moves money through PayPal or
+Solana under an L402 payment contract.
 
-The agent has two homes, and neither is required by the other:
-
-- **`demo-publisher/adpal-agent.js`** — the page-side agent. It runs from the publication itself, so **`/demo/` works standalone** on any host, including a hosted deployment, with no extension, no permissions and no install step. Same-origin `fetch()` to `/api/presence`, `/api/offer` and `/api/client-event`.
-- **`extension/`** — the Manifest V3 extension, for pages the publisher does not control. It measures the same way and relays through its service worker.
-
-The repository contains three independent parts:
-
-1. **`extension/`** — a Chrome Manifest V3 extension that measures attention passively and renders the approved creative inside the declared ad slot, on third-party pages.
-2. **`server/`** — a Node.js/Express simulator: a “human vs script” heuristic, a rotating ad-server agent pool (five advertiser profiles), the **70% user / 30% publisher** split, balances, real PayPal Sandbox payouts through the official **PayPal AI Toolkit**, and a telemetry feed.
-3. **`demo-publisher/`** — the presentation layer, split into two dedicated views: **`/demo/`** is a clean fictional newspaper (editorial only, no telemetry UI), and **`/terminal/`** is a dark agent terminal that streams the negotiation as raw JSON over SSE.
-
-> The ledger and the advertiser campaigns are in-memory and reset on restart, but the **settlement is real**: each batch is created with the PayPal REST Payouts API against your Sandbox credentials. Tokens and secrets are redacted before anything reaches the log or the page.
+Every step is observable. Every decision is explainable. No intermediary takes a cut.
 
 ---
 
-## Architecture
+## 1. Vision & Executive Summary
 
-```text
-┌──────────────────────────── Reader page (http/https) ─────────────────────┐
-│  #adpal-slot — reserved frame, empty until attention is validated         │
-│                                                                           │
-│  adpal-agent.js on /demo/ · content.js on other pages (invisible, no UI)   │
-│    ├── passive tracker: duration · mouse · scroll · visibility · focus     │
-│    ├── 6 s measurement window, started only after natural engagement       │
-│    ├── Shadow DOM creative, rendered only on `approved: true`             │
-│    └── aggregated session samples relayed to the server every 8 s          │
-└───────────────────────────────┬───────────────────────────────────────────┘
-                                │ same-origin fetch (/demo/) · sendMessage (extension)
-┌───────────────────────────────▼───────────────────────────────────────────┐
-│  background.js — MV3 service worker                                       │
-│  chrome.storage.local cache · anonymous client ID · HTTP calls            │
-└───────────────────────────────┬───────────────────────────────────────────┘
-                                │ HTTP localhost:3000
-┌───────────────────────────────▼───────────────────────────────────────────┐
-│  server.js — Express                                                      │
-│    POST /api/offer         → cognition + heuristic + rotation + L402 + ledger          │
-│    POST /api/client-event  → silent session event sink                    │
-│    GET  /api/balance       → user / publisher / advertiser balances       │
-│    GET  /api/telemetry     → incremental negotiation feed (poll)          │
-│    GET  /api/logs          → same events, live over Server-Sent Events    │
-│    GET  /api/toolkit       → PayPal Agent Toolkit capability profile      │
-│    GET  /api/agents        → advertiser roster + campaign budgets         │
-│    POST /api/payout        → PayPal batch or one Solana 70/30 transfer      │
-│    POST /api/flush-payout  → alias kept for the extension popup           │
-│    GET  /api/solana        → devnet rail profile + live balances          │
-│    POST /api/solana/fund   → devnet faucet for the treasury               │
-│    POST /api/l402/solana/confirm → verify an on-chain L402 proof          │
-│    GET  /demo/             → publication page (editorial only)            │
-│    GET  /terminal/         → agent terminal (JSON protocol log only)      │
-└───────────────────────────────┬───────────────────────────────────────────┘
-                                │ SSE /api/logs
-┌───────────────────────────────▼───────────────────────────────────────────┐
-│  demo-publisher/terminal/ — dedicated operator console                    │
-│  agent reasoning · token cost · L402 macaroons · PayPal + Solana payloads  │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### The problem with advertising
 
-Two agent layers sit beside the Express routes, both driven by the official
-`AI-Toolkit-main/` checkout:
+Programmatic advertising routes roughly half of every dollar through
+intermediaries, and it pays for *impressions served* rather than *attention
+earned*. The reader — whose time is the actual inventory — is compensated with
+nothing and pays for the transaction with personal data. The publisher is paid
+late, in aggregate, on numbers they cannot audit.
 
-```text
-AI-Toolkit-main/ (PayPal AI Toolkit v1.2.0)
-        │  .mcp.json → paypal-sandbox (SSE) · skills/paypal-best-practices
-        ▼
-server/src/paypal-agent-toolkit.js
-    ├── advertiser agent  → advertiser_authorize_spend   (campaign budgets)
-    └── protocol agent    → protocol_split_invoice + paypal_create_payout
+### What AdPal changes
 
-server/src/solana.js  (second settlement rail)
-    ├── anchor   → memo of sha256(preimage), signed by the treasury
-    ├── verify   → re-read a signature: confirmation, memo, recipient, units
-    └── payout   → one transaction, two legs (70/30), one memo
-```
+Attention becomes a priced, verifiable, machine-negotiated asset that settles
+directly between the three parties who create the value.
 
-### Project layout
+| Party | Contribution | Share | Settlement |
+| --- | --- | --- | --- |
+| Reader | Verified human attention | **70%** | Personal PayPal account, or a Solana address |
+| Publisher | The page and its editorial context | **30%** | Business PayPal account, or a Solana address |
+| Platform | Routing and verification only | **0%** | No fee is deducted from the split |
 
-```text
-Adpal/
-├── extension/
-│   ├── manifest.json       Manifest V3 (scripting, activeTab, storage)
-│   ├── content.js          Passive tracker + Shadow DOM creative renderer
-│   ├── background.js       Service worker, cache, API calls
-│   ├── popup.html          Extension interface
-│   ├── popup.css
-│   └── popup.js            Balance, connection, rules, activity, payout
-├── server/
-│   ├── package.json        Express, CORS, dotenv
-│   ├── server.js           API, telemetry, and demo page hosting
-│   ├── .env.example        All configuration options
-│   └── src/
-│       ├── config.js       Environment variable parsing and validation
-│       ├── agent-cognition.js  Bid reasoning + attention explanation (agent layer)
-│       ├── heuristic.js    0-100 attention score and guard rails
-│       ├── ledger.js       Accounts, offers, split, and payouts (integer micro-euros)
-│       ├── presence.js     Live reader sessions: the impression/payout gate
-│       ├── webhook-reconciler.js  PayPal event matching, hold-and-replay
-│       ├── creatives.js    Advertiser profiles (creative + campaign budget)
-│       ├── rotation.js     Multi-advertiser rotation, per slot and over time
-│       ├── paypal-agent-toolkit.js  PayPal AI Toolkit bridge (agent tools)
-│       ├── l402.js         L402 challenge + HMAC-chained macaroon verifier
-│       ├── l402-contract.js 402 offer contract + payment-context store
-│       ├── paypal.js       OAuth2 + Payouts client (payload observer)
-│       ├── payout-recipients.js  Recipient planning; refuses self-payment
-│       ├── solana.js       Devnet rail: anchor, verify, 70/30 transaction
-│       └── telemetry.js    Event ring buffer with live subscribers
-├── AI-Toolkit-main/        Official PayPal AI Toolkit checkout (MCP + skills)
-├── client/
-│   └── inspect.js          Standalone L402 inspection CLI (no dependencies)
-├── demo-publisher/
-│   ├── index.html          Publication: editorial only, no debug panels
-│   ├── style.css           Newspaper layout
-│   ├── adpal-agent.js      Page-side agent: presence, attention, offer, creative
-│   ├── reader.js           Reading-progress indicator
-│   └── terminal/
-│       ├── index.html      Agent terminal (dedicated view)
-│       ├── terminal.css    Dark console styling
-│       └── terminal.js     SSE client, JSON renderer, pipeline rail
-├── README.md
-└── .gitignore
-```
+The claim is mechanical, not rhetorical:
 
-### PayPal Agent Toolkit integration
+- The ledger stores **integer micro-euros** and computes
+  `reader = round(gross × 0.70)`, `publisher = gross − reader`, so
+  `reader + publisher === gross` cannot fail.
+- A settlement publishes `accounting.readerConserved` and
+  `accounting.publisherConserved`; both must hold against accrued, paid,
+  reversed and remaining balances.
+- When a leg cannot be paid exactly in cents or lamports, the remainder is
+  **carried and reported** (`reconciliation.carried`), never rebalanced out of
+  the other party's share.
 
-`AI-Toolkit-main/` is PayPal's official AI Toolkit checkout: a plugin manifest,
-a sandbox MCP server declaration (`.mcp.json` → `paypal-sandbox`, SSE) and the
-`paypal-best-practices` skill with its Payouts reference. It ships no runtime
-library, so the server integrates it at the level it defines:
+### Why agents, and not a smarter form of targeting
 
-| Layer | What the server does |
-| --- | --- |
-| Discovery | reads `package.json`, `.cursor-plugin/plugin.json` and `.mcp.json`, validates the Payouts reference, and exposes the result at `GET /api/toolkit` and in the terminal's **Agent toolkit** card |
-| Tools | implements an MCP-shaped catalog (`paypal_get_token`, `paypal_create_payout`, `paypal_get_payout`, `advertiser_authorize_spend`, `protocol_split_invoice`) with JSON input schemas |
-| Advertiser agent | authorizes campaign spend per impression against the chosen profile's budget before the ledger is credited |
-| Protocol agent | splits the settled invoice (70/30) and routes both items into a single Payouts batch |
-| Contract | environment-only credentials, `sender_item_id` + `PayPal-Request-Id` idempotency, exponential backoff on HTTP 429, sandbox host unless `PAYPAL_MODE=live` |
-
-If the folder is absent the simulator still boots: `/api/toolkit` reports
-`present: false` and the tools fall back to the local PayPal client.
+A conventional ad server decides placement from a static rules table. AdPal
+delegates the decision to agents with separate mandates, separate budgets, and
+separate authorities — because the interesting question in the protocol is not
+"which ad fits this page", but "who is allowed to move money, and on what
+evidence". The agent layer answers that question in the open: a bid is scored, a
+session is judged, a batch is authorised, and each of those appears on the
+terminal as a signed-off decision with numbers attached.
 
 ---
 
-## Requirements
+## 2. The AI & Agentic Layer
 
-- **Node.js 18+** and npm
-- **Chrome** (or Edge/Chromium) 102+
-- No account, no API key, no database
+Three agent roles cooperate. They never share a mandate, and none of them holds
+unbounded authority over money.
+
+| Agent | Mandate | Implementation | Authority |
+| --- | --- | --- | --- |
+| Advertiser bidding agents | Is this page worth my budget, and at what price | `server/src/agent-cognition.js` | Can bid or decline; cannot settle |
+| Attention verification agent | Is this a human reading, and why | `server/src/agent-cognition.js` | Explains a verdict; the heuristic decides |
+| Protocol agent | Route a settled invoice to a rail | `server/src/paypal-agent-toolkit.js` | Executes an already-authorised split |
+
+### 2.1 Advertiser bidding agents
+
+Each brand is represented by a named autonomous buyer with its own campaign
+budget, objective, and markets — Northbound Coffee (`agt_northbound_01`,
+reader-acquisition, EUR 18.00), Lumen Audio (`agt_lumen_02`, consideration, EUR
+14.00), Terrace Greens, Halden Optics, Field Notes Press. The roster lives in
+`server/src/creatives.js`, and the terminal prints the agent identity beside the
+creative so a judge can match an ad to the agent that paid for it.
+
+When a page is offered, every eligible agent is scored independently:
+
+```
+relevance = 0.25 + audienceFit × 0.30 + topicFit × 0.35 + novelty
+decide    = affordable && relevance >= AGENT_MIN_RELEVANCE   (default 0.35)
+```
+
+- `audienceFit` maps the page's classified type (editorial, commerce, general)
+  onto the agent's campaign objective.
+- `topicFit` rewards exact vocabulary overlap and, at 0.6 weight, **category
+  adjacency** from a small concept graph — so a page titled "The Courier" reads
+  as publishing inventory to a stationery brand even though no word matches.
+- `novelty` nudges an advertiser that has never appeared on this slot.
+
+The scoring is deterministic and auditable by design. Optionally the same task
+is delegated to a hosted model:
+
+| `AGENT_PROVIDER` | Model (default) | Behaviour |
+| --- | --- | --- |
+| `local` | `adpal-reasoner-v1` | Deterministic feature extraction, weighted scoring, prose synthesis |
+| `openai` | `gpt-4o-mini` | Same task sent to the API, JSON reply parsed |
+| `anthropic` | `claude-3-5-haiku-latest` | As above |
+| `gemini` | `gemini-1.5-flash` | As above |
+
+Even the local reasoner is a real reasoning step: every figure in its rationale
+is derived from the page context and the bid, never pre-written. It is
+nonetheless not a neural network, and its capability profile says so at
+`/api/agents` so nobody mistakes it for one.
+
+Failure semantics are strict, because a demo that lies about its own state is
+worse than a demo that admits a failure. A missing key, timeout, 4xx, or
+malformed JSON degrades to the local reasoner and reports `fallback: true` with
+the provider and the reason. Token counts come from the API `usage` for hosted
+models and are flagged `estimated` when derived. Latency is measured, not claimed.
+
+The most important behaviour is the one a rules engine cannot produce: when every
+agent declines, **the impression is withheld**. No advertiser cleared the floor,
+so nobody is shown an ad. Refusing to sell is the product working.
+
+### 2.2 Attention verification and reasoning agent
+
+The client reduces behaviour to counters — dwell, pointer velocity and direction
+reversals, scroll depth, tab visibility, viewport occupancy — and sends no
+keystrokes, no coordinates, no cross-site identifier, no fingerprint.
+
+`server/src/heuristic.js` scores those counters across eight guard rails:
+automation flag, session length, interaction, tab visibility, ad in viewport,
+movement density, timestamp integrity, scroll pattern. The result is a 0-100
+score compared against `HUMAN_THRESHOLD` (default 50).
+
+The agent then reads the *same* evidence and produces a written assessment: a
+behavioural signature, a confidence value, and a rationale describing reading
+cadence, pointer dynamics and viewport discipline. It runs on refused sessions
+too, so a rejected reader is told why rather than handed a bare score.
+
+The authority boundary is deliberate and is the central design decision of the
+AI layer:
+
+> **The model explains attention. It never approves it.**
+
+`heuristic.js` holds the money decision; the agent's verdict is recorded
+alongside it, and a disagreement between the two is surfaced explicitly rather
+than resolved in the model's favour. A persuasive or hallucinated narrative
+cannot pay anyone.
+
+### 2.3 Protocol agent and the PayPal AI Toolkit (v1.2.0)
+
+`AI-Toolkit-main/` is the official PayPal AI Toolkit checkout. AdPal reads it at
+boot and re-exposes its capabilities as callable agent tools with real JSON
+schemas in `server/src/paypal-agent-toolkit.js`.
+
+The toolkit declares its own MCP server, which AdPal reports verbatim at
+`/api/toolkit`:
+
+```json
+{
+  "mcpServers": {
+    "paypal-sandbox": {
+      "type": "sse",
+      "url": "https://mcp.sandbox.paypal.com/sse",
+      "headers": { "Authorization": "Bearer ${PAYPAL_SANDBOX_ACCESS_TOKEN}" }
+    }
+  }
+}
+```
+
+Only the header *name* is ever echoed; the substituted token is never returned by
+any endpoint. The server also reads the toolkit's
+`skills/paypal-best-practices/references/payouts.md` and reports it as the
+governing reference for the rail it implements, so the integration is traceable
+to the vendor's own guidance instead of to guesswork.
+
+**Agent tool surface** (`/api/toolkit` returns the live inventory):
+
+| Tool | Agent | Contract |
+| --- | --- | --- |
+| `advertiser_authorize_spend` | Advertiser | Authorise an impression against remaining campaign budget. Returns `CAMPAIGN_BUDGET_EXHAUSTED` rather than overdrawing |
+| `protocol_split_invoice` | Protocol | Split a settled invoice into reader and publisher cents, report drift and `withinTolerance` |
+| `paypal_create_payout` | Protocol | Create a Payouts batch, one item per receiver with its own `sender_item_id` for idempotency |
+| `paypal_get_payout` | Protocol | Re-read a batch so a `PENDING` settlement can be refreshed to final status |
+| `paypal_get_token` | Protocol | Cached OAuth2 client-credentials token for the configured environment |
+
+Tools are dispatched through a single `callTool(name, args)` entry point, with
+bounded retry on HTTP 429. Each agent-level invocation — spend authorisation,
+split routing, payout creation — emits an `agent.advertiser`, `agent.protocol`
+or `agent.reasoning` event carrying the tool name, its inputs and its result, so
+the agentic layer is inspectable while it runs, not just afterwards.
+
+### 2.4 The agent pipeline
+
+```
+ 1. A page is offered with its title, host and slot
+        |
+        v
+ +----------------------+     +------------------------+     +----------------------+
+ | ADVERTISER AGENTS    |     | ATTENTION AGENT        |     | PROTOCOL AGENT       |
+ | agent-cognition.js   |     | agent-cognition.js     |     | paypal-agent-toolkit |
+ |                      |     |                        |     |                      |
+ | score 5 advertisers  |     | 8 guard rails          |     | authorize_spend      |
+ | relevance + budget   |     | 0-100 score            |     | split_invoice        |
+ | bid or decline       |     | narrative + confidence |     | create_payout        |
+ +----------------------+     +------------------------+     +----------------------+
+        |                             |                             |
+        | winner funds the price      | verdict + rationale         | executes the split
+        v                             v                             v
+   creative shown               L402 bearer issued          PayPal batch | Solana tx
+        |                             |                             |
+        +=========== SSE: agent.bid | agent.reasoning | agent.attention ==========+
+                    agent.advertiser | agent.protocol
+```
+
+Terminal event stages, in the order a settlement produces them:
+`agent.bid`, `agent.reasoning`, `agent.attention`, `agent.advertiser`,
+`agent.protocol`.
 
 ---
 
-## Quick start
+## 3. Complete Technology Stack
 
-### 1. Start the server
+| Layer | Technology | Role in AdPal |
+| --- | --- | --- |
+| Payments (fiat) | PayPal REST Payouts API | One batch, two items, `PayPal-Request-Id` for idempotent retry |
+| Payments (agent) | PayPal AI Toolkit v1.2.0, MCP over SSE | Tool contracts, agent spend authorisation, payouts reference |
+| Payments (on-chain) | Solana Devnet, `@solana/web3.js`, `@solana/spl-token` | Atomic two-leg transfer plus memo proof, best-effort anchoring |
+| Protocol | L402 (HTTP 402 + Macaroons) | Paid-resource negotiation, chained-HMAC caveats, single-use contexts |
+| Cryptography | HMAC-SHA256, `crypto.timingSafeEqual` | Caveat chaining and constant-time macaroon verification |
+| Reasoning | OpenAI, Anthropic, Gemini, or local reasoner | Bid scoring and attention narrative, with mandatory fallback |
+| Backend | Node.js 18+, Express | HTTP surface, payout orchestration, webhook ingestion |
+| Telemetry | Server-Sent Events | `/api/logs` live stream; `/api/telemetry?since=` pollable feed |
+| Web client | Vanilla JS publication agent | Reads a page without any install, no PII |
+| Extension | Chrome Manifest V3 | Optional same-protocol client with browser UI |
+| Deployment | Render (`RENDER_EXTERNAL_URL`, `$PORT`) | Public base URL and port are read from the platform |
+| API tooling | OpenAPI 3.0, Postman collection, APIMatic validator | `scripts/apimatic-validate.js` enforces import constraints on the spec |
+
+### Settlement rails in detail
+
+**PayPal REST Payouts.** `POST /v1/payments/payouts` creates one batch containing
+both legs, each with a distinct `sender_item_id`, and a `PayPal-Request-Id`
+derived from our reference so a retry is idempotent on PayPal's side. OAuth
+tokens are cached and refreshed once on a 401; a rejected credential set is
+cached too, so a webhook retry storm cannot hammer the token endpoint.
+
+Webhooks (`PAYMENT.PAYOUTS-ITEM.*`) are verified with
+`POST /v1/notifications/verify-webhook-signature` against the **raw request
+bytes**, then reconciled by `server/src/webhook-reconciler.js`. A delivery that
+arrives before our create-response is held and replayed when the payout commits;
+a terminal failure reverses the payout exactly once, restoring the precise
+per-publisher debits that were taken. `UNCLAIMED` and `ONHOLD` set status without
+reversing, because the item can still settle.
+
+**Solana Devnet.** The same 70/30 split executes as two transfers in a single
+atomic transaction, with a memo committing to the L402 `sha256(preimage)` — the
+32 bytes in the macaroon and the 32 bytes on-chain are identical. Settlement is
+all-or-nothing. Anchoring is best-effort: an unfunded devnet treasury degrades
+the receipt to `anchored: false` rather than failing a settlement that verified
+attention already justified.
+
+---
+
+## 4. System Architecture & the 70/30 Flow
+
+```
+              Advertiser agent budget (campaign escrow)
+                            |
+                            |  bid, capped by MAX_OFFER_PRICE
+                            v
+   +--------------------------------------------------------+
+   |                    AdPal Protocol                      |
+   |                                                        |
+   |   L402 challenge              AI attention engine      |
+   |   402 Payment Required        8 guard rails + agent    |
+   |   payment_context_token       0-100 score + narrative  |
+   |          |                          |                  |
+   |          +--- verified human -------+                  |
+   |              attention proof                           |
+   |                                                        |
+   |   ledger: integer micro-euros, 1:1 invariants          |
+   +--------------------------------------------------------+
+                |                            |
+          70%   v                      30%   v
+    Reader (personal)              Publisher (business)
+    attention reward               content reward
+                \                            /
+                 +---- one atomic settlement --+
+                      (PayPal batch | Solana tx)
+```
+
+No step in that path holds a commission. The rail moves the two legs the ledger
+already recorded.
+
+### Three distinct PayPal Sandbox accounts
+
+A Payouts batch cannot pay the account whose credentials created it: PayPal
+answers `SELF_PAY_NOT_ALLOWED` and **rejects the entire batch** — so one bad
+publisher address can cancel the reader's payment too. AdPal therefore models
+three roles explicitly and refuses the conflict before reserving any money.
+
+| Role | Config | Rule |
+| --- | --- | --- |
+| Advertiser / payer | `PAYPAL_BUSINESS_EMAIL`, `PAYPAL_CLIENT_ID` | Owns the REST credentials. Never a payout receiver |
+| Reader / personal | `PAYPAL_RECEIVER_EMAIL` | Must be a *different* account, or the payout is refused with `409` before any reservation |
+| Publisher / business | `PAYPAL_PUBLISHER_EMAIL` | A third, distinct account. Empty, equal to the reader, or equal to the payer means the 30% stays accrued on the ledger |
+
+`server/src/payout-recipients.js` is the single decision point used by every call
+path. It treats `PAYPAL_SENDER_ALIASES` as the payer, because PayPal matches by
+account rather than by string; and if PayPal still refuses an alias the process
+was never told about, the reservation is re-planned without the publisher leg and
+retried once — reader paid, nothing reversed.
+
+### Money invariants
+
+- A reservation is created only after every recipient check passes, and is
+  committed only when the rail accepts the transfer. A reservation that is never
+  accepted is cancelled, so a mid-request network failure leaves balances intact.
+- `preparePayout` and `commitPayout` are the only two places money can move.
+- A payout failed by webhook is reversed exactly once, from the recorded
+  per-publisher debits rather than an aggregate.
+- `UNCLAIMED` and `ONHOLD` never reverse: reversing early would pay the same
+  share twice.
+
+---
+
+## 5. Quick Start & Local Setup
+
+Requires Node.js 18+.
 
 ```bash
 cd server
 npm install
+cp .env.example .env      # Windows: copy .env.example .env
 npm start
 ```
 
-The server listens on port **3000** (or the next free port if 3000 is taken) and prints:
+Open **http://localhost:3000/demo/** and read for a few seconds. Then open
+**http://localhost:3000/terminal/** beside it: the bid reasoning, the attention
+narrative, the 70/30 split and the payout batch appear as they happen.
 
-```text
-API        http://localhost:3000/api/balance
-Demo       http://localhost:3000/demo/
-Split      70% user · 30% publisher
-Threshold  €0.050 · offer cap €0.050
-```
-
-Quick check:
-
-```bash
-curl http://localhost:3000/api/health
-```
-
-### Development assets and caching
-
-The pages are edited live while a browser is open, so the server never lets a
-browser keep a stylesheet from a previous run. `server/src/view-assets.js`
-serves both views with three rules:
-
-| Rule | Effect |
+| Surface | Purpose |
 | --- | --- |
-| `Cache-Control: no-store` (+ `Pragma`, `Expires`) and no `ETag`/`Last-Modified` in development | A normal refresh always re-reads `style.css` / `reader.js` from disk. There is no 304 that could be paired with a stale copy. |
-| Content-addressed asset URLs | `<link href="style.css">` is served as `style.css?v=<sha1>`, recomputed whenever the file changes. A changed stylesheet is a *new URL*, so even a disk cache, bfcache or proxy cannot serve the old one. |
-| CSS stays synchronous | The rewrite only edits the `href` of the existing `<link>` in `<head>`. Nothing is injected by JavaScript, preloaded asynchronously or deferred, so there is no flash of unstyled content. |
+| `/demo/` | The publication. Editorial, no debug chrome, no telemetry panel |
+| `/terminal/` | The agent console. Live reasoning, scores, ledger, batches, webhooks |
+| `/api/agents` | Advertiser roster, budgets, cognition profile, rail readiness |
+| `/api/toolkit` | Detected toolkit version, MCP endpoint, callable tool names |
+| `/api/balance` | Ledger snapshot with the accounting invariants |
+| `/api/logs` | SSE stream of every event the terminal renders |
 
-Both views declare their stylesheet in `<head>` and their script at the end of
-`<body>`, and `serveView` keeps the trailing-slash redirect (`/demo` → `/demo/`)
-so relative asset URLs always resolve inside the view.
-
-Production caching is opt-in:
-
-```powershell
-$env:NODE_ENV = 'production'; node server.js
-```
-
-With `NODE_ENV=production`, pages are sent `public, max-age=0, must-revalidate`
-with validators enabled, and a `?v=` URL is served `immutable` for a year.
-
-### 2. (Optional) Load the extension
-
-**`/demo/` does not need this step.** The publication ships its own page agent, so presence, measurement and creative rendering all happen in the page with the server running. Install the extension only if you want AdPal to work on pages the publisher does not control.
-
-1. Open `chrome://extensions`.
-2. Turn on **Developer mode** (top right).
-3. Click **Load unpacked**.
-4. Select the **`extension/`** folder (not the project root).
-5. Pin the **AdPal** icon to the toolbar.
-
-After changing extension code, click **Reload** on the AdPal card in `chrome://extensions`, then reload the demo tab.
-
-> On `/demo/` the two agents defer to each other: the page agent claims the document during parsing, and the content script sees that claim at `document_idle` and stands down (the reverse guard also exists). One reading session is never negotiated twice, so an impression can never be paid twice.
-
-> The service worker and popup need the server. If it is stopped, the popup shows **Offline** and the terminal stays disconnected.
-
-### 3. Open the demo
-
-Go to **[http://localhost:3000/demo/](http://localhost:3000/demo/)** and read normally:
-
-1. The page is a clean, bento-grid publication with **no telemetry panel**: a cover card, a quick take, a stat module, a reading column, a sticky sidebar rail and a mid-article row of category highlights. Four publisher placements (`#adpal-slot` and `[data-adpal-slot]`) each sit in a **frame the page reserves from the first paint**: one compact partner line at the foot of the stat card, one in the Business card of the mid-article row, one sponsored card in the sticky sidebar, and one partner strip at the close. Empty frames carry nothing but a quiet “Partner” hairline — no CTA, no placeholder button.
-
-   > **Act 1** — `/terminal/` starts clean: *“Waiting for reader attention…”*.
-
-2. Move the mouse and scroll for a few seconds, as any reader would.
-3. The page agent measures a **6-second window in the background** for whichever placement is on screen. The phase moves from *Measuring* to *Validating*.
-4. The server runs the bot checks, scores the session, mints an **L402 macaroon**, and records the 70/30 split.
-
-   > **Act 2/3** — `/terminal/` streams the `402 Payment Required` challenge, the attention proof, the macaroon caveats and the revenue split as raw JSON.
-
-5. If approved, the sponsored banner appears **inside the article**, automatically, with no interaction. The reader is credited **€0.035** (70% of €0.05).
-6. Keep reading: each placement negotiates once, so a full read of the four placements credits **€0.14** and rotates the creative between sponsors.
-7. Open **[http://localhost:3000/terminal/](http://localhost:3000/terminal/)** in a second window. The PayPal card shows **Settle €0.03 to PayPal**: the reader accrued €0.035, but PayPal settles in whole cents, so €0.03 moves now and the €0.005 carry is shown explicitly. The next impression makes the second batch cent-exact (€0.04 + €0.02), and the cumulative total is exactly 70/30.
-
-   > **Act 4** — the batch id and status appear in the terminal, and the money lands in the Sandbox account.
-8. Open the AdPal popup: live balance, last verification, activity, and rules.
-
-> Use **New run** in the terminal toolbar to clear the stream and reset the ledger between rehearsals. It does not reverse batches already sent to PayPal.
-
-> To see a rejection, keep the tab hidden or stay completely still: the server withholds the offer, the slot stays empty, and the terminal shows the failing guard rail. The article itself stays silent — no error card is shown to the reader.
-
-### 4. Inspect the protocol without a browser
-
-The whole L402 negotiation can be driven from the terminal, exactly as CrawlerPal's Python client does:
+Without PayPal credentials the simulator still runs, and says so: the balance
+panel reports `configured: false` and payouts stop with an explicit reason
+instead of pretending to have moved money. Add `PAYPAL_CLIENT_ID` and
+`PAYPAL_CLIENT_SECRET` from the PayPal developer dashboard to execute real
+Sandbox batches.
 
 ```bash
-node client/inspect.js                 # contract → attention proof → macaroon → resource → ledger
-node client/inspect.js --bot           # prove the refusal path (no credit, context kept for retry)
-node client/inspect.js --settle-twice  # prove settlement idempotency
-node client/inspect.js --json          # machine-readable transcript, no ANSI noise
+# environment consistency: credentials, API host and webhook id
+npm run check:paypal-env
+
+# offline invariants (no network)
+npm run check:accounting      # 1:1 ledger and carry handling
+npm run check:webhooks        # hold-and-replay reconciliation
+npm run check:self-pay        # recipient planning, self-payment refusal
+
+# against a running server
+npm run check                 # health, rails, telemetry
+npm run check:webhooks:signature
+npm run check:webhooks:e2e
+npm run check:stream          # SSE latency
 ```
 
-No dependencies, no build step: it is plain Node 18+ `fetch`. Watch `/terminal/` while it runs to see `l402.contract`, `l402.settle`, `l402.issue`, `l402.verify` and `l402.access` arrive live.
+`adpal.openapi.json` and `adpal.postman_collection.json` describe the HTTP
+surface; `node scripts/apimatic-validate.js` checks that the spec still satisfies
+APIMatic import constraints. `client/inspect.js` is a dependency-free L402 CLI
+for negotiating a paid resource from a shell.
 
 ---
 
-## Two separate views
+## 6. Key Environment Variables
 
-Presentation is deliberately split so a judge never confuses the demo chrome with the product:
-
-**`/demo/` — Publication.** A distraction-free bento-grid front page and reading column for *The Attention Revolution*: a cover card, a quick take, a stat module, a reading column with a sticky sidebar rail, and a mid-article row of category highlights. The only advertising elements are the publisher-declared placements (`#adpal-slot` plus `[data-adpal-slot]`), and each one occupies a **frame the page reserves in CSS before any creative exists**: no “activate” button, no countdown, no “+€0.014” toast, and, crucially, no layout shift. When the L402 challenge settles, the unit fades into a box that was already there — the paragraphs around it never move, so the reader never loses their place. One unit renders as a **sponsored card in the sticky sidebar** (pinned while the essay scrolls), two as a **compact partner line** at the foot of an editorial card, and one as a **partner strip** at the close, so the unit inherits the bento aesthetic instead of interrupting it. There is no inspector, no debug card, no protocol badge and no overlay anywhere on the page.
-
-**`/terminal/` — Agent terminal.** A dedicated dark console, not linked from the article, that shows the protocol as it happens:
-
-| Panel | Contents |
-| --- | --- |
-| Stream | every event as the raw JSON envelope: `seq`, `at`, `stage`, `source`, `level`, `title`, `detail`, `data` |
-| Viewport attention | smoothed 0-100 score, slot visibility, active reading share, article depth, session |
-| Negotiation | offer id, advertiser agent id, bid, creative, human score |
-| L402 macaroon | offer, payment context token, token id, caveat count, payment hash, expiry, signature status |
-| PayPal Sandbox | reader balance, batch id, status, amount, recipient, OAuth2 token state |
-
-Filters separate **L402**, **Attention**, **PayPal** and general **Negotiation** events. ***Follow tail* keeps the newest event in view** — every incoming event pins the stream to the bottom, even if the reader had scrolled up, and unchecking the switch is the only way to stay put. *Pause* freezes the view without dropping events, and *Export .jsonl* downloads the buffer.
-
-**Money is colour-coded.** Standard protocol lines stay neutral, while every ledger split, payout request, OAuth/token event, batch confirmation and acknowledged settlement is painted in the payout accent: a 3 px bright-green left border, a tinted row background, a `€` badge between the stage chip and the title, and green title/detail text. A judge can scan the stream and spot the transaction without opening a single JSON body. Failures still win: a `warn` or `error` money line keeps its amber/red border and title.
-
-An **Agent toolkit** card reports what was read from `AI-Toolkit-main/`: version, MCP endpoint, the tools wired into the server, and whether automatic settlement is on.
-
-Three data paths feed the terminal:
-
-- the server emits every negotiation stage into `Telemetry`, which fans out to SSE subscribers (`GET /api/logs`);
-- `paypal.js` publishes redacted request/response bodies for `/v1/oauth2/token`, `/v1/payments/payouts` and the status re-read;
-- the content script relays **aggregated** session samples through the service worker to `POST /api/client-event` (one sample every 8 seconds, never raw input).
-
-The terminal is a demonstration surface only. The extension never injects it, and it is not part of the reader experience.
----
-
-## The four-act live demo
-
-The three surfaces are designed to be shown together, in this order:
-
-| Act | Surface | What the audience sees |
-| --- | --- | --- |
-| **1 · Attention** | `/demo/` | An editorial article with no ad chrome. Reading it is the only input. |
-| **2 · 402** | `/terminal/` | `HTTP 402 Payment Required`, the €0.020 offer, the payment hash, the caveats. |
-| **3 · Proof** | `/terminal/` | `Attention score 100/100`, macaroon minted and verified, `70% reader / 30% publisher` credited. |
-| **4 · Settlement** | `/terminal/` | A real Payouts batch against the Sandbox — created automatically the moment the settled invoice crosses the threshold. |
-
-The terminal carries a **Demo runbook** card that tracks these four steps. It is driven only by real events — if the attention proof is refused, act 1 stays open — and its note always says what to do next.
-
-**New run** in the terminal toolbar clears the stream, resets the ledger (and the L402 context store) and reopens act 1 without restarting the server. Batches already sent to PayPal are not reversed.
-
-The stream is opened as `/api/logs?live=1`, which starts at the current sequence instead of replaying the tail. That is why a refreshed terminal shows *“Waiting for reader attention…”* rather than the previous run; a reconnecting `EventSource` still resumes from `Last-Event-ID`.
-
-Each article placement is worth **€0.05** to the advertiser, which splits exactly into **€0.035 to the reader** and **€0.015 to the publisher**. One verified impression already crosses the (deliberately tiny) `PAYOUT_THRESHOLD`. Reload `/demo/` to start a new page view.
-
-### Multi-advertiser rotation
-
-Five advertiser profiles are available, each with its own creative and campaign
-budget (`server/src/rotation.js` rotates over `server/src/creatives.js`):
-
-| Sponsor | Agent | Objective |
-| --- | --- | --- |
-| Northbound Coffee | `agt_northbound_01` | reader-acquisition |
-| Lumen Audio | `agt_lumen_02` | consideration |
-| Terrace Greens | `agt_terrace_03` | trial-signup |
-| Halden Optics | `agt_halden_04` | direct-sale |
-| Field Notes Press | `agt_fieldnotes_05` | brand-awareness |
-
-A placement is not bound to one banner:
-
-- the server rotates **per slot** and **over time**, preferring the least-shown
-  profile and never repeating the creative that slot just showed;
-- a profile whose campaign budget cannot cover the impression is skipped, and
-  the **advertiser agent** authorizes every spend before the ledger is credited;
-- the extension re-negotiates a placement after `rotateAfterMs` (20 s) of
-  continued engagement, up to `maxPerSlot` impressions, and cross-fades the new
-  creative in (`opacity` dip, swap, fade up) so the reserved frame never moves;
-- the terminal shows a `rotation` event per switch, with the chosen advertiser,
-  the reason and the remaining campaign budget.
-
----
-
-## How the passive flow works
-
-### The slot
-
-- AdPal only activates where the publisher exposes a placement: **`#adpal-slot`** or any element carrying **`[data-adpal-slot]`**. `demo-publisher/index.html` declares four of them across the article.
-- Without a declared placement, the extension stays completely invisible and does nothing. It never creates a floating ad on arbitrary pages.
-- One negotiation runs at a time across the whole page, so two placements can never be credited for the same stretch of attention. A placement rotates: up to three impressions per page view, each delivered only after a fresh measurement window and never from the advertiser it just showed.
-- The placement is untouched until an impression is approved. Then the extension clears publisher fallback content, attaches a **Shadow DOM**, and renders the banner in-flow. Site styles cannot break it.
-
-### The measurement window
-
-`content.js` listens passively and never asks the reader to act:
-
-| Signal | Detail |
-| --- | --- |
-| Duration | 6-second measurement window after natural engagement |
-| Page dwell | time since the page became readable |
-| Mouse | number of moves and direction changes |
-| Scrolling | number of events and maximum depth |
-| Visibility | share of the window where the tab is visible |
-| Focus | share of the window where the window is active |
-| Interactions | clicks and key presses (counters only) |
-
-A window starts only when the tab is visible, the page has been open for at least 2.5 s, and there are fresh interaction signals. After a rejection, it waits for new signals before trying again. No coordinates, typed text, individual key presses, or page content are transmitted.
-
-### The decision
-
-The service worker posts the report to `POST /api/offer`. The server:
-
-1. validates the requested price (`MAX_OFFER_PRICE` cap) and the per-client rate limit;
-2. applies **blocking guard rails** and reports each one as a `checks` entry;
-3. computes a **0-100 score** with an explicit factor breakdown;
-4. withholds the offer if any guard rail fires or the score is below `HUMAN_THRESHOLD`;
-5. otherwise debits the advertiser budget, assigns a creative, and credits **70% to the reader** and **30% to the publisher**.
-
-The agent renders the creative only when the response contains `approved: true`. On rejection the slot simply stays empty.
-
-### The payout
-
-Payouts go through the **real PayPal REST Payouts API** in the sandbox, and they
-are triggered by the settlement itself:
-
-- a credited attention proof — either an extension `POST /api/offer` or an L402
-  `POST /api/l402/settle` — calls the auto-settlement queue; once the reader
-  balance crosses `PAYOUT_THRESHOLD` the protocol agent creates the batch on its
-  own (`PAYPAL_AUTO_PAYOUT=true`);
-- the queue executes in the **same tick** as the settlement. There is no
-  cosmetic delay (`PAYPAL_AUTO_PAYOUT_DELAY_MS=0`), so the terminal shows the
-  split and the payout trigger together; only the batch response itself waits
-  on PayPal's REST round-trip;
-- **an impression needs a live reader.** `POST /api/offer` refuses a client with
-  no visible `/demo/` session (`409 NO_ACTIVE_SESSION`), and an auto payout is
-  abandoned if that session disappears before it executes. See *Reader presence*
-  below;
-- `POST /api/payout` still exists for a manual settlement (terminal button,
-  extension popup, curl) and runs the *same* code path;
-- it fetches an OAuth2 token from `https://api-m.sandbox.paypal.com/v1/oauth2/token`, then creates a batch with `POST /v1/payments/payouts`, paying the reader share to `PAYPAL_RECEIVER_EMAIL`;
-- the publisher's 30% travels in the same batch as a second item, paid to
-  `PAYPAL_PUBLISHER_EMAIL` **only when that is a third, distinct account**. If
-  it is unset, equal to the reader, or equal to the sending account, the share
-  stays accrued on the ledger and the reservation does not debit it — the batch
-  then contains the reader item alone;
-- the response contains the real `payout_batch_id` and `batch_status`, which the terminal shows verbatim.
-
-#### Self-payment is refused before the request
-
-PayPal will not let a batch pay the account it was sent from. The rejection is
-`SELF_PAY_NOT_ALLOWED`, it applies to the **whole batch**, and it used to be
-reachable by default: `PAYPAL_PUBLISHER_EMAIL` fell back to the business
-account, which is the payer, so every 70/30 batch carried a 30% item addressed
-to itself. PayPal rejected the batch, the reader's 70% never moved either, and
-the reservation had to be cancelled.
-
-`server/src/payout-recipients.js` decides the recipients before anything is
-reserved, and all three call sites use it (`runPaypalPayout`,
-`routeSettlement`, `paypal.createPayout`):
-
-| receiver | outcome |
-| --- | --- |
-| reader is the sending account | `409 SELF_PAY_NOT_ALLOWED`, nothing reserved, balances untouched |
-| publisher is the sender, the reader, or unset | that item is withheld; 30% stays accrued, no debit |
-| reader and publisher are distinct non-senders | both items travel in one batch |
-
-Three details make it safe rather than merely quiet:
-
-- **The ledger and the batch are planned together.** Withholding the publisher
-  item sets `payPublisher: false`, so the reservation never debits money that no
-  transfer will move. `split.publisherRail` reads `ledger-held` instead of
-  pretending the 30% left.
-- **Sender aliases count.** PayPal matches the payer by account, not by string,
-  so `PAYPAL_SENDER_ALIASES` lists any other confirmed email on the business
-  account. Comparison is case-insensitive.
-- **One exact recovery.** An alias we were never told about is only discoverable
-  from PayPal's response. On `SELF_PAY_NOT_ALLOWED` the reservation is
-  cancelled, re-prepared without the publisher leg, and the batch is sent again
-  — the reader is still paid, the 30% stays accrued, and nothing has to be
-  reversed.
-
-```bash
-npm run check:self-pay    # recipient decisions, no network
-```
-
-All PayPal calls go through the tools defined in
-`server/src/paypal-agent-toolkit.js`: `paypal_get_token`,
-`paypal_create_payout`, `paypal_get_payout`, `advertiser_authorize_spend` and
-`protocol_split_invoice`. They implement what the toolkit's
-`skills/paypal-best-practices/references/payouts.md` requires — environment-only
-credentials, `sender_item_id`/`PayPal-Request-Id` idempotency, exponential
-backoff on HTTP 429 — and the toolkit's MCP endpoint
-(`https://mcp.sandbox.paypal.com/sse`) is reported in `/api/toolkit` and the
-terminal.
-
-#### Exact 1:1 accounting
-
-The ledger stores **integer micro-euros**, not floats. Every impression is split
-as `reader = round(gross × 0.70)` and `publisher = gross − reader`, so the two
-legs always add back to the gross to the micro-euro — there is no second
-independent rounding to drift against the first.
-
-A €0.05 impression therefore accrues exactly **€0.035 / €0.015**. PayPal settles
-in **whole cents**, and €0.035 is not a whole number of cents, so the rail moves
-what it can and the ledger reports the rest:
-
-- first impression: €0.03 reader + €0.01 publisher move, **€0.005 per leg is
-  carried** (shown as *Carried · sub-cent* in the terminal);
-- second impression: the carry is included, so €0.04 + €0.02 move and nothing is
-  left behind;
-- cumulative: **€0.07 / €0.03 on €0.10 — exactly 70/30, zero drift**.
-
-`GET /api/balance → accounting` exposes the audit a judge can check by hand:
-accrued, paid, reversed, held, and four invariants (`splitIsExact`,
-`readerConserved`, `publisherConserved`, `ratioWithinOneCent`). **No fee is ever
-deducted from a split leg**: PayPal Payouts charges the sender, so the recipient
-amounts are gross (`fees.model = "sender-pays"`, `deductedFromSplit = 0`).
-
-Two extra fields answer "did a micro-cent go missing?" without reading code:
-`carryMicros` is the sub-cent remainder still held for the next batch, and
-`unexplainedMicros` is `accrued − (paid − reversed + carried)` per party. The
-latter must be `0`; it is the number that would move if the split or the
-reversal ever lost money. `invariants.readerDriftCents` is measured against what
-was *paid*, so a single impression legitimately shows `0.2¢` — that is the
-carry, not a loss.
-
-Nothing is debited unless PayPal accepts the batch: a network error or API
-rejection leaves both balances untouched.
-
-Below the threshold, the API returns `409 THRESHOLD_NOT_REACHED` with the missing amount. Missing credentials return `503 PAYPAL_NOT_CONFIGURED`, and a rejected batch returns the PayPal issue code (for example `RECEIVER_UNREGISTERED`).
-
-#### Reader presence
-
-`server/src/presence.js` is the one thing that can authorise an impression. The
-content script sends a heartbeat every 4 s **only while the tab is visible**;
-`PRESENCE_TTL_MS` (12 s) tolerates two missed beats. A hidden tab, a closed
-page, a `curl` replay, or an expired session all get `409 NO_ACTIVE_SESSION`
-and no ledger entry is written.
-
-Presence deliberately uses **no server timer**: expiry is computed on read, so
-an idle simulator has nothing running in the background. `/api/dev/reset` bumps
-a run epoch, which also cancels any payout queued by the previous run — a batch
-can no longer land after a reset and look like a ghost transaction.
-
-#### Webhook reconciliation
-
-`POST /api/webhooks/paypal` matches a delivery on **any** identifier PayPal
-sends — `payout_batch_id`, `sender_batch_id`, `sender_item_id`, `payout_item_id`
-or our own reference — rather than the batch id alone. A notification that
-arrives before our create-response is committed is **held and replayed** the
-moment the matching payout is committed, so the terminal reports
-`Early webhook reconciled` instead of *“no matching payout”*. A retried failure
-is idempotent: the reversal runs once.
-
-```bash
-node scripts/webhook-reconcile-check.js   # 18 checks, no network
-node scripts/webhook-e2e.js http://localhost:3101   # real batch, real deliveries
-node scripts/webhook-signature-check.js             # signature/refusal mapping
-```
-
-The end-to-end check needs a second server with `PAYPAL_WEBHOOK_ID` blanked, so
-signature verification is skipped and unsigned deliveries are accepted:
-
-```powershell
-$env:PORT='3101'; $env:PAYPAL_WEBHOOK_ID=' '; node server.js
-```
-
-It creates one real sandbox batch, then delivers an item event carrying **only**
-`sender_batch_id` (the shape that used to fall through to *unmatched*), the same
-event again from the `payout_batch_id` side, a byte-identical redelivery, and a
-foreign batch id. Expected outcomes: `handled`, `handled`/`duplicate`,
-`duplicate`, `deferred` — with balances untouched in the last case.
-
-
-### The Solana Devnet rail
-
-The same settlement can be paid on-chain instead. `PAYOUT_RAIL` picks the rail
-the automatic queue uses, and `POST /api/payout { "rail": "solana-devnet" }`
-forces it per request; the PayPal path is untouched.
-
-Three things happen on-chain (`server/src/solana.js`):
-
-1. **The proof is anchored.** On settle, the invoice's `sha256(preimage)` — the
-   same 32 bytes the 402 challenge minted and the macaroon commits to — is
-   written into a Memo instruction signed by the treasury. The receipt carries
-   the transaction signature, so the hash is now publicly checkable:
-
-   ```
-   ADPAL/v1|kind=l402-proof|hash=<64 hex>|ref=l402_cae7b7f8|score=98|offer=attention_session_v1
-   ```
-
-2. **The proof is verified.** `POST /api/l402/solana/confirm` re-reads a
-   signature from the cluster and checks, individually: the transaction exists,
-   is `confirmed`/`finalized`, has no `meta.err`, its memo commits to *this*
-   invoice's hash, the expected recipient received it, the amount is exactly the
-   expected number of base units, and the signature has not settled anything
-   else. Settlement accepts the same proof through `solana_signature`, and an
-   invalid chain proof answers `402 SOLANA_PROOF_INVALID` without burning the
-   context.
-
-3. **The split is paid on-chain.** One transaction carries two `SystemProgram`
-   transfers (or two `transferChecked` instructions for an SPL mint) and a memo
-   with the payout reference and the L402 hash. Both legs are in one transaction,
-   so the split is atomic: either the reader and the publisher are paid, or
-   neither is.
-
-#### Integer base units, no drift
-
-The ledger is denominated in euros at four decimals; Solana amounts are integers.
-The conversion is one multiplication, applied once per leg:
-
-```
-units = round(euros × SOLANA_UNITS_PER_EUR)      // 1e8 lamports = 0.1 SOL per €1
-```
-
-Nothing is floored (unlike PayPal's cent quantiser), and the two integers sum to
-the integer image of the total, so no fraction of a unit is lost. `splitUnits()`
-also re-derives the 70/30 ratio from the total in base units and reports `drift`
-— normally `0`. The legs are never force-balanced against each other, because
-doing so would move money the ledger never reserved (a capped reader payout would
-drain the publisher balance); the alignment is measured, not manufactured.
-
-#### Funding the treasury
-
-A fresh devnet keypair holds no SOL, and the anchor plus a payout need fees.
-`SOLANA_AIRDROP=true` makes the server try the devnet faucet when it needs funds
-(once a minute, because the public faucet rate-limits hard). If the faucet
-refuses, the rail reports `unfunded` — the settlement still succeeds, the receipt
-says the anchor was skipped, and `/api/solana` prints the treasury address to
-fund at <https://faucet.solana.com>. With a funded keypair, set
-`SOLANA_TREASURY_SECRET` (base58 or JSON bytes) and everything runs from the
-first request.
-
-`SOLANA_FALLBACK_TO_PAYPAL=true` keeps a demo alive when devnet cannot confirm a
-transfer: the reservation is cancelled, a warning is emitted, and the same 70/30
-split is sent through PayPal instead.
-
----
-
-## API
-
-All responses are JSON. Base URL: `http://localhost:3000`.
-
-### `GET /api/health`
-
-```json
-{
-  "status": "ok",
-  "service": "adpal-simulator",
-  "version": "1.0.0",
-  "port": 3000,
-  "demoUrl": "http://localhost:3000/demo/",
-  "uptimeSeconds": 12,
-  "toolkit": {
-    "present": true,
-    "version": "1.2.0",
-    "tools": 5,
-    "mcp": "https://mcp.sandbox.paypal.com/sse"
-  },
-  "agents": ["agt_northbound_01", "agt_lumen_02", "agt_terrace_03", "agt_halden_04", "agt_fieldnotes_05"]
-}
-```
-
-### `GET /api/toolkit`
-
-The capability profile read from `AI-Toolkit-main/`: plugin version, license,
-sandbox MCP endpoint and transport, skills, the Payouts reference, the tool
-inventory this server exposes, and the retry policy. A missing checkout reports
-`present: false` and the simulator still boots.
-
-### `GET /api/agents`
-
-The rotation roster — advertiser agent id, sponsor, objective, campaign budget,
-spend and impressions — plus the current 70/30 split, whether automatic payout
-is enabled, and the active `cognition` profile (provider, model, relevance
-floor, and whether a hosted model is actually configured).
-
-### `GET /api/balance`
-
-```json
-{
-  "currency": "EUR",
-  "threshold": 0.05,
-  "user": {
-    "balance": 0.014,
-    "lifetime": 0.014,
-    "offersAccepted": 1,
-    "offersRejected": 0
-  },
-  "publisher": {
-    "balance": 0.006,
-    "lifetime": 0.006,
-    "publishers": [
-      { "name": "localhost", "balance": 0.006, "lifetime": 0.006, "offers": 1 }
-    ]
-  },
-  "advertiser": {
-    "budget": 49.98,
-    "initialBudget": 50,
-    "spent": 0.02
-  },
-  "rules": {
-    "maxPrice": 0.05,
-    "userShare": 0.7,
-    "publisherShare": 0.3,
-    "threshold": 0.05,
-    "humanThreshold": 50,
-    "payoutMode": "grouped"
-  },
-  "recentOffers": [],
-  "payouts": [],
-  "stats": { "offersTotal": 1, "payoutsTotal": 0 }
-}
-```
-
-### `GET /api/telemetry?since=<seq>`
-
-Incremental feed used by scripts and tests. Events are sequence-numbered and kept in a 500-event ring buffer.
-
-```json
-{
-  "seq": 6,
-  "events": [
-    {
-      "seq": 1,
-      "at": "2026-10-21T09:22:30.412Z",
-      "stage": "request",
-      "source": "extension.agent",
-      "level": "info",
-      "title": "Offer requested",
-      "detail": "€0.050 · localhost · The city reinvents its squares",
-      "data": { "price": 0.05, "slot": "declared" }
-    }
-  ],
-  "guards": [
-    { "id": "automation", "label": "Automation flag" }
-  ],
-  "rules": {
-    "humanThreshold": 50,
-    "userShare": 0.7,
-    "publisherShare": 0.3,
-    "payoutThreshold": 0.05,
-    "maxPrice": 0.05
-  }
-}
-```
-
-Stages: `request`, `checks`, `score`, `rotation`, `agent.advertiser`, `agent.protocol`, `decision`, `l402.contract`, `l402.settle`, `l402.challenge`, `l402.issue`, `l402.verify`, `l402.access`, `creative`, `ledger`, `attention`, `payout`, `paypal.oauth`, `paypal.payout`, `paypal.status`, `paypal.retry`, `system`. Levels: `info`, `ok`, `warn`, `error`. Money-moving stages (`ledger`, `payout`, `paypal.*`, `agent.protocol`, acknowledged `l402.settle`) are rendered with the terminal's bright-green transaction accent.
-
-### `GET /api/logs` (SSE)
-
-The same events as `/api/telemetry`, pushed live. Used by `/terminal/`.
-
-- `event: hello` — stream metadata: service, seq, rules, agents, L402 TTL, PayPal profile.
-- `event: log` — one event per frame, with `id: <seq>` and the full JSON envelope as `data`.
-- `: heartbeat` — comment frame every 15 s to keep intermediaries from timing out.
-- A fresh connection replays the last 40 events. A reconnecting `EventSource` sends `Last-Event-ID` and resumes exactly where it stopped; `?since=<seq>` overrides the default.
-
-PayPal credentials are redacted before they reach this stream: OAuth tokens are truncated, client secrets and bearer tokens appear only as `<redacted>`. The one deliberate exception is the L402 macaroon: it is a five-minute demo token, and showing it verbatim is the point of the protocol log.
-
-### `POST /api/client-event`
-
-Silent sink for the agent's aggregated session samples (`kind`, `level`, `title`, `detail`, `data`, `host`, `channel`). The publication page renders none of it; it exists so the terminal can show what the agent measured while the reader was simply reading. `channel` is `web` when `/demo/` posted the sample itself and `extension` when it was relayed by the service worker, and it selects the `source` on the stream (`web.agent` / `extension.agent`).
-
-### `POST /api/offer`
-
-Expected body (the values below produce an approved offer):
-
-```json
-{
-  "clientId": "demo-client",
-  "price": 0.02,
-  "signals": {
-    "durationMs": 6200,
-    "pageDwellMs": 12000,
-    "mouseMoves": 32,
-    "directionChanges": 11,
-    "scrollEvents": 5,
-    "scrollDepth": 0.62,
-    "clicks": 2,
-    "keyPresses": 1,
-    "visibleRatio": 1,
-    "focusRatio": 1,
-    "webdriver": false,
-    "clientSentAt": 1792578000000
-  },
-  "page": {
-    "title": "The city reinvents its squares",
-    "host": "localhost"
-  },
-  "slot": {
-    "detected": true
-  }
-}
-```
-
-Example with `curl.exe` (Windows) or `curl`. The endpoint requires a live reader
-session, so send the heartbeat first (the content script does this every 4 s
-while the tab is visible):
-
-```bash
-# 1. register the session (state: active)
-curl -X POST http://localhost:3000/api/presence \
-  -H "Content-Type: application/json" \
-  -d '{"clientId":"demo","state":"active","page":{"title":"Demo","host":"localhost"}}'
-
-# 2. request the offer within PRESENCE_TTL_MS (12 s)
-curl -X POST http://localhost:3000/api/offer \
-  -H "Content-Type: application/json" \
-  -d '{"clientId":"demo","price":0.05,"signals":{"durationMs":6200,"mouseMoves":32,"directionChanges":11,"scrollEvents":5,"scrollDepth":0.62,"clicks":2,"keyPresses":1,"visibleRatio":1,"focusRatio":1,"clientSentAt":1792578000000},"page":{"title":"Demo","host":"localhost"},"slot":{"detected":true}}'
-```
-
-Without a live session the response is `409 NO_ACTIVE_SESSION` and **nothing is
-credited** — that is the guarantee, not an error path.
-
-Approved response (excerpt):
-
-```json
-{
-  "approved": true,
-  "offerId": "ofr_1a2b3c4d",
-  "score": 99,
-  "verdict": "human",
-  "reason": "Attention signal consistent with human browsing.",
-  "price": 0.05,
-  "checks": [
-    { "id": "automation", "label": "Automation flag", "status": "pass", "detail": "navigator.webdriver = false" }
-  ],
-  "split": {
-    "user": 0.035,
-    "publisher": 0.015,
-    "userRate": 0.7,
-    "publisherRate": 0.3,
-    "gross": 0.05,
-    "exact": true,
-    "micros": { "reader": 35000, "publisher": 15000, "gross": 50000 },
-    "carryMicros": { "reader": 5000, "publisher": 5000 }
-  },
-  "creative": {
-    "id": "northbound-coffee",
-    "sponsor": "Northbound Coffee",
-    "headline": "Coffee that wakes up your ideas.",
-    "body": "Small-batch roasting, delivered to your door every week.",
-    "cta": "Discover Northbound",
-    "theme": "coffee"
-  },
-  "balance": { "...": "full snapshot" }
-}
-```
-
-Rejected response: status `200`, `approved: false`, with `score`, `reason`, `hint`, `flags`, `checks`, and the full `factors` breakdown. The creative is only assigned on approval.
-
-Errors: `400 INVALID_PRICE`, `400 PRICE_TOO_HIGH`, `429 RATE_LIMITED` (one request per second per client), `402 ADVERTISER_BUDGET_EXHAUSTED`.
-
----
-
-## L402 protocol surface
-
-`POST /api/offer` is the endpoint both agents use: it submits signals and gets a decision in one call. `/demo/` posts it same-origin from the page; the extension relays it through its service worker. Agents, scripts and auditors get a separate, explicit **L402 negotiation**, modelled on CrawlerPal's FastAPI reference server (`server/main.py` + `client/main.py`).
-
-The difference from the reference is that AdPal never sniffs the `User-Agent`. The publication lives at `/demo/` and the contract only at `/api/l402/*`, so a browser can never be mistaken for an agent and an agent can never be served the article.
-
-### `GET /api/l402/offer`
-
-Without a `Bearer` token it answers **HTTP 402** and the offer contract:
-
-```json
-{
-  "version": "1.0.0",
-  "protocol": "L402",
-  "payment_request_url": "http://localhost:3000/api/l402/settle",
-  "payment_context_token": "aa09327b-252f-4efe-b932-d8da1188bf57",
-  "expires_at": "2026-10-25T16:06:11.643Z",
-  "selected_offer_id": "attention_impression_v1",
-  "offers": [
-    {
-      "id": "attention_impression_v1",
-      "title": "Human Attention Verification",
-      "description": "70% reader split / 30% publisher split upon human attention proof",
-      "amount": 0.02,
-      "currency": "EUR",
-      "payment_methods": ["paypal_payouts"]
-    },
-    {
-      "id": "attention_session_v1",
-      "title": "Verified Reading Session",
-      "description": "Up to 12 verified impressions during one hour of reading, same 70/30 split",
-      "amount": 0.05,
-      "currency": "EUR",
-      "type": "session",
-      "duration": "1 hour",
-      "max_impressions": 12,
-      "payment_methods": ["paypal_payouts"]
-    }
-  ],
-  "payment_request": {
-    "method": "POST",
-    "url": "http://localhost:3000/api/l402/settle",
-    "content_type": "application/json",
-    "required_fields": ["payment_context_token", "offer_id", "attention.signals"],
-    "body": { "payment_context_token": "aa09327b-…", "offer_id": "attention_impression_v1", "attention": { "signals": {} } },
-    "signals_schema": { "durationMs": "integer — measured session length in ms (min 2500)", "…": "…" }
-  },
-  "challenge": {
-    "scheme": "L402",
-    "caveat": "viewport-gated",
-    "ttl_ms": 300000,
-    "payment_hash": "1a086cb0923ce054d768d5a0fcf4d2ecb3d11fcf9b88a4d4a01f1f75e6a4c8b5",
-    "www_authenticate": "L402 macaroon=\"pending\", payment_hash=\"1a08…\", caveat=\"viewport-gated\""
-  }
-}
-```
-
-The response also sets `WWW-Authenticate: L402 …`. The payment hash is minted **before** the client pays, so the macaroon issued later is cryptographically bound to the challenge the client actually received.
-
-Add `?offer_id=attention_session_v1` to pin the contract to one offer.
-
-With a valid `Authorization: Bearer <token>` the same URL returns **HTTP 200** and the paid resource: the impression receipt, the 70/30 split, the creative, the agent that bought it, and the current balance.
-
-### `POST /api/l402/challenge`
-
-Same contract, but created explicitly by POST (both `/api/l402/*` and `/l402/*` are mounted). Useful when an agent wants to name the publisher:
-
-```json
-{ "offer_id": "attention_impression_v1", "publisher": "localhost" }
-```
-
-### `POST /api/l402/settle`
-
-This is the `payment_request_url` advertised in the contract. In L402 terms the "payment" is proven human attention:
-
-```json
-{
-  "payment_context_token": "aa09327b-252f-4efe-b932-d8da1188bf57",
-  "offer_id": "attention_impression_v1",
-  "attention": { "signals": { "durationMs": 6400, "mouseMoves": 38, "scrollEvents": 7, "visibleRatio": 0.98, "webdriver": false } }
-}
-```
-
-Accepted (HTTP 200):
-
-```json
-{
-  "message": "Payment settled",
-  "protocol": "L402",
-  "bearer_token": "eyJ2IjoxLCJpIjoibDQwMjpjMDJm…",
-  "token_type": "Bearer",
-  "payment_context_token": "aa09327b-…",
-  "expires_at": "…",
-  "macaroon": { "id": "mcr_c02ffc3ab332", "caveats": 8, "caveatList": ["offer_id=…", "…"], "paymentHashFull": "…" },
-  "receipt": { "reference": "l402_aa09327b", "split": { "user": 0.014, "publisher": 0.006 }, "creative": { "…": "…" }, "agent": { "…": "…" } },
-  "proof": { "score": 100, "verdict": "human", "checks": ["…"] },
-  "balance": { "…": "full snapshot" }
-}
-```
-
-The `bearer_token` is the macaroon: identifier `l402:<sha256(preimage)>` plus eight HMAC-chained caveats, verified before it is returned. Both the macaroon **and** the raw `payment_context_token` work as a `Bearer` credential, so a CrawlerPal-style client works unchanged.
-
-Refused (HTTP 402): settlement re-returns the contract with `error.code = "ATTENTION_NOT_VERIFIED"`, plus `score`, `threshold`, `flags` and `checks`. The context token is **not** burned, so the same token can be retried once the reader actually engages.
-
-Idempotent: repeating the POST on a settled context returns 200 with `"idempotent": true` and the same bearer token — no double credit.
-
-Other errors: `400 OFFER_MISMATCH`, `402 UNKNOWN_PAYMENT_CONTEXT`, `402 CONTEXT_EXPIRED`, `402 ADVERTISER_BUDGET_EXHAUSTED`, `402 INVALID_MACAROON` (tampered caveats on read).
-
-### `GET /api/l402/receipt/:payment_context_token`
-
-The negotiation receipt: state (`issued` → `settled` → `consumed`, or `expired`), attempts, reads, macaroon, proof and ledger receipt. Preimages are never exposed.
-
-### `GET /api/l402/sessions?limit=20`
-
-The offer catalogue, context statistics and the most recent negotiations. The terminal uses the same data via SSE.
-
-### `client/inspect.js`
-
-A dependency-free CLI that walks the whole loop, after CrawlerPal's `client/main.py`:
-
-```bash
-node client/inspect.js                 # contract → proof → macaroon → resource → ledger
-node client/inspect.js --bot           # prove the refusal path (no credit, context kept)
-node client/inspect.js --settle-twice  # prove settlement idempotency
-node client/inspect.js --with-auth <bearer>
-node client/inspect.js --json          # machine-readable transcript
-node client/inspect.js --server http://localhost:3001 --offer attention_session_v1
-```
-
-Example run:
-
-```text
-[1] Requesting the offer contract (unauthenticated)
-    status: 402 Payment Required
-    ✓ 402 Payment Required · contract received
-    payment_context_token: 1bb0c906-3831-4ff8-9294-8a965817ac02
-    payment_hash: c02ffc3ab3321e9cadde7ef8ec1bd9b54975329911250b01374e0b8ee31c748e
-
-[2] Settling with an attention proof
-    status: 200 OK
-    ✓ settled · bearer token issued
-    macaroon id: mcr_c02ffc3ab332 · caveats: 8
-    attention: 100/100 · human
-
-[3] Reading the paid resource with the Bearer token
-    ✓ resource served · impression · attention_impression_v1
-    receipt: l402_a336c313 · €0.014 reader / €0.006 publisher
-
-[4] PayPal ledger state
-    reader balance: €0.014 · publisher balance: €0.006 · threshold: €0.100
-```
-
-Every step is also streamed to the terminal as `l402.contract`, `l402.settle`, `l402.issue`, `l402.verify` and `l402.access`, so a demo run can be inspected live.
-
-### `POST /api/payout`
-
-No body required. Optional fields:
-
-| field | meaning |
-| --- | --- |
-| `rail` | `paypal_payouts` (default) or `solana-devnet` |
-| `receiverEmail` / `publisherEmail` | PayPal overrides |
-| `paymentHash` | 64-hex L402 hash to commit in the Solana memo |
-| `reason` | Free-text label shown in the stream |
-
-Creates a **real payout on the selected rail**: a PayPal Sandbox batch, or a
-single Solana Devnet transaction carrying both 70/30 legs.
-
-- **PayPal batch accepted** → `200`
-
-```json
-{
-  "settled": true,
-  "payout": {
-    "id": "pay_ab12cd34",
-    "reference": "ADPAL-MVHV4IK4",
-    "method": "paypal",
-    "userAmount": 0.11,
-    "publisherAmount": 0.04,
-    "currency": "EUR",
-    "paypal": {
-      "batchId": "FVX5YM69EQ89N",
-      "status": "PENDING",
-      "rawStatus": "PENDING",
-      "receiverEmail": "sb-jokak53538300@business.example.com",
-      "mode": "sandbox"
-    },
-    "remainder": { "user": 0.002, "publisher": 0.008 }
-  },
-  "paypal": {
-    "configured": true,
-    "mode": "sandbox",
-    "batchId": "FVX5YM69EQ89N",
-    "status": "PENDING",
-    "amount": 0.11,
-    "currency": "EUR",
-    "receiverEmail": "sb-jokak53538300@business.example.com",
-    "selfUrl": "https://api-m.sandbox.paypal.com/v1/payments/payouts/FVX5YM69EQ89N"
-  },
-  "balance": { "...": "reader and publisher balances debited" }
-}
-```
-
-- **Threshold not reached** → `409`
-
-```json
-{
-  "settled": false,
-  "error": "THRESHOLD_NOT_REACHED",
-  "message": "Payout threshold of €0.100 not reached: €0.086 short.",
-  "missing": 0.086
-}
-```
-
-- **PayPal rejected the batch** → `502`
-
-```json
-{
-  "settled": false,
-  "error": "RECEIVER_UNREGISTERED",
-  "message": "The recipient email is not a confirmed PayPal Sandbox account.",
-  "issues": [{ "issue": "RECEIVER_UNREGISTERED", "description": "…" }],
-  "debugId": "…"
-}
-```
-
-`POST /api/flush-payout` is kept as an alias so the extension popup uses the same rail.
-
-**Solana Devnet payouts** return the same envelope with `rail: "solana-devnet"`
-and a `solana` block instead of `paypal`:
-
-```json
-{
-  "settled": true,
-  "rail": "solana-devnet",
-  "payout": {
-    "id": "pay_ab12cd34",
-    "method": "solana",
-    "userAmount": 0.07,
-    "publisherAmount": 0.03,
-    "solana": {
-      "signature": "4h8…",
-      "status": "confirmed",
-      "cluster": "devnet",
-      "memo": "ADPAL/v1|kind=payout|hash=…|ref=ADPAL-…|reader=7000000|publisher=3000000",
-      "units": { "reader": 7000000, "publisher": 3000000, "total": 10000000 }
-    }
-  },
-  "solana": { "signature": "4h8…", "explorerUrl": "https://explorer.solana.com/tx/4h8…?cluster=devnet", "…": "…" }
-}
-```
-
-### `GET /api/payout/:id`
-
-Re-reads a payout so a `PENDING` transfer can be shown as settled once the rail
-processed it. `id` is a PayPal batch id **or** a Solana transaction signature —
-the rail is inferred from the shape and echoed back as `rail`.
-
-```json
-{
-  "ok": true,
-  "status": {
-    "batchId": "FVX5YM69EQ89N",
-    "status": "PENDING",
-    "rawStatus": "PENDING",
-    "amount": 0.11,
-    "currency": "EUR",
-    "itemStatus": "PENDING",
-    "itemId": "6WQGRVHVRLLAC"
-  },
-  "payout": { "...": "matching ledger payout, status updated" }
-}
-```
-
-For a signature the `status` object is `{ signature, slot, confirmationStatus,
-confirmations, err, explorerUrl }`.
-
-### `GET /api/solana`
-
-The devnet rail profile, plus live balances read from the cluster.
-
-```json
-{
-  "enabled": true,
-  "rail": "solana-devnet",
-  "cluster": "devnet",
-  "rpcUrl": "https://api.devnet.solana.com",
-  "currency": "SOL",
-  "unitsPerEuro": 100000000,
-  "treasury": "C1VU5k76F43Qvvr9D64ZmjvGxNuwpjmwrRcaaTXQaNby",
-  "reader": "6Anfr5dPkpdRn73jXjFQoDYZ8HkQWTTVAK7vcdrUmkb2",
-  "publisher": "CFTa5327froMB89kJpokRRXFAPrm1eFBZeXWGrDNVAxw",
-  "ready": true,
-  "balances": { "treasury": 1000000000, "reader": 0, "publisher": 0, "treasurySol": 1 },
-  "faucetUrl": "https://faucet.solana.com?address=C1VU…&network=devnet",
-  "payoutRail": "solana-devnet"
-}
-```
-
-### `POST /api/solana/fund`
-
-Asks the devnet faucet for treasury SOL (`{ "sol": 1 }`, default
-`SOLANA_AIRDROP_SOL`). The public faucet is rate-limited per IP; when it refuses,
-the response carries the treasury address and a faucet link instead of failing
-silently.
-
-### `POST /api/l402/solana/confirm`
-
-Out-of-band confirmation of an on-chain L402 proof. The transaction is re-read
-from devnet and every check is returned individually.
-
-```bash
-curl -X POST http://localhost:3000/api/l402/solana/confirm \
-  -H 'content-type: application/json' \
-  -d '{"signature":"4h8…","payment_context_token":"cae7…"}'
-```
-
-```json
-{
-  "verified": true,
-  "rail": "solana-devnet",
-  "cluster": "devnet",
-  "signature": "4h8…",
-  "payment_hash": "579fb8ca…",
-  "slot": 515067123,
-  "confirmation_status": "confirmed",
-  "memo": "ADPAL/v1|kind=l402-proof|hash=579fb8ca…|ref=l402_cae7b7f8|score=98",
-  "checks": [
-    { "id": "replay", "label": "First use of this signature", "passed": true, "detail": "Not seen before" },
-    { "id": "exists", "label": "Transaction found on devnet", "passed": true, "detail": "slot 515067123" },
-    { "id": "confirmed", "label": "Confirmed on devnet", "passed": true, "detail": "confirmed" },
-    { "id": "succeeded", "label": "No on-chain error", "passed": true, "detail": "meta.err = null" },
-    { "id": "memo", "label": "Memo commits to the L402 hash", "passed": true, "detail": "hash=579fb8ca365d4e7a…" }
-  ],
-  "reason": "Transaction confirmed and the memo commits to this L402 hash.",
-  "explorerUrl": "https://explorer.solana.com/tx/4h8…?cluster=devnet"
-}
-```
-
-`payment_hash` may be supplied instead of a context token. A failed check answers
-`402` with the failing checks; a signature already used for a settlement answers
-`409 SIGNATURE_ALREADY_SETTLED`.
-
-### `server/scripts/solana-smoke.js`
-
-End-to-end smoke test against a running server: health → devnet profile →
-challenge → settle (prints the anchor) → `solana/confirm` on the anchor →
-a payout forced on each rail.
-
-```bash
-cd server
-node scripts/solana-smoke.js
-```
-
-### `POST /api/dev/reset`
-
-Developer tool: clears the accounts, the history, and the rate limits, and emits a `system` telemetry event.
-
-```bash
-curl -X POST http://localhost:3000/api/dev/reset
-```
-
----
-
-## PayPal webhooks
-
-### `POST /api/webhooks/paypal`
-
-The one route a client never calls. Register it in the PayPal dashboard, and
-PayPal will `POST` payout notifications (`PAYMENT.PAYOUTS-ITEM.SUCCEEDED`,
-`.FAILED`, `.RETURNED`, `.BLOCKED`, `.CANCELED`, `.UNCLAIMED`, `.ONHOLD`,
-`.REFUNDED`) as the batch progresses.
-
-```bash
-curl -X POST http://localhost:3000/api/webhooks/paypal \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "id": "WH-DEMO-1",
-    "event_type": "PAYMENT.PAYOUTS-ITEM.SUCCEEDED",
-    "resource_type": "payouts",
-    "resource": { "payout_batch_id": "XKGQ3VT6VDJ2Q", "transaction_status": "SUCCESS" }
-  }'
-```
-
-```json
-{
-  "ok": true,
-  "received": true,
-  "event_id": "WH-DEMO-1",
-  "event_type": "PAYMENT.PAYOUTS-ITEM.SUCCEEDED",
-  "outcome": "handled",
-  "signature": "skipped",
-  "signature_reason": "PAYPAL_WEBHOOK_ID is not set, so the signature could not be verified.",
-  "rail": "paypal_payouts",
-  "batch_id": "XKGQ3VT6VDJ2Q",
-  "status": "SUCCESS",
-  "reversal": { "reversed": false, "restored": 0 },
-  "payout": { "id": "pay_9a1ea53f", "rail": "paypal_payouts" },
-  "balance": { "...": "the ledger snapshot" }
-}
-```
-
-**Acknowledging is part of the contract.** PayPal retries anything that is not a
-2xx, so a well-formed event this simulator chooses not to act on still returns
-`200` — `outcome` says what happened:
-
-| `outcome` | meaning |
-| --- | --- |
-| `handled` | the ledger was updated |
-| `ignored` | a known type with nothing to apply, or a type this simulator does not model |
-| `duplicate` | the event id was already processed, or the payout was already reversed |
-| `unmatched` | well-formed, but no ledger record matches the batch id (e.g. after a restart) |
-
-Only three responses are refusals: an unparseable body is `400`, a signature
-PayPal rejects is `401`, and strict mode with no way to verify is `503`.
-
-**A failed payout puts the money back.** `commitPayout` debits the balances as
-soon as the rail accepts the batch, but payout items can still fail afterwards —
-an unregistered receiver, a restricted account. A terminal failure therefore
-*reverses* the payout: the reader and publisher balances are restored, because
-the money never left. `UNCLAIMED` and `ONHOLD` are deliberately **not** terminal
-and only update the status, since reversing early would pay the same share twice.
-Both the reversal and the replay guard are idempotent, so a redelivered
-notification cannot mint money.
-
-**Signature verification.** The route keeps the raw request body (a `express.raw`
-parser is mounted on this path *before* the JSON parser), so the event is parsed
-from the exact bytes PayPal signed. Verification itself is a round-trip to
-`POST /v1/notifications/verify-webhook-signature` and needs `PAYPAL_WEBHOOK_ID`:
-
-| configuration | unsigned / bad signature | outcome |
-| --- | --- | --- |
-| no id, no credentials | not checked | `200`, `signature: "skipped"` |
-| id configured, PayPal says `FAILURE` | refused | `401` `WEBHOOK_SIGNATURE_INVALID` |
-| id configured, verification API unreachable | held | `503` `WEBHOOK_VERIFICATION_UNAVAILABLE` |
-| notification signed by the other environment | refused, retryable | `503` `WEBHOOK_ENVIRONMENT_MISMATCH` |
-| `paypal-cert-url` is not a PayPal host | refused | `401` `WEBHOOK_SIGNATURE_INVALID` |
-| `PAYPAL_WEBHOOK_STRICT=true`, nothing to verify against | refused | `503` `WEBHOOK_UNVERIFIED` |
-
-The rows matter operationally. Once an id is configured, *every* notification
-must carry a signature PayPal confirms, so an unsigned request is refused — which
-also means the Postman and health-check probes accept either `200` or `401`
-depending on how the server is configured. And a failure of the verification
-*call* is deliberately not reported as a rejected signature: `401` tells PayPal
-the event is bad and it retries indefinitely, so an outage becomes an infinite
-retry loop with the real cause hidden.
-
-The environment-mismatch row is the same reasoning applied to configuration. A
-notification signed by Live can never verify against a Sandbox server, so a
-`401` there is a lie about the signature: PayPal reads it as "rejected" and
-redelivers while the real cause — a webhook id or mode belonging to the other
-environment — never appears. It answers `503` with a long `Retry-After` instead,
-which keeps the event available for a configuration fix, and the refusal is
-logged once per window rather than once per retry.
-
-### Seeing webhooks in the logs
-
-The terminal stream (`/terminal/`, `/api/logs`) is an in-memory ring buffer fed
-by SSE — it is **not** stdout. On a hosted platform the log stream is stdout, so
-the server writes an access line for every request, before any route matches:
-
-```
-[http] POST /api/webhooks/paypal → 200 · 118.9ms · paypal-transmission-id=b0f0e0d0-…
-[webhook] · Webhook acknowledged · no matching payout · PAYMENT.PAYOUTS-ITEM.SUCCEEDED · XKGQ3VT6VDJ2Q
-```
-
-If `[http]` shows nothing while PayPal's dashboard reports delivery attempts,
-the request is not reaching this process — check the callback URL registered in
-the PayPal dashboard (it must end in `/api/webhooks/paypal`, not `/api/api/…`),
-that the deployed build contains this route, and that the service is bound to
-the platform's `$PORT`.
-
-### Environment consistency (Sandbox vs Live)
-
-PayPal keeps Sandbox and Live completely separate, and three independent settings
-have to agree: the credentials, `PAYPAL_MODE` (which picks the API host) and the
-webhook id. A mix fails silently — the credentials may still authenticate, the
-webhook still arrives, and every notification is answered `FAILURE` forever,
-which looks identical to a forged signature.
-
-`scripts/paypal-env-check.js` proves the answer instead of guessing:
-
-```bash
-cd server
-node scripts/paypal-env-check.js
-```
-
-```
-  ok   credentials authenticate · sandbox (app APP-4XE00973…)
-  ok   PAYPAL_MODE matches the credentials · sandbox vs sandbox
-  ok   webhook id resolves in sandbox · https://adpal.onrender.com/api/webhooks/paypal
-  ok   subscribed to payout events · *
-CONSISTENT · credentials, API host and webhook id are all the same environment.
-```
-
-It works because the environment is provable in both directions: PayPal rejects
-the other environment's credentials with `401 invalid_client`, and a webhook id
-resolves only against the Webhooks API of the environment it was registered in.
-Run it with the deployment's variables to check a host you cannot shell into.
-
-At runtime the same conclusion is guarded from the notification itself. PayPal
-stamps each event with `paypal-cert-url`, whose host names the environment that
-sent it, so a Live event reaching a Sandbox-configured server is refused before
-the network round trip and logged as `Webhook environment mismatch` rather than
-an anonymous `FAILURE`.
-
-The comparison is against the exact hostnames PayPal signs from
-(`api.sandbox.paypal.com` / `api-m.sandbox.paypal.com` for Sandbox,
-`api.paypal.com` / `api-m.paypal.com` for Live), over HTTPS. A host that is
-neither is refused outright rather than forwarded: a substring test would let
-`api.sandbox.paypal.com.evil.example` through, and no genuine PayPal delivery
-uses anything outside those four names.
-
-Sandbox is enforced rather than merely defaulted. `PAYPAL_MODE=live` is ignored
-unless `PAYPAL_ALLOW_LIVE=true`, because that one variable moves the API host,
-the signing host and which webhook ids are valid; a half-flipped environment
-verifies nothing and retries forever. A demotion is printed at boot.
-
-The boot banner states all three values on one line, so a mixed deployment is
-visible at deploy time:
-
-```
-  Webhooks   sandbox · https://api-m.sandbox.paypal.com · id 09V249…
-```
-
-After the banner, one non-blocking check asks PayPal for the registered webhook
-and compares its callback URL with this deployment (`RENDER_EXTERNAL_URL`, or
-`PUBLIC_BASE_URL`), which catches the other silent failure — a valid id whose
-URL still points at a previous hostname, so nothing is ever delivered:
-
-```
-[webhook] ! Webhook endpoint mismatch · PayPal calls https://adpal.onrender.com/api/webhooks/paypal
-            but this deployment is https://old-adpal.example.com/api/webhooks/paypal
-```
-
----
-
-## Configuration
-
-Copy `server/.env.example` to `server/.env`, then adjust:
-
-```bash
-cd server
-copy .env.example .env      # Windows (cmd)
-# cp .env.example .env      # macOS / Linux
-```
+`server/.env.example` is the annotated reference. These change behaviour
+materially.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `NODE_ENV` | *(unset → development)* | `development` serves every view `no-store` with hashed asset URLs; `production` enables `must-revalidate` + validators |
-| `PORT` | `3000` | Preferred Express server port |
-| `PORT_SCAN_RANGE` | `10` | Ports to try (`3001`, `3002`, …) if `PORT` is taken. Ignored when `PORT` is injected by the platform, where the assigned port is not negotiable. The server binds `0.0.0.0` |
-| `PAYOUT_THRESHOLD` | `0.05` | Reader balance that unlocks a PayPal payout, in euros |
-| `MAX_OFFER_PRICE` | `0.05` | Maximum price accepted per offer |
-| `DEFAULT_OFFER_PRICE` | `0.05` | Informational price exposed in the rules |
-| `USER_SHARE` | `0.7` | User share (the remainder goes to the publisher) |
-| `ADVERTISER_BUDGET` | `50` | Simulated initial advertiser budget |
-| `HUMAN_THRESHOLD` | `50` | Minimum score required to approve an offer |
-| `PAYPAL_MODE` | `sandbox` | `sandbox` or `live`. Live is ignored unless `PAYPAL_ALLOW_LIVE=true` |
-| `PAYPAL_ALLOW_LIVE` | `false` | Opt in to Live. Sandbox is enforced otherwise: mode, API host and signing host always move together |
-| `PAYPAL_CLIENT_ID` | — | REST app client id from the PayPal developer dashboard |
-| `PAYPAL_CLIENT_SECRET` | — | REST app secret (server-side only, never sent to the page) |
-| `PAYPAL_BUSINESS_EMAIL` | `sb-jokak53538300@business.example.com` | Sandbox account the batch is sent from. PayPal refuses a payout to this account |
-| `PAYPAL_SENDER_ALIASES` | *(empty)* | Other confirmed emails on that same account (comma-separated), so they are also treated as the sender |
-| `PAYPAL_RECEIVER_EMAIL` | business email | Recipient of the reader (70%) share. Must be a *different* account, or the payout is refused before submission |
-| `PAYPAL_PUBLISHER_EMAIL` | *(empty)* | Recipient of the publisher (30%) share. Empty, equal to the reader, or equal to the sender means the share stays accrued on the ledger instead of being debited |
-| `PAYPAL_CURRENCY` | `EUR` | Payout currency |
-| `PAYPAL_MAX_PAYOUT` | `5` | Guard rail: largest amount a single demo payout may move |
-| `PAYPAL_TIMEOUT_MS` | `15000` | Abort a PayPal HTTP call after this long |
-| `PAYPAL_AUTH_BACKOFF_MS` | `30000` | Do not re-try refused credentials for this long; stops a webhook retry storm from hammering `/v1/oauth2/token` |
-| `PAYPAL_AUTO_PAYOUT` | `true` | Create the batch automatically when a settled invoice crosses the threshold |
-| `PAYPAL_AUTO_PAYOUT_DELAY_MS` | `0` | Pause between the settlement event and the PayPal call; `0` keeps them on the same tick |
-| `PAYPAL_AUTO_PAYOUT_MIN_INTERVAL_MS` | `15000` | Minimum gap between two automatic batches |
-| `PRESENCE_TTL_MS` | `12000` | How long a reader session stays live without a heartbeat (the content script pings every 4 s) |
-| `PRESENCE_REQUIRED` | `true` | Refuse `POST /api/offer` with no live session; `false` reintroduces ghost impressions and is for scripted checks only |
-| `PAYPAL_WEBHOOK_ID` | *(empty)* | Webhook id from the PayPal dashboard. Without it, notifications are accepted but reported `unverified` |
-| `PAYPAL_WEBHOOK_STRICT` | `false` | `true` refuses unverified notifications (503) instead of accepting them — use outside a sandbox demo |
-| `PAYPAL_WEBHOOK_REPLAY_WINDOW` | `500` | Event ids remembered to suppress PayPal's retries |
-| `PAYPAL_WEBHOOK_RETRY_AFTER` | `300` | `Retry-After` for a refusal only a configuration fix can change; also the minimum gap between identical refusal log lines |
-| `PUBLIC_BASE_URL` | *(empty)* | Public origin this deployment is reachable on, for the boot-time callback-URL check. Render's `RENDER_EXTERNAL_URL` is used when unset |
-| `PAYOUT_RAIL` | `paypal_payouts` | Active automatic rail: `paypal_payouts` or `solana-devnet` |
-| `SOLANA_ENABLED` | `true` | Enable the devnet rail |
-| `SOLANA_CLUSTER` | `devnet` | Label used in explorer links |
-| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | Devnet RPC endpoint |
-| `SOLANA_CURRENCY` / `SOLANA_MINT` / `SOLANA_DECIMALS` | `SOL` / *(empty)* / `9` | Native SOL, or an SPL mint address to pay in that token |
-| `SOLANA_UNITS_PER_EUR` | `100000000` | Base units per euro (0.1 SOL per €1); integer by design |
-| `SOLANA_TREASURY_SECRET` | *(empty)* | Base58 or JSON byte array; when empty a keypair is generated and persisted |
-| `SOLANA_KEYPAIR_FILE` | `server/.solana-devnet-keys.json` | Where generated demo keypairs live (gitignored) |
-| `SOLANA_READER_ADDRESS` / `SOLANA_PUBLISHER_ADDRESS` | *(empty)* | Fixed destinations for the two legs |
-| `SOLANA_AIRDROP` / `SOLANA_AIRDROP_SOL` | `true` / `1` | Try the devnet faucet when the treasury is short |
-| `SOLANA_ANCHOR_PROOFS` | `true` | Anchor `sha256(preimage)` on settle |
-| `SOLANA_ANCHOR_TIMEOUT_MS` / `SOLANA_TIMEOUT_MS` | `8000` / `15000` | Confirmation timeouts |
-| `SOLANA_MAX_PAYOUT` | `5` | Guard rail for a single devnet payout |
-| `SOLANA_FALLBACK_TO_PAYPAL` | `true` | Send the same split through PayPal if devnet cannot confirm |
-| `AGENT_PROVIDER` | `local` | Agent cognition backend: `local` (deterministic reasoner) or `openai` / `anthropic` / `gemini` |
-| `AGENT_API_KEY` | *(empty)* | Key for the hosted provider; falls back to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` |
-| `AGENT_MODEL` / `AGENT_BASE_URL` | *(provider default)* | Override the model or an OpenAI-compatible endpoint |
-| `AGENT_MIN_RELEVANCE` | `0.35` | Relevance floor below which an advertiser agent declines to spend |
-| `AGENT_TIMEOUT_MS` / `AGENT_MAX_TOKENS` / `AGENT_TEMPERATURE` | `6000` / `512` / `0.4` | Hosted-call limits; any failure falls back to the local reasoner |
-| `AGENT_ENABLED` | `true` | `false` skips the cognition layer entirely |
+| `PORT` | `3000` | HTTP port. The platform's `$PORT` wins when injected |
+| `PUBLIC_BASE_URL` | `RENDER_EXTERNAL_URL` | Base URL embedded in the 402 contract and webhook checks |
+| `USER_SHARE` | `0.7` | Reader share. Publisher share is `1 − USER_SHARE` |
+| `PAYOUT_THRESHOLD` | `0.05` | Reader balance that unlocks a payout, in EUR |
+| `MAX_OFFER_PRICE` | `0.05` | Hard ceiling on a single impression bid |
+| `HUMAN_THRESHOLD` | `50` | Minimum attention score for approval |
+| `PRESENCE_TTL_MS` | `12000` | How long a reader session stays live without a heartbeat |
+| `PAYOUT_RAIL` | `paypal_payouts` | `paypal_payouts` or `solana-devnet` |
+| `AGENT_PROVIDER` | `local` | `local`, `openai`, `anthropic` or `gemini` |
+| `AGENT_MODEL` | provider default | Override the model named in the table above |
+| `AGENT_MIN_RELEVANCE` | `0.35` | Relevance floor below which an agent declines |
+| `AGENT_TIMEOUT_MS` | `6000` | Hosted-model timeout before falling back to local |
+| `AGENT_ENABLED` | `true` | `false` forces the deterministic reasoner everywhere |
+| `PAYPAL_MODE` | `sandbox` | `sandbox` or `live`. Sandbox is enforced |
+| `PAYPAL_ALLOW_LIVE` | `false` | Required to leave Sandbox; prevents a half-flipped environment |
+| `PAYPAL_CLIENT_ID` | — | REST app client id (the payer) |
+| `PAYPAL_CLIENT_SECRET` | — | REST app secret, server-side only |
+| `PAYPAL_BUSINESS_EMAIL` | Sandbox business account | The payer. Must not appear as a receiver |
+| `PAYPAL_SENDER_ALIASES` | *(empty)* | Other confirmed emails on the payer account, comma-separated |
+| `PAYPAL_RECEIVER_EMAIL` | payer email | Reader recipient. Must be a different account |
+| `PAYPAL_PUBLISHER_EMAIL` | *(empty)* | Publisher recipient. Empty means the 30% stays accrued |
+| `PAYPAL_WEBHOOK_ID` | *(empty)* | Enables signature verification of payout webhooks |
+| `PAYPAL_WEBHOOK_STRICT` | `false` | `true` refuses unverified webhooks with `503` |
+| `SOLANA_ENABLED` | `true` | Enable the Devnet rail |
+| `SOLANA_UNITS_PER_EUR` | `100000000` | Base units per EUR: `1e8` lamports = 0.1 SOL per euro |
+| `SOLANA_ANCHOR_PROOFS` | `true` | Anchor `sha256(preimage)` on-chain when an invoice settles |
+| `L402_TTL_MS` | `300000` | Payment-context lifetime before it expires |
 
-PayPal credentials are only read by the server. The page and the extension never receive them: the terminal gets the mode, the recipient, and the batch result, nothing more. OAuth tokens are truncated to a prefix before they reach the log.
+Two details prevent the most common misconfiguration. `PAYPAL_ALLOW_LIVE` gates
+the mode switch because that one variable also moves the API host and the
+certificate host. At boot the server prints mode, API base and webhook id on one
+line, then reads the registered webhook and warns if its callback URL no longer
+points at this deployment.
 
-If a payout stays `PENDING`, that is the sandbox's own processing state. `POST /api/payout` reports exactly what PayPal returned; the **Refresh** action in the terminal re-reads the batch with `GET /v1/payments/payouts/{id}`. The batch only completes when every recipient is a **personal** Sandbox account distinct from `PAYPAL_BUSINESS_EMAIL`: the business account is the payer, and PayPal refuses to pay it (`SELF_PAY_NOT_ALLOWED`). Point `PAYPAL_RECEIVER_EMAIL` at one personal account, and `PAYPAL_PUBLISHER_EMAIL` at a second if you want the 30% to move too — otherwise it stays accrued on the ledger, which is visible in `split.publisherRail`.
+---
 
-The price actually requested is defined in `demo-publisher/adpal-agent.js` for the publication and in `extension/content.js` for third-party pages (`CONFIG.price`, €0.05 by default). The server rejects it if it exceeds `MAX_OFFER_PRICE`.
+## 7. L402 API & Agent Tools Surface
 
-The simulator **never fails because of a busy port**. If `PORT` is already taken (a stale terminal, another app), it walks forward through `PORT_SCAN_RANGE` following ports and prints the one it settled on:
+The protocol is mounted twice — `/api/l402/*` (advertised inside the contract) and
+`/l402/*` (protocol-native) — resolving to the same handlers. The browser path is
+separate by design: `/demo/` is never content-sniffed into a `402`, which removes
+a class of misdetection bugs and keeps the contract stable for agents.
 
-```text
-[AdPal] Port 3000 is busy, trying 3001…
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/l402/offer` | Without a bearer token: `402` with the contract. With one: the paid resource |
+| `POST` | `/api/l402/challenge` | Issue a fresh contract for an offer |
+| `POST` | `/api/l402/settle` | Submit attention proof (and optional Solana proof); returns a macaroon |
+| `POST` | `/api/l402/solana/confirm` | Verify an on-chain transaction against the invoice's payment hash |
+| `GET` | `/api/l402/receipt/:token` | The negotiation receipt for a context token |
+| `GET` | `/api/l402/sessions` | Live contexts, offer catalogue and aggregate stats |
 
-  AdPal — local simulator
-  API        http://localhost:3001/api/balance
-  Demo       http://localhost:3001/demo/
-  Note       port 3000 was busy, using 3001
+### The negotiation cycle
+
+```
+1. GET /api/l402/offer
+     402 Payment Required
+     { protocol, version, payment_request_url, payment_context_token,
+       offers: [...], payment_request: { required_fields, signals_schema } }
+
+2. POST /api/l402/settle
+     { payment_context_token, offer_id, attention: { signals }, solana_signature? }
+     402 ATTENTION_NOT_VERIFIED   -> score below HUMAN_THRESHOLD, context still valid
+     200  { bearer_token, receipt, solana, proof, balance }
+
+3. GET /api/l402/offer
+     Authorization: Bearer <macaroon>
+     200  { resource, grant, impression, balance }
 ```
 
-The extension does not need reconfiguration when that happens. It resolves the server in this order:
+The contract publishes its own required fields and signal schema, so an agent can
+negotiate with no out-of-band documentation. A refused settlement does not burn
+the context, so the same token can be retried once the reader genuinely engages;
+a successful one consumes it.
 
-1. the origin of the publisher page that requested the offer (`serverHint`, only sent by local pages);
-2. the last known URL cached in `chrome.storage.local`;
-3. a scan of `localhost` / `127.0.0.1` on ports 3000-3010.
+### Credential model
 
-Every response is validated against `GET /api/health` (`service === 'adpal-simulator'`), so an unrelated app on a scanned port is never mistaken for the simulator. On a network failure the worker re-discovers once and replays the request, which also covers a server restarted on a different port.
+The payment credential is a macaroon, not a session cookie. Each caveat — offer
+id, publisher, authorised price, expiry — is appended to the signature with a
+chained HMAC-SHA256:
 
-The publication is served by the simulator itself, so all of its API calls are relative and follow the active port automatically — `/demo/` needs no server discovery at all. The terminal header shows the live host (e.g. `localhost:3001`) and its SSE endpoint.
-
-The passive loop timings live in `CONFIG` at the top of `demo-publisher/adpal-agent.js` for the page, and at the top of `extension/content.js` for third-party pages. The two are kept in step deliberately; a different window on one surface would make the same reading session score differently depending on which agent measured it.
-
-| Key | Default | Purpose |
-| --- | --- | --- |
-| `dwellBeforeStartMs` | `2500` | Minimum page dwell before a window can start |
-| `sessionMs` | `6000` | Measurement window length |
-| `maxPerSlot` | `3` | Paid impressions per placement before it rotates |
-| `rotateAfterMs` | `20000` | Gap between a delivered creative and the next rotation |
-| `retryCooldownMs` | `10000` | Delay after a rejection |
-| `minNewSignals` | `4` | Fresh interactions required before retrying |
-| `maxImpressionsPerPage` | `9` | Cap across all placements on one page load |
-
----
-
-## Agent cognition
-
-`server/src/agent-cognition.js` is the reasoning layer around the deterministic pipeline. It has two roles:
-
-| Role | Called from | Output |
-| --- | --- | --- |
-| Advertiser bid reasoning | `POST /api/offer`, `POST /api/l402/settle` | a relevance score and a written justification per eligible advertiser; the highest relevant bid wins the slot |
-| Attention explanation | same routes | the telemetry read back as a behavioural signature, with each guard rail named |
-
-### Providers
-
-| `AGENT_PROVIDER` | What runs | Network |
-| --- | --- | --- |
-| `local` (default) | Deterministic reasoner: page classification, keyword + concept overlap, objective × page affinity, budget check, then prose assembled from those numbers | none |
-| `openai` / `anthropic` / `gemini` | The same task as a JSON prompt; `usage` from the API is recorded | provider API |
-
-The local reasoner is not a neural network, and this README will not pretend otherwise: it is feature extraction plus weighted scoring. Its output is still genuinely contextual — *"The city reinvents its squares"* and *"A desk garden for small apartments"* produce different winners and different arguments. Select a hosted provider with `AGENT_PROVIDER` plus `AGENT_API_KEY` (or `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`). On a missing key, timeout, 4xx or unparseable JSON the layer falls back to the local reasoner and marks the event `fallback: true` / `degraded: true` — it never reports a model that did not answer.
-
-### What the agents decide
-
-Each eligible advertiser is scored on three components:
-
-- **audience fit** — does the campaign objective suit this page type (`editorial`, `commerce`, `general`)?
-- **topic fit** — keyword overlap plus a small category map; exact terms count more than category adjacency
-- **novelty** — tie-breaker for an advertiser that has not been shown yet
-
-Relevance must clear `AGENT_MIN_RELEVANCE` (default `0.35`) or the agent declines to spend, and the offer is withheld with `402 NO_RELEVANT_ADVERTISER`. Budget and the per-slot no-repeat rule stay in `rotation.js`, so reasoning chooses the winner but cannot break the placement invariants.
-
-### What the attention agent does
-
-`heuristic.js` remains the authority: it produces the score and the approve/refuse decision, and the money follows it. The cognition layer reads the same signals and writes the explanation — reading cadence, pointer dynamics, viewport discipline, and each guard rail that passed or failed. With a hosted model, a disagreement between the model's verdict and the heuristic is reported (`disagreement: true`), never applied.
-
-### In the stream
-
-Three SSE stages carry the reasoning, each with a `cognition` envelope (`provider`, `model`, `usage`, `latencyMs`, `steps`):
-
-- `agent.attention` — the verification narrative and the measured signature
-- `agent.reasoning` — every bid, ranked, with the step trace
-- `agent.bid` — the winner's full justification in `detail`
-
-The terminal paints these rows violet, adds an `AI` badge and a numbered step list, and the **Agent cognition** card tracks provider, last verdict, relevance, cumulative tokens and latency. Token counts from a hosted API are exact; local-reasoner counts are marked `(est)` and computed as `chars / 4`.
-
----
-
-## Attention heuristic
-
-`server/src/heuristic.js` is deliberately readable and deterministic. It is not an AI model: it is an explainable mock with no personal data.
-
-### Blocking guard rails
-
-Any single one of these conditions rejects the offer:
-
-- `webdriver === true` (automated browser);
-- session shorter than 2.5 s;
-- fewer than 2 mouse moves **and** no scrolling **and** no click;
-- tab visible for less than 45% of the session;
-- more than 60 mouse moves per second;
-- client timestamp off by more than 2 minutes;
-- frantic scrolling (more than 200 events at maximum depth).
-
-Every guard rail is returned in `checks` with a `pass`/`fail` status and a human-readable detail. On rejection, the reported score is capped at 35.
-
-### Score (0-100)
-
-| Component | Max points |
-| --- | --- |
-| Base | 15 |
-| Attention duration (6 s = maximum) | 20 |
-| Mouse movement (24 = maximum) | 20 |
-| Direction changes (8 = maximum) | 10 |
-| Reading depth (50% = maximum) | 10 |
-| Scroll events (4 = maximum) | 5 |
-| Tab visibility | 10 |
-| Window focus | 8 |
-| Explicit interactions | 2 |
-| Penalty when interaction is near zero | −8 |
-
-An offer is approved only if **no guard rail** fires and `score >= HUMAN_THRESHOLD`.
-
-Assumed limits: signals come from the client and remain spoofable. A real system would need publisher-verified impressions, signatures, fraud detection, and explicit consent.
-
----
-
-## Simulated economics
-
-For a **€0.02** offer:
-
-```text
-Advertiser  ── €0.020 ──►  Approved offer
-                              ├── 70% ──►  Reader    : €0.014
-                              └── 30% ──►  Publisher : €0.006
+```
+signature = HMAC(root, identifier)
+signature = HMAC(root, signature || caveat_1)
+signature = HMAC(root, signature || caveat_2)  ...
 ```
 
-- Amounts are rounded to four decimal places.
-- The advertiser starts with a €50 budget; each approved offer debits it.
-- The €0.10 threshold is deliberately low: eight approved impressions reach it.
-- Balances and history live **in memory**: a restart resets everything.
+Editing or reordering any caveat invalidates the token, verification is
+constant-time, and the payment context is additionally tracked through an
+explicit state machine (`issued -> settled -> consumed`, or `expired`/`failed`)
+so every negotiation is inspectable and idempotent on retry.
 
----
+### What one settlement returns
 
-## Privacy
-
-**Sent to the local server**
-
-- aggregated counters: duration, movement, direction changes, scrolling, depth, clicks, key presses;
-- visibility and focus ratios;
-- the `webdriver` flag;
-- page title and host name;
-- a random client ID stored in `chrome.storage.local`.
-
-**Relayed silently to the simulator**
-
-- the same aggregated counters, so the agent terminal can display them during a session;
-- a compact attention sample every 8 seconds (never raw input);
-- lifecycle events (slot detected, session started, creative delivered).
-
-The publication page itself renders none of it.
-
-**Never sent**
-
-- mouse coordinates;
-- key or field content;
-- full URL, query parameters, cookies;
-- page content or form data.
-
-The history keeps only the title, host, score, price, and split.
-
----
-
-## Placement on other pages
-
-AdPal fills **publisher-declared inventory**. To monetize a page, add:
-
-```html
-<div id="adpal-slot" data-adpal-layout="banner"></div>
-```
-
-Three shapes are available:
-
-| `data-adpal-layout` | Unit | Where to put it |
-| --- | --- | --- |
-| `banner` (default) | partner card the width of the reading column | a dedicated full-width frame at the end of an article or section |
-| `inline` | compact partner line, no border of its own | the foot of one of the page's own cards |
-| `rail` | vertical sponsored card | a sidebar column beside the reading measure |
-
-**Reserve the space, don't create it on delivery.** CLS is the publisher's half of the contract: give every placement a fixed height in your own stylesheet, so the box exists before any creative does. The demo does this in `demo-publisher/style.css`:
-
-```css
-.adpal-slot {
-  --adpal-frame-h: 196px;            /* the unit is ~173px; leave headroom */
-  display: grid;
-  place-items: center;
-  min-height: var(--adpal-frame-h);
+```json
+{
+  "protocol": "L402",
+  "bearer_token": "<macaroon>",
+  "resource_url": "http://localhost:3000/api/l402/offer",
+  "receipt": {
+    "reference": "l402_9f3c1a2b",
+    "amount": 0.05,
+    "currency": "EUR",
+    "score": 99,
+    "verdict": "human",
+    "split": { "user": 0.035, "publisher": 0.015 }
+  },
+  "solana": {
+    "anchorSignature": "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ...",
+    "anchorExplorerUrl": "https://explorer.solana.com/tx/...?cluster=devnet"
+  },
+  "proof": { "threshold": 50, "checks": ["..."] },
+  "balance": { "reader": { "balance": 0.005 } }
 }
-
-/* Optional: the frame is identified while it waits… */
-.adpal-slot::before { content: "Partner"; /* … */ }
-
-/* …and drops its chrome once the extension mounts a creative. */
-.adpal-slot[data-adpal-state="filled"] { border-color: transparent; background: none; }
-.adpal-slot[data-adpal-state="filled"]::before { display: none; }
 ```
 
-The extension sets `data-adpal-state="filled"` on the host the moment it renders, so the publisher can style the empty and filled states differently without ever changing the frame's height. Keep `min-height`/`height` fixed across both states and the unit's fade-in costs zero layout shift.
-
-Any element carrying `[data-adpal-slot]` works too, so one page can declare several placements.
-
-The extension then behaves exactly as on the demo page: a passive measurement window once the reader engages, and an automatic creative only if the server approves the offer.
-
-Without `#adpal-slot`, the extension stays dormant — it does not create floating ads, overlays, or pop-ups. It also does not run on `chrome://` pages, the Chrome Web Store, or internal browser pages.
+Settlement and transfer are two distinct events on purpose: `/api/l402/settle`
+returns as soon as the payment is proven, and the batch or transaction identifier
+appears on the same tick in the SSE stream and in `/api/balance`.
 
 ---
 
-## Troubleshooting
+## Project layout
 
-| Symptom | Check |
-| --- | --- |
-| Popup shows **Offline** | The server is not running. Check `http://localhost:3000/api/health` (or `3001` if the banner said the port shifted). |
-| Inspector says “no extension signal” | The extension is not loaded, or the tab was opened before reloading it. Load `extension/`, then reload the page. |
-| Slot stays empty | No approved offer yet. Move the mouse and scroll; check the **Agent negotiation** stream for the failing check. |
-| Offer withheld despite interacting | Stay on the tab, keep the window focused, and move the mouse **and** scroll during the 6-second window. |
-| `429 RATE_LIMITED` | Only one request per second per client. |
-| Payout button disabled | Threshold not reached: four approved impressions at €0.014 reach €0.05. |
-| Port 3000 already in use | Nothing to do: the simulator falls back to 3001 and the extension finds it. |
-| Page renders unstyled until **Ctrl + F5** | Should no longer happen: views are served `no-store` with `?v=<hash>` assets. Confirm the response headers with `curl -I http://localhost:3000/demo/style.css` — you should see `Cache-Control: no-store` and **no** `ETag`. |
-| Styles correct but stale layout still shows | A `NODE_ENV=production` server is running. Restart without it for development. |
-| `curl -I` shows `ETag` in development | An old `server.js` is still bound to the port: stop it and restart `npm start`. |
-| Garbled console text on Windows | Use Windows Terminal or PowerShell 7; all files are UTF-8. |
-
-Useful commands:
-
-```bash
-# Start from scratch without restarting the server
-curl -X POST http://localhost:3000/api/dev/reset
-
-# Inspect the negotiation stream
-curl http://localhost:3000/api/telemetry?since=0
-
-# Follow server decisions
-# ([offer] and [payout] lines appear in the npm start terminal)
+```
+server/
+  server.js                  HTTP surface, payout orchestration, webhook route
+  src/
+    config.js                Environment parsing; the two PayPal hosts
+    heuristic.js             0-100 attention score and the eight guard rails
+    agent-cognition.js       Advertiser bidding agents and attention narrative
+    paypal-agent-toolkit.js  MCP-shaped agent tools over the official toolkit
+    l402.js                  HMAC-chained macaroon issue and verification
+    l402-contract.js         402 envelope and payment-context state machine
+    ledger.js                Integer micro-euro accounts, split, reversals
+    payout-recipients.js     Recipient planning; refuses self-payment
+    paypal.js                OAuth2, Payouts, webhook signature verification
+    webhook-reconciler.js    Hold-and-replay event matching
+    solana.js                Devnet transfers, proof verification, anchoring
+    presence.js              Live reader sessions; the impression gate
+    rotation.js              Per-slot advertiser rotation
+    creatives.js             Brand agent roster, campaign budgets, creatives
+    telemetry.js             Event bus behind the SSE stream
+demo-publisher/              The publication served at /demo/
+  adpal-agent.js             Page-side attention agent (no extension required)
+  terminal/                  The control room served at /terminal/
+extension/                   Optional Manifest V3 client: same protocol, browser UI
+AI-Toolkit-main/             Official PayPal AI Toolkit checkout (v1.2.0)
+client/inspect.js            Standalone L402 inspection CLI
+scripts/apimatic-validate.js OpenAPI import validation with live probes
 ```
 
 ---
 
-## Limitations and next steps
-
-- **Simulator only**: no authentication, no TLS, no real payments, no persistence.
-- The server listens on all network interfaces: keep it on a local machine and do not expose it publicly.
-- **A single advertiser** and a single currency; creatives come from a local library and rotate deterministically.
-- **Open heuristic**: good enough for a demo, not enough against real fraud.
-- The telemetry feed (`/api/telemetry`, `/api/logs`, `/api/client-event`) is intended for the local demo terminal and is not authenticated.
-- Possible next steps: SQLite or Postgres for accounts, server-signed offers, multiple publishers and advertisers, WebSockets for live balances, consent and retention policies, and integration with a real payment provider.
-
----
-
-## License
-
-MIT. Demo project — all brands, articles, and advertisements are fictional.
+**AdPal pays the people who make attention worth buying — and it lets autonomous
+agents prove, price and settle that attention in the open.** The protocol is the
+product: open, measurable, and settled directly between advertiser, reader and
+publisher.

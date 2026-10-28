@@ -290,6 +290,10 @@
       index,
       layout,
       viewport,
+      /* `total` is the slot-count accessor passed in by the caller; it is
+       * exposed here because reportAttention() and the terminal both render
+       * "slot N of M" from a runtime alone. */
+      total,
       label: () => `${index + 1}/${total()}`,
       get snapshot() {
         return snapshot;

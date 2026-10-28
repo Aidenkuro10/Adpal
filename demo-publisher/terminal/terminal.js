@@ -76,6 +76,7 @@
     agentOffer: $('agent-offer'),
     agentId: $('agent-id'),
     agentBid: $('agent-bid'),
+    agentBudget: $('agent-budget'),
     agentCreative: $('agent-creative'),
     agentScore: $('agent-score'),
     aiState: $('ai-state'),
@@ -100,6 +101,9 @@
     paypalBatch: $('paypal-batch'),
     paypalStatus: $('paypal-status'),
     paypalAmount: $('paypal-amount'),
+    paypalReaderLeg: $('paypal-reader-leg'),
+    paypalPublisherLeg: $('paypal-publisher-leg'),
+    paypalDebits: $('paypal-debits'),
     paypalRecipient: $('paypal-recipient'),
     paypalOauth: $('paypal-oauth'),
     paypalNote: $('paypal-note'),
@@ -690,6 +694,28 @@
         els.agentState.textContent = `${euro(split.user)} / ${euro(split.publisher)}`;
         els.agentState.title = 'Reader 70% / publisher 30% for the last approved impression';
       }
+      /*
+       * The advertiser's remaining campaign budget. It arrives with every
+       * credited impression but used to be dropped on the floor, which left the
+       * terminal unable to answer "how much can this campaign still spend?".
+       */
+      const budget = Number(data.balances.advertiser);
+      if (Number.isFinite(budget) && els.agentBudget) {
+        els.agentBudget.textContent = moneyLabel(budget, data.amount?.currency || 'EUR');
+        const spent = Number(data.amount?.value) || (Number(split.user) + Number(split.publisher));
+        els.agentBudget.title = Number.isFinite(spent) && spent > 0
+          ? `${moneyLabel(budget, 'EUR')} left after this ${moneyLabel(spent, 'EUR')} impression.`
+          : 'Remaining simulated campaign budget.';
+      }
+    }
+
+    if (event.stage === 'rotation' && data.advertiser) {
+      // Same figure from the rotation event, so the row is correct even when an
+      // impression is served without a ledger event.
+      const remaining = Number(data.advertiser.budgetRemaining);
+      if (Number.isFinite(remaining) && els.agentBudget) {
+        els.agentBudget.textContent = moneyLabel(remaining, 'EUR');
+      }
     }
   }
 
@@ -933,14 +959,32 @@
         updatePayoutButton();
       }
       if (header.batch_status) setPayoutStatus(header.batch_status);
-      if (header.amount?.value) {
-        els.paypalAmount.textContent = moneyLabel(header.amount.value, header.amount.currency);
+
+      /*
+       * The legs come from the request this server sent, because PayPal's
+       * create response echoes the batch id and status but not a per-item
+       * breakdown. Summing the request items is also the check that the batch
+       * total and its legs agree before either is shown.
+       */
+      const sent = Array.isArray(data.request?.body?.items) ? data.request.body.items : [];
+      const currency = data.request?.body?.items?.[0]?.amount?.currency || 'EUR';
+      if (sent.length > 0) {
+        const amounts = sent.map((entry) => Number(entry?.amount?.value) || 0);
+        const total = Math.round(amounts.reduce((sum, value) => sum + value, 0) * 100) / 100;
+        renderBatchMetrics({
+          total,
+          reader: amounts[0],
+          publisher: amounts[1] ?? 0,
+          currency,
+          debits: 1,
+          publisherHeld: amounts.length < 2
+        });
+        if (sent[0]?.receiver) {
+          els.paypalRecipient.textContent = sent[0].receiver;
+          els.paypalRecipient.title = sent[0].receiver;
+        }
       }
-      const item = Array.isArray(response.items) ? response.items[0] : null;
-      if (item?.receiver) {
-        els.paypalRecipient.textContent = item.receiver;
-        els.paypalRecipient.title = item.receiver;
-      }
+
       els.paypalNote.textContent = header.payout_batch_id
         ? `Payouts API ${event.title.toLowerCase()} · HTTP ${data.response?.status}.`
         : event.detail || 'Payout response received.';
@@ -957,17 +1001,79 @@
     }
 
     if (event.stage === 'payout') {
+      /*
+       * Only a settlement that actually produced a batch id touches the money
+       * rows. Notices such as "auto payout skipped" also arrive on this stage
+       * and must not overwrite the card with zeroes or a stale batch.
+       */
       if (data.batchId) {
         state.batchId = data.batchId;
         els.paypalBatch.textContent = data.batchId;
         updatePayoutButton();
       }
       if (data.status) setPayoutStatus(data.status);
-      if (Number.isFinite(Number(data.amount))) {
-        els.paypalAmount.textContent = moneyLabel(data.amount, data.currency);
+
+      if (data.batchId && Number.isFinite(Number(data.amount))) {
+        const split = data.split || {};
+        const reader = Number.isFinite(Number(split.user))
+          ? Number(split.user)
+          : Number(data.amount) - Number(data.publisherAmount || 0);
+        renderBatchMetrics({
+          total: Number(data.amount),
+          reader,
+          publisher: Number(data.publisherAmount) || 0,
+          currency: data.currency,
+          debits: 1,
+          // A publisher leg that exists on the ledger but not in the batch.
+          publisherHeld: Number(data.publisherAmount) < 0.01 && Number(split.publisher) >= 0.01
+        });
       }
       if (data.receiverEmail) els.paypalRecipient.textContent = data.receiverEmail;
       els.paypalNote.textContent = event.detail || 'Payout event.';
+    }
+  }
+
+  /**
+   * The money a single batch actually moved, rendered from one object.
+   *
+   * A PayPal Payouts batch debits the sender ONCE for the batch total. The
+   * reader and publisher amounts are that same total split by receiver — they
+   * are not additional charges, which is the reading that made the sender's
+   * activity page look like a €2.00 debit. All three numbers are therefore
+   * derived here together, so the card can never show a "total" that disagrees
+   * with its own legs, and the debit count is stated explicitly.
+   */
+  function renderBatchMetrics({ total, reader, publisher, currency = 'EUR', debits = 1, publisherHeld = false } = {}) {
+    const totalValue = Number(total);
+    const readerValue = Number(reader);
+    const publisherValue = Number(publisher);
+
+    if (Number.isFinite(totalValue)) {
+      els.paypalAmount.textContent = moneyLabel(totalValue, currency);
+      els.paypalAmount.title =
+        `One batch of ${moneyLabel(totalValue, currency)}. The reader and publisher lines are ` +
+        'this same amount split by receiver — they are not separate charges.';
+    }
+    if (Number.isFinite(readerValue)) {
+      els.paypalReaderLeg.textContent = moneyLabel(readerValue, currency);
+    }
+    if (Number.isFinite(publisherValue)) {
+      els.paypalPublisherLeg.textContent = publisherHeld
+        ? `${moneyLabel(publisherValue, currency)} · held`
+        : moneyLabel(publisherValue, currency);
+      els.paypalPublisherLeg.title = publisherHeld
+        ? 'Accrued on the ledger: the publisher receiver is the sending account, so it is not in this batch.'
+        : 'Second item in the same batch.';
+    }
+    if (els.paypalDebits) {
+      const count = Number(debits) || 1;
+      els.paypalDebits.textContent = `${count} debit${count === 1 ? '' : 's'} · ${moneyLabel(
+        Number.isFinite(totalValue) ? totalValue : 0,
+        currency
+      )}`;
+      els.paypalDebits.title =
+        `The sender is debited ${count} time${count === 1 ? '' : 's'} for this settlement, ` +
+        'not once per receiver.';
     }
   }
 
@@ -1307,6 +1413,19 @@
         }
       }
       renderBalance(data.user?.balance, data.publisher?.balance);
+
+      // The campaign budget survives a reload too; without this the row is
+      // blank until the next impression, which reads as "unknown" during a demo.
+      const advertiser = data.advertiser || {};
+      if (els.agentBudget && Number.isFinite(Number(advertiser.budget))) {
+        els.agentBudget.textContent = moneyLabel(advertiser.budget, 'EUR');
+        const spent = Number(advertiser.spent) || 0;
+        const initial = Number(advertiser.initialBudget) || 0;
+        els.agentBudget.title = initial > 0
+          ? `${moneyLabel(spent, 'EUR')} spent of ${moneyLabel(initial, 'EUR')} campaign budget.`
+          : 'Remaining simulated campaign budget.';
+      }
+
       applyPresence(data.presence);
       applyAccounting(data.accounting);
       if (data.solana) applySolanaProfile(data.solana);
@@ -1314,14 +1433,34 @@
         state.rail = data.payoutRail === 'solana-devnet' ? 'solana-devnet' : 'paypal_payouts';
       }
 
-      // Restore the last batch after a reload so the card is not blank.
+      /*
+       * Restore the last batch after a reload so the card is not blank.
+       *
+       * The total comes from the payout's `total`, never from `userAmount`:
+       * the reader leg is €0.70 of a €1.00 batch, so showing it as "the amount"
+       * was the number that disagreed with the Sandbox debit after a refresh.
+       */
       const last = Array.isArray(data.payouts) ? data.payouts[0] : null;
       if (last?.paypal?.batchId && !state.batchId) {
         state.batchId = last.paypal.batchId;
         els.paypalBatch.textContent = last.paypal.batchId;
         if (last.paypal.status) setPayoutStatus(last.paypal.status);
-        if (Number.isFinite(Number(last.userAmount))) {
-          els.paypalAmount.textContent = moneyLabel(last.userAmount, last.paypal.currency);
+
+        const debit = last.paypal.senderDebit || {};
+        const total = Number.isFinite(Number(last.total))
+          ? Number(last.total)
+          : Number(last.userAmount) + Number(last.publisherAmount || 0);
+        renderBatchMetrics({
+          total,
+          reader: Number(last.userAmount),
+          publisher: Number(last.publisherAmount) || 0,
+          currency: last.paypal.currency || debit.currency,
+          debits: Number(debit.debits) || 1,
+          publisherHeld: Number(last.publisherAmount) < 0.01
+        });
+        if (last.paypal.receiverEmail) {
+          els.paypalRecipient.textContent = last.paypal.receiverEmail;
+          els.paypalRecipient.title = last.paypal.receiverEmail;
         }
         els.payoutRefresh.disabled = false;
       }

@@ -3401,6 +3401,17 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
   const payout = ledger.commitPayout(reservation, { ...batch, rail: RAILS.PAYPAL });
   if (auto) lastAutoPayoutAt = Date.now();
 
+  /*
+   * The two legs, read back from the committed payout rather than recomputed.
+   *
+   * That makes the terminal's breakdown the same numbers the ledger recorded
+   * for the batch PayPal accepted — including the case where the publisher leg
+   * was withheld and is therefore 0 rather than a 30% that never left.
+   */
+  const debitItems = payout?.paypal?.senderDebit?.items || [];
+  const readerLeg = Number(debitItems[0]?.amount ?? reservation.userAmount);
+  const publisherLeg = Number(debitItems[1]?.amount ?? 0);
+
   // A webhook that beat the create response to the server is already buffered.
   // Apply it now, in the same tick, so the ledger is consistent before the
   // batch is even reported to the terminal.
@@ -3411,9 +3422,19 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     source: 'adserver.agent',
     level: 'ok',
     title: `PayPal batch ${batch.status}`,
+    /*
+     * The disbursement, stated as money rather than as protocol.
+     *
+     * One batch debits the sender once for the total; the reader and publisher
+     * figures are that total split by receiver. Spelling all three out on one
+     * line, with the debit count, is what lets a viewer reconcile the terminal
+     * against the Sandbox activity page without adding the legs to the total
+     * and concluding the sender paid twice.
+     */
     detail:
-      `${batch.batchId} · €${money(batch.amount)} ${batch.currency} → ${batch.receiverEmail}` +
-      (batch.items?.length > 1 ? ` (+${batch.items.length - 1} publisher item)` : '') +
+      `€${money(batch.amount)} ${batch.currency} total · ` +
+      `reader €${money(readerLeg)} / publisher €${money(publisherLeg)} · ` +
+      `1 debit · ${batch.batchId} ${batch.status}` +
       (reservation.reconciliation.carried.gross > 0
         ? ` · €${money(reservation.reconciliation.carried.gross)} carried (sub-cent)`
         : ' · cent-exact'),
@@ -3426,10 +3447,14 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
       rawStatus: batch.rawStatus,
       amount: batch.amount,
       currency: batch.currency,
+      // Explicit legs, so no consumer has to re-derive them from the split.
+      readerAmount: readerLeg,
+      publisherAmount: publisherLeg,
+      senderDebits: 1,
+      duplicate: Boolean(batch.duplicate),
       receiverEmail: batch.receiverEmail,
       items: batch.items || [],
       itemCount: items.length,
-      publisherAmount: reservation.publisherAmount,
       split,
       reconciliation: reservation.reconciliation,
       reconciledWebhooks: reconciled,
@@ -3441,7 +3466,8 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
   });
 
   console.log(
-    `[payout] ${batch.batchId} ${batch.status} · €${money(batch.amount)} ${batch.currency} → ${batch.receiverEmail}` +
+    `[payout] ${batch.batchId} ${batch.status} · €${money(batch.amount)} ${batch.currency} total` +
+      ` · reader €${money(readerLeg)} / publisher €${money(publisherLeg)} · 1 debit` +
       (auto ? ` · auto (${reason})` : '')
   );
 

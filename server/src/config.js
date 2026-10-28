@@ -85,7 +85,16 @@ const paypalBusinessEmail = textFromEnv(
 );
 
 const userShare = clamp(numberFromEnv('USER_SHARE', 0.7), 0.1, 0.9);
-const maxOfferPrice = Math.max(0.001, numberFromEnv('MAX_OFFER_PRICE', 0.05));
+/*
+ * Demo baseline: one verified impression is priced at €1.00, so the 70/30 rule
+ * settles €0.70 to the reader and €0.30 to the publisher per settlement. The
+ * amounts are large enough that Sandbox balances move visibly on every
+ * impression, while both legs remain whole cents — no carry, no rounding.
+ *
+ * The cap must be >= the default price, or `defaultOfferPrice` is clamped down
+ * to the cap below.
+ */
+const maxOfferPrice = Math.max(0.001, numberFromEnv('MAX_OFFER_PRICE', 1));
 
 /*
  * Solana Devnet rail.
@@ -97,9 +106,9 @@ const maxOfferPrice = Math.max(0.001, numberFromEnv('MAX_OFFER_PRICE', 0.05));
  * amount maps to a whole number of base units, so the 70/30 split can be
  * computed exactly instead of accumulating float drift.
  *
- * 1e8 lamports = 0.1 SOL per euro, which is large enough to read on Explorer
- * and small enough that a single 1 SOL devnet airdrop funds hundreds of demo
- * payouts.
+ * 1e8 lamports = 0.1 SOL per euro. At the €1.00 demo price that is 0.1 SOL per
+ * payout, so one 1 SOL devnet airdrop funds ten settlements — large enough to
+ * read on Explorer, and easy to top up from the faucet for a longer run.
  */
 const solanaMint = textFromEnv('SOLANA_MINT', '');
 const solanaUnitsPerEuro = Math.max(
@@ -109,7 +118,7 @@ const solanaUnitsPerEuro = Math.max(
   )
 );
 const defaultOfferPrice = clamp(
-  numberFromEnv('DEFAULT_OFFER_PRICE', 0.05),
+  numberFromEnv('DEFAULT_OFFER_PRICE', 1),
   0.001,
   maxOfferPrice
 );

@@ -1355,8 +1355,10 @@
 
     if (els.paypalPayable) els.paypalPayable.textContent = euro2(payable);
     if (els.paypalThreshold) els.paypalThreshold.textContent = euro(state.threshold);
-    // The balance minus what a whole-cent rail can carry. This is the half cent
-    // a €0.05 impression leaves behind, shown instead of silently vanishing.
+    // The balance minus what a whole-cent rail can move. With the €1.00 demo
+    // baseline this is zero (€0.70/€0.30 are cent-exact); it only becomes
+    // non-zero for an odd configured price, where the remainder is shown
+    // instead of silently vanishing.
     if (els.paypalCarry) {
       els.paypalCarry.textContent = euro(Math.max(0, state.balance - payable));
       els.paypalCarry.title =

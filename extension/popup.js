@@ -166,7 +166,7 @@ function renderRules(rules, threshold) {
   list.replaceChildren();
 
   const items = [
-    ['Maximum price per offer', `€${money(toNumber(rules.maxPrice, 0.05))}`],
+    ['Maximum price per offer', `€${money(toNumber(rules.maxPrice, 1))}`],
     ['Your share', `${Math.round(toNumber(rules.userShare, 0.7) * 100)}%`],
     ['Grouped payout threshold', `€${money(threshold)}`],
     ['Minimum attention score', `${Math.round(toNumber(rules.humanThreshold, 50))}/100`],

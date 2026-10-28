@@ -37,7 +37,9 @@
   const CLIENT_KEY = 'adpal:web:clientId';
 
   const CONFIG = {
-    price: 0.05,
+    // One impression is priced at €1.00, so the 70/30 split credits €0.70 to
+    // the reader and €0.30 to the publisher on every approved settlement.
+    price: 1,
 
     /* Measurement window */
     dwellBeforeStartMs: 2500,

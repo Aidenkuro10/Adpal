@@ -441,7 +441,7 @@
                   "  const split = b.receipt.split;",
                   "  pm.expect(split.userRate).to.eql(0.7);",
                   "  pm.expect(split.publisherRate).to.eql(0.3);",
-                  "  // Float-safe: 0.035 + 0.015 is not exactly 0.05 in binary.",
+                  "  // Float-safe: 0.70 + 0.30 is not exactly 1.00 in binary.",
                   "  pm.expect(split.user + split.publisher).to.be.closeTo(b.receipt.amount, 1e-9);",
                   "});",
                   "",
@@ -729,7 +729,7 @@
     },
     {
       "name": "04 · Payout Rails",
-      "description": "Both rails share the ledger reservation, the threshold and the 70/30 rule. Only the settlement call differs.\n\nThese requests accept **200** (paid) or **409** (`THRESHOLD_NOT_REACHED`) because the ledger is stateful and the outcome depends on it, not on the request:\n\n- A fresh reset starts the reader at €0.00, and the single settle in the L402 folder credits €0.035 against a €0.05 threshold — so a 409 is the correct answer.\n- `PAYPAL_AUTO_PAYOUT=true` fires **900ms** after a settlement crosses the threshold. By the time you click a payout button by hand, the credit has usually already been spent automatically, so a 409 again means \"already paid\", not \"broken\".\n\nBecause both outcomes are legitimate, the tests assert the response *shape* in either branch. To force a 200 by hand: switch `PAYPAL_AUTO_PAYOUT=false`, reset, settle twice, then call payout.",
+      "description": "Both rails share the ledger reservation, the threshold and the 70/30 rule. Only the settlement call differs.\n\nThese requests accept **200** (paid) or **409** (`THRESHOLD_NOT_REACHED`) because the ledger is stateful and the outcome depends on it, not on the request:\n\n- A fresh reset starts the reader at €0.00. One settle credits €0.70 (a €1.00 impression at the 70% share), which is far above the €0.005 threshold shipped in `server/.env.example`, so it pays out on its own.\n- `PAYPAL_AUTO_PAYOUT=true` fires **900ms** after a settlement crosses the threshold. By the time you click a payout button by hand, the credit has usually already been spent automatically, so a 409 means \"already paid\", not \"broken\".\n\nBecause both outcomes are legitimate, the tests assert the response *shape* in either branch. To force a 200 by hand: switch `PAYPAL_AUTO_PAYOUT=false`, reset, settle once, then call payout.",
       "item": [
         {
           "name": "Payout · PayPal Sandbox rail",

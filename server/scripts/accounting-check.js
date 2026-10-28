@@ -81,6 +81,55 @@ console.log('Accounting · one impression');
   );
 }
 
+console.log('\nAccounting · demo baseline (€1.00 impression)');
+{
+  // This is the shipped default: DEFAULT_OFFER_PRICE=1.00, USER_SHARE=0.7.
+  const baseline = { ...config, maxOfferPrice: 1, defaultOfferPrice: 1 };
+  const ledger = new Ledger(baseline);
+  const offer = impression(ledger, 1);
+
+  check('reader is exactly €0.70', offer.split.micros.reader === 700000, String(offer.split.micros.reader));
+  check('publisher is exactly €0.30', offer.split.micros.publisher === 300000, String(offer.split.micros.publisher));
+  check(
+    'split totals exactly €1.00',
+    offer.split.micros.reader + offer.split.micros.publisher === 1000000,
+    String(offer.split.micros.reader + offer.split.micros.publisher)
+  );
+  check(
+    'both legs are whole cents · nothing to carry',
+    offer.split.carryMicros.reader === 0 && offer.split.carryMicros.publisher === 0,
+    JSON.stringify(offer.split.carryMicros)
+  );
+
+  const prepared = ledger.preparePayout({ payPublisher: true, maxAmount: 5 });
+  check('reader pays exactly €0.70', prepared.reservation.userAmount === 0.7, String(prepared.reservation.userAmount));
+  check('publisher pays exactly €0.30', prepared.reservation.publisherAmount === 0.3, String(prepared.reservation.publisherAmount));
+  check('total payout is exactly €1.00', prepared.reservation.total === 1, String(prepared.reservation.total));
+  check('nothing is carried at the new baseline', prepared.reservation.reconciliation.carried.gross === 0);
+
+  ledger.commitPayout(prepared.reservation, { batchId: 'B-demo', status: 'SUCCESS' });
+  const audit = ledger.audit();
+  check(
+    'all invariants hold after the €1.00 payout',
+    Object.values({
+      splitIsExact: audit.invariants.splitIsExact,
+      readerConserved: audit.invariants.readerConserved,
+      publisherConserved: audit.invariants.publisherConserved,
+      ratioWithinOneCent: audit.invariants.ratioWithinOneCent
+    }).every(Boolean)
+  );
+  check(
+    'both balances drain to zero',
+    micros(ledger.user.balance) === 0 && micros(ledger.publisher.balance) === 0,
+    `${ledger.user.balance} / ${ledger.publisher.balance}`
+  );
+  check(
+    'no micro-cent is lost on a cent-exact split',
+    audit.unexplainedMicros.reader === 0 && audit.unexplainedMicros.publisher === 0,
+    JSON.stringify(audit.unexplainedMicros)
+  );
+}
+
 console.log('\nAccounting · convergence across impressions');
 {
   const ledger = new Ledger(config);

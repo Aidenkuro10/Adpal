@@ -335,6 +335,11 @@ Open **http://localhost:3000/demo/** and read for a few seconds. Then open
 **http://localhost:3000/terminal/** beside it: the bid reasoning, the attention
 narrative, the 70/30 split and the payout batch appear as they happen.
 
+The shipped baseline prices one impression at **€1.00**, so every approved
+settlement moves **€0.70 to the reader and €0.30 to the publisher** — enough for
+Sandbox balances to change visibly on a single impression, and both legs are
+whole cents, so nothing is held back as rounding.
+
 | Surface | Purpose |
 | --- | --- |
 | `/demo/` | The publication. Editorial, no debug chrome, no telemetry panel |
@@ -383,8 +388,9 @@ materially.
 | `PORT` | `3000` | HTTP port. The platform's `$PORT` wins when injected |
 | `PUBLIC_BASE_URL` | `RENDER_EXTERNAL_URL` | Base URL embedded in the 402 contract and webhook checks |
 | `USER_SHARE` | `0.7` | Reader share. Publisher share is `1 − USER_SHARE` |
-| `PAYOUT_THRESHOLD` | `0.05` | Reader balance that unlocks a payout, in EUR |
-| `MAX_OFFER_PRICE` | `0.05` | Hard ceiling on a single impression bid |
+| `PAYOUT_THRESHOLD` | `0.05` | Minimum reader balance for a payout. `server/.env.example` ships `0.005`, so the first €0.70 credit settles immediately |
+| `MAX_OFFER_PRICE` | `1.00` | Hard ceiling on a single impression bid. Must be `>= DEFAULT_OFFER_PRICE` |
+| `DEFAULT_OFFER_PRICE` | `1.00` | Unit price of one impression: €0.70 to the reader, €0.30 to the publisher |
 | `HUMAN_THRESHOLD` | `50` | Minimum attention score for approval |
 | `PRESENCE_TTL_MS` | `12000` | How long a reader session stays live without a heartbeat |
 | `PAYOUT_RAIL` | `paypal_payouts` | `paypal_payouts` or `solana-devnet` |
@@ -481,18 +487,18 @@ so every negotiation is inspectable and idempotent on retry.
   "resource_url": "http://localhost:3000/api/l402/offer",
   "receipt": {
     "reference": "l402_9f3c1a2b",
-    "amount": 0.05,
+    "amount": 1,
     "currency": "EUR",
     "score": 99,
     "verdict": "human",
-    "split": { "user": 0.035, "publisher": 0.015 }
+    "split": { "user": 0.7, "publisher": 0.3 }
   },
   "solana": {
     "anchorSignature": "4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ...",
     "anchorExplorerUrl": "https://explorer.solana.com/tx/...?cluster=devnet"
   },
   "proof": { "threshold": 50, "checks": ["..."] },
-  "balance": { "reader": { "balance": 0.005 } }
+  "balance": { "reader": { "balance": 0 } }
 }
 ```
 

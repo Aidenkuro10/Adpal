@@ -43,7 +43,8 @@
   const SLOT_SELECTOR = '#adpal-slot, [data-adpal-slot]';
 
   const CONFIG = {
-    price: 0.05,
+    // Matches the server baseline: €1.00 per impression → €0.70 / €0.30.
+    price: 1,
 
     /* Measurement window */
     dwellBeforeStartMs: 2500,

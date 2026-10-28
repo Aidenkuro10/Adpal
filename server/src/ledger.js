@@ -11,10 +11,11 @@ const { randomUUID } = require('crypto');
  *
  * The previous implementation stored euros as floats and rounded each step with
  * `round4`. That is fine until a payout: `floor2(0.035)` is `0.03`, so a €0.05
- * impression credited €0.035 to the reader and then paid out €0.03, silently
+ * impression credits €0.035 to the reader and then pays out €0.03, silently
  * stranding half a cent. Integer micros make the accrual exact and force the
  * rail quantisation to be an explicit, reported step instead of a rounding
- * artefact.
+ * artefact. The demo baseline (€1.00 → €0.70/€0.30) is cent-exact by
+ * construction; the carry path stays because any configured price can be odd.
  *
  * 1 € = 1_000_000 micros · 1 cent = 10_000 micros
  */
@@ -499,8 +500,9 @@ class Ledger {
           publisher: Math.round(publisherPayable / MICROS_PER_CENT),
           total: Math.round((userPayable + publisherPayable) / MICROS_PER_CENT)
         },
-        // Why a carry exists at all: the rail can only express whole cents, and
-        // a 70/30 leg of €0.05 is €0.035 — three decimals.
+        // Why a carry exists at all: the rail can only express whole cents. A
+        // €1.00 impression splits to €0.70/€0.30 (both exact), but an odd price
+        // such as €0.05 splits to €0.035 — three decimals — and must carry.
         note:
           readerCarried + publisherCarried > 0
             ? 'The rail settles in whole cents; the sub-cent remainder stays on the ledger and is paid with the next batch.'
@@ -517,9 +519,9 @@ class Ledger {
    * Describes the split a batch moves.
    *
    * `withinTolerance` is judged on the **cumulative** paid totals, not on one
-   * batch: a single €0.05 impression carries half a cent per leg, so an
-   * individual batch legitimately wobbles by up to a cent while the running
-   * total converges on exactly 70/30.
+   * batch: a single odd-priced impression (€0.05 → €0.035 per reader leg) carries
+   * half a cent, so an individual batch legitimately wobbles by up to a cent
+   * while the running total converges on exactly 70/30.
    */
   #splitOf(userMicros, publisherMicros, rail = 'paypal_payouts') {
     const userRate = this.config.userShare;

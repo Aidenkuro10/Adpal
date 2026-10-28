@@ -69,8 +69,13 @@ const OFFERS = Object.freeze([
   Object.freeze({
     id: 'attention_session_v1',
     title: 'Verified Reading Session',
-    description: 'Up to 12 verified impressions during one hour of reading, same 70/30 split',
-    amount: 0.05,
+    description:
+      'One hour of verified reading, up to 12 impressions, billed as a flat session fee · same 70/30 split',
+    // A session is a flat fee at the same unit price as one impression: the
+    // 12-impression allowance is a volume benefit, not a 12x invoice. Keeping
+    // the invoice at one unit price means every settlement stays inside the
+    // per-payout caps and splits to the same €0.70 / €0.30.
+    amount: config.defaultOfferPrice,
     currency: 'EUR',
     type: 'session',
     duration: '1 hour',

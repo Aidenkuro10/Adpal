@@ -29,7 +29,7 @@ const CREATIVES = Object.freeze([
     agent: Object.freeze({
       id: 'agt_northbound_01',
       name: 'Northbound Media Agent',
-      bid: 0.05
+      bid: 1
     }),
     campaign: Object.freeze({
       budget: 18.0,
@@ -47,7 +47,7 @@ const CREATIVES = Object.freeze([
     agent: Object.freeze({
       id: 'agt_lumen_02',
       name: 'Lumen Demand Agent',
-      bid: 0.05
+      bid: 1
     }),
     campaign: Object.freeze({
       budget: 14.0,
@@ -65,7 +65,7 @@ const CREATIVES = Object.freeze([
     agent: Object.freeze({
       id: 'agt_terrace_03',
       name: 'Terrace Growth Agent',
-      bid: 0.05
+      bid: 1
     }),
     campaign: Object.freeze({
       budget: 10.0,
@@ -83,7 +83,7 @@ const CREATIVES = Object.freeze([
     agent: Object.freeze({
       id: 'agt_halden_04',
       name: 'Halden Retail Agent',
-      bid: 0.05
+      bid: 1
     }),
     campaign: Object.freeze({
       budget: 12.0,
@@ -101,7 +101,7 @@ const CREATIVES = Object.freeze([
     agent: Object.freeze({
       id: 'agt_fieldnotes_05',
       name: 'Field Notes Culture Agent',
-      bid: 0.05
+      bid: 1
     }),
     campaign: Object.freeze({
       budget: 8.0,

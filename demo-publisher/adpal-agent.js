@@ -36,6 +36,13 @@
   const SLOT_SELECTOR = '#adpal-slot, [data-adpal-slot]';
   const CLIENT_KEY = 'adpal:web:clientId';
 
+  /* The price this page negotiates at, shared by every placement runtime.
+   * It starts at the shipped baseline and drops to the server's cap if this
+   * deployment is older than the client (see requestOffer). Kept at module
+   * scope because requestOffer is created per runtime, so a variable local to
+   * start() would not be visible inside it. */
+  let negotiatedPrice = null;
+
   const CONFIG = {
     // One impression is priced at €1.00, so the 70/30 split credits €0.70 to
     // the reader and €0.30 to the publisher on every approved settlement.
@@ -243,7 +250,10 @@
           `depth ${Math.round(snapshot.scrollDepth * 100)}%`,
         data: {
           slot: runtime.index + 1,
-          slots: runtime.total(),
+          // Defensive: the count comes from the runtime when it exposes one,
+          // and from the live slot list otherwise. Telemetry must never be able
+          // to throw and abort the tick that follows it.
+          slots: typeof runtime.total === 'function' ? runtime.total() : runtimes.length,
           layout: runtime.layout,
           pageAttention: snapshot.attention,
           ...snapshot
@@ -521,7 +531,7 @@
       const payload = {
         clientId: sessionId,
         channel: 'web',
-        price: CONFIG.price,
+        price: negotiatedPrice ?? CONFIG.price,
         signals,
         page: {
           title: document.title.slice(0, 120),
@@ -540,6 +550,25 @@
         await sendPresence('active');
         await delay(120);
         response = await post('/api/offer', payload);
+      }
+
+      /* The server caps the price it will accept, and a deployment that lags
+       * these clients still caps at the older baseline. Rather than leaving an
+       * empty slot, adopt the cap it reports and ask once more. The negotiated
+       * price is remembered for this page, so only the first offer pays this
+       * round trip. */
+      if (response.status === 400 && response.data?.error === 'PRICE_TOO_HIGH') {
+        const cap = Number(response.data.maxPrice);
+        if (Number.isFinite(cap) && cap > 0 && cap < payload.price) {
+          negotiatedPrice = cap;
+          payload.price = cap;
+          emitClientEvent(
+            'info',
+            'Price renegotiated',
+            `server cap €${money(cap)} · asking again`
+          );
+          response = await post('/api/offer', payload);
+        }
       }
 
       return response;
@@ -770,7 +799,16 @@
    * a stopped server), and the caller decides how to back off.
    */
   async function post(path, body, { beacon = false } = {}) {
-    const payload = JSON.stringify(body);
+    let payload;
+    try {
+      // Serialisation sits inside the guard on purpose: one non-serialisable
+      // field must not throw before the request is attempted, which would leave
+      // the placement stuck in "validating" with nothing in the server log.
+      payload = JSON.stringify(body);
+      if (typeof payload !== 'string') throw new Error('request body is not serialisable');
+    } catch (error) {
+      return { ok: false, status: 0, offline: true, error: error?.message || 'serialisation error', data: null };
+    }
 
     if (beacon && typeof navigator.sendBeacon === 'function') {
       try {
@@ -782,13 +820,22 @@
       }
     }
 
+    /* A negotiated offer must resolve in bounded time. Without this, a stalled
+     * socket leaves the placement measuring forever and the banner never
+     * appears — the failure looks like a broken renderer, not a dead request. */
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timeout = controller
+      ? window.setTimeout(() => controller.abort(), 8000)
+      : 0;
+
     try {
       const response = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: payload,
         cache: 'no-store',
-        credentials: 'same-origin'
+        credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined
       });
 
       let data = null;
@@ -804,9 +851,11 @@
         ok: false,
         status: 0,
         offline: true,
-        error: error?.message || 'network error',
+        error: error?.name === 'AbortError' ? 'request timed out after 8s' : error?.message || 'network error',
         data: null
       };
+    } finally {
+      if (timeout) window.clearTimeout(timeout);
     }
   }
 

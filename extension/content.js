@@ -226,7 +226,9 @@
           `depth ${Math.round(snapshot.scrollDepth * 100)}%`,
         data: {
           slot: runtime.index + 1,
-          slots: runtime.total(),
+          // Defensive: prefer the runtime's count, fall back to the live slot
+          // list so a missing method can never abort the tick loop.
+          slots: typeof runtime.total === 'function' ? runtime.total() : runtimes.length,
           layout: runtime.layout,
           pageAttention: snapshot.attention,
           ...snapshot
@@ -285,6 +287,10 @@
       index,
       layout,
       viewport,
+      /* `total` is the slot-count accessor passed in by the caller; it is
+       * exposed here because reportAttention() renders "slot N of M" from a
+       * runtime alone. */
+      total,
       label: () => `${index + 1}/${total()}`,
       get snapshot() {
         return snapshot;

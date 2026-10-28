@@ -2395,6 +2395,10 @@ app.post('/api/offer', async (req, res) => {
     return res.status(400).json({
       error: 'PRICE_TOO_HIGH',
       message: `The requested price exceeds the €${money(config.maxOfferPrice)} cap.`,
+      // The cap is returned so a client that ships with a newer default than
+      // the running server can renegotiate instead of failing: a stale process
+      // or a deployment that lags the clients must not break the page.
+      maxPrice: config.maxOfferPrice,
       balance: snapshot()
     });
   }

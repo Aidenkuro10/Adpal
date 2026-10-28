@@ -849,7 +849,7 @@
           "autoPayout": { "type": "boolean" },
           "payoutRail": { "$ref": "#/components/schemas/RailName" },
           "rails": { "$ref": "#/components/schemas/AgentsRails" },
-          "currency": { "type": "string", "example": "EUR" }
+          "currency": { "type": "string", "example": "USD" }
         }
       },
       "Rotation": {
@@ -952,7 +952,7 @@
           "decimals": { "type": "integer", "example": 9 },
           "unitsPerEuro": {
             "type": "integer",
-            "description": "Base units per euro. Integer by construction, so the 70/30 split cannot drift."
+            "description": "Base units per whole currency unit. Integer by construction, so the 70/30 split cannot drift."
           },
           "explorerBase": { "type": "string", "format": "uri" },
           "anchorProofs": { "type": "boolean" },
@@ -1096,7 +1096,7 @@
           "title": { "type": "string" },
           "description": { "type": "string" },
           "amount": { "type": "number", "minimum": 0 },
-          "currency": { "type": "string", "example": "EUR" },
+          "currency": { "type": "string", "example": "USD" },
           "type": { "type": "string", "description": "Present on multi-impression offers.", "example": "session" },
           "duration": { "type": "string", "example": "1 hour" },
           "max_impressions": { "type": "integer", "minimum": 1 },

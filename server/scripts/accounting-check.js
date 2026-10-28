@@ -5,7 +5,7 @@
  *
  * Runs the real ledger, no network. Verifies the two properties the demo claims:
  *
- *  1. every impression splits to the micro-euro (reader + publisher === gross);
+ *  1. every impression splits to the micro-unit (reader + publisher === gross);
  *  2. the payout rail's whole-cent quantisation carries the remainder instead of
  *     losing it, and the cumulative total converges on exactly 70/30.
  */
@@ -13,7 +13,7 @@
 const { Ledger, MICROS_PER_CENT } = require('../src/ledger');
 
 const config = {
-  currency: 'EUR',
+  currency: 'USD',
   advertiserBudget: 62,
   userShare: 0.7,
   publisherShare: 0.3,
@@ -81,17 +81,17 @@ console.log('Accounting · one impression');
   );
 }
 
-console.log('\nAccounting · demo baseline (€1.00 impression)');
+console.log('\nAccounting · demo baseline ($1.00 impression)');
 {
   // This is the shipped default: DEFAULT_OFFER_PRICE=1.00, USER_SHARE=0.7.
   const baseline = { ...config, maxOfferPrice: 1, defaultOfferPrice: 1 };
   const ledger = new Ledger(baseline);
   const offer = impression(ledger, 1);
 
-  check('reader is exactly €0.70', offer.split.micros.reader === 700000, String(offer.split.micros.reader));
-  check('publisher is exactly €0.30', offer.split.micros.publisher === 300000, String(offer.split.micros.publisher));
+  check('reader is exactly $0.70', offer.split.micros.reader === 700000, String(offer.split.micros.reader));
+  check('publisher is exactly $0.30', offer.split.micros.publisher === 300000, String(offer.split.micros.publisher));
   check(
-    'split totals exactly €1.00',
+    'split totals exactly $1.00',
     offer.split.micros.reader + offer.split.micros.publisher === 1000000,
     String(offer.split.micros.reader + offer.split.micros.publisher)
   );
@@ -102,15 +102,15 @@ console.log('\nAccounting · demo baseline (€1.00 impression)');
   );
 
   const prepared = ledger.preparePayout({ payPublisher: true, maxAmount: 5 });
-  check('reader pays exactly €0.70', prepared.reservation.userAmount === 0.7, String(prepared.reservation.userAmount));
-  check('publisher pays exactly €0.30', prepared.reservation.publisherAmount === 0.3, String(prepared.reservation.publisherAmount));
-  check('total payout is exactly €1.00', prepared.reservation.total === 1, String(prepared.reservation.total));
+  check('reader pays exactly $0.70', prepared.reservation.userAmount === 0.7, String(prepared.reservation.userAmount));
+  check('publisher pays exactly $0.30', prepared.reservation.publisherAmount === 0.3, String(prepared.reservation.publisherAmount));
+  check('total payout is exactly $1.00', prepared.reservation.total === 1, String(prepared.reservation.total));
   check('nothing is carried at the new baseline', prepared.reservation.reconciliation.carried.gross === 0);
 
   ledger.commitPayout(prepared.reservation, { batchId: 'B-demo', status: 'SUCCESS' });
   const audit = ledger.audit();
   check(
-    'all invariants hold after the €1.00 payout',
+    'all invariants hold after the $1.00 payout',
     Object.values({
       splitIsExact: audit.invariants.splitIsExact,
       readerConserved: audit.invariants.readerConserved,

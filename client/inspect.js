@@ -501,7 +501,7 @@ function printResource(body) {
 
   line('resource', `${body.resource?.type || '—'} · ${body.resource?.offer_id || '—'}`);
   line('credential', body.grant?.credential || '—');
-  line('max_price', body.grant?.max_price ? `${body.grant.max_price} EUR` : '—');
+  line('max_price', body.grant?.max_price ? `${body.grant.max_price} ${body.grant.currency || 'USD'}` : '—');
 
   const impression = body.impression;
   if (impression) {
@@ -580,12 +580,15 @@ function statusLabel(status) {
   return String(status);
 }
 
-function money(value, currency = 'EUR') {
+function money(value, currency = 'USD') {
   const amount = Number(value);
   if (!Number.isFinite(amount)) return '—';
-  const code = String(currency || 'EUR').toUpperCase();
-  const formatted = amount.toFixed(code === 'EUR' ? 3 : 2);
-  return code === 'EUR' ? `€${formatted}` : `${code} ${formatted}`;
+  const code = String(currency || 'USD').toUpperCase();
+  const formatted = amount.toFixed(code === 'USD' ? 3 : 2);
+  if (code === 'USD') return `$${formatted}`;
+  if (code === 'EUR') return `€${formatted}`;
+  if (code === 'GBP') return `£${formatted}`;
+  return `${code} ${formatted}`;
 }
 
 function truncate(value, max) {

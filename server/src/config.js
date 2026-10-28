@@ -86,8 +86,35 @@ const paypalBusinessEmail = textFromEnv(
 
 const userShare = clamp(numberFromEnv('USER_SHARE', 0.7), 0.1, 0.9);
 /*
- * Demo baseline: one verified impression is priced at €1.00, so the 70/30 rule
- * settles €0.70 to the reader and €0.30 to the publisher per settlement. The
+ * The application's money denomination.
+ *
+ * One place decides the currency: `/api/health`, the L402 contract, the PayPal
+ * batch payload and every terminal glyph read it from here. USD is the
+ * baseline (the Sandbox account settles USD batches); `CURRENCY` exists so a
+ * deployment can still be moved to another fiat code without editing code.
+ */
+const appCurrency = textFromEnv('CURRENCY', 'USD').toUpperCase();
+
+/**
+ * Presentation glyph for an ISO currency code.
+ *
+ * Formatting money is a UI concern, but the backend also writes amounts into
+ * log lines and event details, and those must not contradict the batch that was
+ * actually sent. Unknown codes render as the code itself rather than a wrong
+ * symbol. `SOL` is not fiat and uses the coin glyph the terminal already uses.
+ */
+function currencySymbol(code = appCurrency) {
+  const value = String(code || 'USD').toUpperCase();
+  if (value === 'USD') return '$';
+  if (value === 'EUR') return '€';
+  if (value === 'GBP') return '£';
+  if (value === 'SOL') return '◎';
+  return `${value} `;
+}
+
+/*
+ * Demo baseline: one verified impression is priced at $1.00, so the 70/30 rule
+ * settles $0.70 to the reader and $0.30 to the publisher per settlement. The
  * amounts are large enough that Sandbox balances move visibly on every
  * impression, while both legs remain whole cents — no carry, no rounding.
  *
@@ -95,7 +122,7 @@ const userShare = clamp(numberFromEnv('USER_SHARE', 0.7), 0.1, 0.9);
  * to the cap below.
  *
  * The baseline is also a floor. A deployment created before the demo moved to
- * €1.00 still carries `MAX_OFFER_PRICE=0.05` (and often
+ * $1.00 still carries `MAX_OFFER_PRICE=0.05` (and often
  * `DEFAULT_OFFER_PRICE=0.05`) in its platform environment, and that stale
  * value is invisible from the repository because `.env` is not committed.
  * Left alone it silently quarters every payout, so the on-page banner and the
@@ -118,22 +145,29 @@ const maxOfferPrice = allowLowPrice
 /*
  * Solana Devnet rail.
  *
- * The demo ledger is denominated in euros with four decimals, while Solana
- * amounts are integers. `unitsPerEuro` is the fixed bridge between the two:
- * one euro of attention is worth this many base units (lamports for SOL, or
- * token base units for an SPL mint). Keeping it an integer means every euro
- * amount maps to a whole number of base units, so the 70/30 split can be
+ * The fiat ledger is denominated in micro-units (1e-6 of the active currency),
+ * while Solana amounts are integers. `unitsPerFiat` is the fixed bridge between
+ * the two: one unit of fiat attention is worth this many base units (lamports
+ * for SOL, or token base units for an SPL mint). Keeping it an integer means
+ * every amount maps to a whole number of base units, so the 70/30 split can be
  * computed exactly instead of accumulating float drift.
  *
- * 1e8 lamports = 0.1 SOL per euro. At the €1.00 demo price that is 0.1 SOL per
+ * 1e8 lamports = 0.1 SOL per $1.00. At the $1.00 demo price that is 0.1 SOL per
  * payout, so one 1 SOL devnet airdrop funds ten settlements — large enough to
  * read on Explorer, and easy to top up from the faucet for a longer run.
+ *
+ * `SOLANA_UNITS_PER_EUR` is the original name and is still honoured, because
+ * deployments and the documented environment already carry it. The neutral
+ * `SOLANA_UNITS_PER_FIAT` takes precedence when both are set.
  */
 const solanaMint = textFromEnv('SOLANA_MINT', '');
-const solanaUnitsPerEuro = Math.max(
+const solanaUnitsPerFiat = Math.max(
   1,
   Math.round(
-    numberFromEnv('SOLANA_UNITS_PER_EUR', solanaMint ? 1_000_000 : 100_000_000)
+    numberFromEnv(
+      'SOLANA_UNITS_PER_FIAT',
+      numberFromEnv('SOLANA_UNITS_PER_EUR', solanaMint ? 1_000_000 : 100_000_000)
+    )
   )
 );
 const defaultOfferPrice = clamp(
@@ -143,8 +177,8 @@ const defaultOfferPrice = clamp(
 );
 /*
  * The floor `/api/offer` enforces. Without it a stale client that still bids
- * €0.05 (the pre-baseline default) would be honoured even though the server's
- * own default is €1.00, so "the price is €1.00" would only be true for callers
+ * $0.05 (the pre-baseline default) would be honoured even though the server's
+ * own default is $1.00, so "the price is $1.00" would only be true for callers
  * that ask nicely.
  */
 const minOfferPrice = Math.min(defaultOfferPrice, maxOfferPrice);
@@ -154,8 +188,8 @@ const minOfferPrice = Math.min(defaultOfferPrice, maxOfferPrice);
 const pricingCorrection =
   !allowLowPrice && (envMaxOfferPrice < DEMO_BASELINE_PRICE || envDefaultOfferPrice < DEMO_BASELINE_PRICE)
     ? `MAX_OFFER_PRICE=${envMaxOfferPrice} / DEFAULT_OFFER_PRICE=${envDefaultOfferPrice} ` +
-      `is below the €${DEMO_BASELINE_PRICE.toFixed(2)} demo baseline; using ` +
-      `€${maxOfferPrice.toFixed(2)} cap / €${defaultOfferPrice.toFixed(2)} price. ` +
+      `is below the ${currencySymbol()}${DEMO_BASELINE_PRICE.toFixed(2)} demo baseline; using ` +
+      `${currencySymbol()}${maxOfferPrice.toFixed(2)} cap / ${currencySymbol()}${defaultOfferPrice.toFixed(2)} price. ` +
       'Set ALLOW_LOW_PRICE=true to honour the platform value.'
     : '';
 
@@ -184,7 +218,8 @@ module.exports = Object.freeze({
   publisherShare: Math.round((1 - userShare) * 1000) / 1000,
   advertiserBudget: Math.max(1, numberFromEnv('ADVERTISER_BUDGET', 50)),
   humanThreshold: Math.round(clamp(numberFromEnv('HUMAN_THRESHOLD', 50), 10, 90)),
-  currency: 'EUR',
+  currency: appCurrency,
+  currencySymbol,
   demoDir: path.join(__dirname, '..', '..', 'demo-publisher'),
 
   /* ------------------------------------------------------------------ */
@@ -271,7 +306,7 @@ module.exports = Object.freeze({
      * it is never debited without a transfer to match.
      */
     publisherEmail: textFromEnv('PAYPAL_PUBLISHER_EMAIL', ''),
-    currency: textFromEnv('PAYPAL_CURRENCY', 'EUR').toUpperCase(),
+    currency: textFromEnv('PAYPAL_CURRENCY', appCurrency).toUpperCase(),
     // Guard rail so a demo can never move a large amount of sandbox money.
     maxPayout: Math.max(0.01, numberFromEnv('PAYPAL_MAX_PAYOUT', 5)),
     timeoutMs: Math.round(clamp(numberFromEnv('PAYPAL_TIMEOUT_MS', 15000), 3000, 60000)),
@@ -344,7 +379,10 @@ module.exports = Object.freeze({
     currency: textFromEnv('SOLANA_CURRENCY', 'SOL').toUpperCase(),
     mint: solanaMint,
     decimals: Math.round(clamp(numberFromEnv('SOLANA_DECIMALS', solanaMint ? 6 : 9), 0, 9)),
-    unitsPerEuro: solanaUnitsPerEuro,
+    unitsPerFiat: solanaUnitsPerFiat,
+    // Kept because `/api/solana`, the OpenAPI schema and the Postman collection
+    // all publish `unitsPerEuro`; it is the same number under its old name.
+    unitsPerEuro: solanaUnitsPerFiat,
     // Treasury signs anchors and payouts. When unset, a keypair is generated
     // once and persisted to `keypairFile` so the devnet address stays stable.
     treasurySecret: textFromEnv('SOLANA_TREASURY_SECRET', ''),

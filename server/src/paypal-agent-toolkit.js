@@ -24,6 +24,9 @@ const fs = require('fs');
 const path = require('path');
 
 const config = require('./config');
+
+/** Glyph for the configured currency, used by every prose amount below. */
+const CUR = config.currencySymbol(config.currency);
 const { planRecipients } = require('./payout-recipients');
 
 const TOOLKIT_DIR = path.resolve(__dirname, '..', '..', 'AI-Toolkit-main', 'AI-Toolkit-main');
@@ -355,8 +358,8 @@ async function authorizeAdvertiserSpend({ advertiser, price }) {
       ? `Spend authorized · ${advertiser?.sponsor || advertiser?.id}`
       : `Spend refused · ${advertiser?.sponsor || advertiser?.id}`,
     detail: decision.authorized
-      ? `€${Number(price).toFixed(3)} of €${Number(advertiser?.budgetRemaining ?? 0).toFixed(2)} remaining · ${advertiser?.objective || 'reach'}`
-      : `${decision.code} · remaining €${Number(decision.remaining ?? 0).toFixed(2)}`,
+      ? `${CUR}${Number(price).toFixed(3)} of ${CUR}${Number(advertiser?.budgetRemaining ?? 0).toFixed(2)} remaining · ${advertiser?.objective || 'reach'}`
+      : `${decision.code} · remaining ${CUR}${Number(decision.remaining ?? 0).toFixed(2)}`,
     data: { tool: 'advertiser_authorize_spend', ...decision, sponsor: advertiser?.sponsor }
   });
 
@@ -418,7 +421,7 @@ async function routeSettlement({
     level: split.withinTolerance ? 'ok' : 'warn',
     title: 'Settlement routed to PayPal Payouts',
     detail:
-      `€${reservation.userAmount.toFixed(2)} reader / €${reservation.publisherAmount.toFixed(2)} publisher · ` +
+      `${CUR}${reservation.userAmount.toFixed(2)} reader / ${CUR}${reservation.publisherAmount.toFixed(2)} publisher · ` +
       `${Math.round(split.readerRate * 100)}% / ${Math.round(split.publisherRate * 100)}` +
       (split.driftCents ? ` · ${split.driftCents > 0 ? '+' : ''}${split.driftCents}¢ cent rounding` : ''),
     data: {

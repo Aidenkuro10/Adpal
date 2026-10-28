@@ -115,7 +115,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   if (!payout) process.exit(1);
 
   const { batchId, senderBatchId } = payout.paypal;
-  console.log(`  ·    batch ${batchId} · sender ${senderBatchId} · €${payout.total}`);
+  console.log(`  ·    batch ${batchId} · sender ${senderBatchId} · $${payout.total}`);
 
   // 1. The shape PayPal sends for an item event: no payout_batch_id on the
   //    resource, only sender_batch_id inside payout_item. This is the case that
@@ -132,7 +132,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         transaction_id: 'TX-1',
         sender_item_id: `${payout.paypal.senderBatchId}-1`,
         sender_batch_id: senderBatchId,
-        payout_item_fee: { currency: 'EUR', value: '0.00' }
+        payout_item_fee: { currency: 'USD', value: '0.00' }
       }
     }
   });

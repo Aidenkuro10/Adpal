@@ -7,20 +7,35 @@ const { randomUUID } = require('crypto');
 /* ------------------------------------------------------------------ */
 
 /**
- * Every balance is an integer number of micro-euros.
+ * Every balance is an integer number of micro-units of the active currency.
  *
- * The previous implementation stored euros as floats and rounded each step with
- * `round4`. That is fine until a payout: `floor2(0.035)` is `0.03`, so a €0.05
- * impression credits €0.035 to the reader and then pays out €0.03, silently
+ * The previous implementation stored money as floats and rounded each step with
+ * `round4`. That is fine until a payout: `floor2(0.035)` is `0.03`, so a $0.05
+ * impression credits $0.035 to the reader and then pays out $0.03, silently
  * stranding half a cent. Integer micros make the accrual exact and force the
  * rail quantisation to be an explicit, reported step instead of a rounding
- * artefact. The demo baseline (€1.00 → €0.70/€0.30) is cent-exact by
+ * artefact. The demo baseline ($1.00 → $0.70/$0.30) is cent-exact by
  * construction; the carry path stays because any configured price can be odd.
  *
- * 1 € = 1_000_000 micros · 1 cent = 10_000 micros
+ * The unit is 1e-6 of one whole currency unit, whichever ISO code `CURRENCY`
+ * selects, so the arithmetic is identical for USD and EUR. The exported
+ * constant keeps its historical name (`MICROS_PER_EURO`) because `/api/health`,
+ * the scripts and the accounting audit all reference it.
+ *
+ * 1 unit = 1_000_000 micros · 1 cent = 10_000 micros
  */
 const MICROS_PER_EURO = 1_000_000;
 const MICROS_PER_CENT = 10_000;
+
+/** Presentation glyph for the ledger's configured currency. */
+function fiatSymbol(currency = 'USD') {
+  const code = String(currency || 'USD').toUpperCase();
+  if (code === 'USD') return '$';
+  if (code === 'EUR') return '€';
+  if (code === 'GBP') return '£';
+  if (code === 'SOL') return '◎';
+  return `${code} `;
+}
 
 function toMicros(value) {
   const number = Number(value);
@@ -38,7 +53,7 @@ function floorCents(micros) {
   return Math.floor(Number(micros) / MICROS_PER_CENT + 1e-9) * MICROS_PER_CENT;
 }
 
-/** Round4 kept for the public helpers that still speak in euros. */
+/** Round4 kept for the public helpers that still speak in whole units. */
 function round4(value) {
   return Math.round((value + Number.EPSILON) * 10000) / 10000;
 }
@@ -56,7 +71,7 @@ function round6(value) {
  *  - advertiser: the budget spent to buy impressions.
  *
  * Invariants (asserted by `audit()`):
- *  1. for every impression, reader + publisher === gross, to the micro-euro;
+ *  1. for every impression, reader + publisher === gross, to the micro-unit;
  *  2. accrued === paid + balances, for both parties;
  *  3. cumulative paid keeps the 70/30 ratio within one cent.
  */
@@ -69,7 +84,7 @@ class Ledger {
   reset() {
     this.startedAt = new Date().toISOString();
 
-    // Integer micro-euro state. Nothing else in this class stores money.
+    // Integer micro-unit state. Nothing else in this class stores money.
     this._m = {
       user: 0,
       publisher: 0,
@@ -149,7 +164,7 @@ class Ledger {
     return this;
   }
 
-  /** Advertiser budget as euros, for the routes that still read it directly. */
+  /** Advertiser budget in whole units, for routes that read it directly. */
   get advertiser() {
     return {
       budget: round6(fromMicros(this._m.advertiserBudget)),
@@ -185,7 +200,7 @@ class Ledger {
     const m = this._m;
     const readerDrift = m.readerPaid - Math.round((m.readerPaid + m.publisherPaid) * this.config.userShare);
     return {
-      unit: 'micro-euro',
+      unit: 'micro-unit',
       divisible: 1 / MICROS_PER_EURO,
       impressions: this.user.offersAccepted,
       grossAccrued: round6(fromMicros(m.grossAccrued)),
@@ -451,7 +466,7 @@ class Ledger {
     const thresholdMicros = toMicros(this.config.payoutThreshold);
     const capMicros = Number.isFinite(Number(maxAmount)) ? toMicros(maxAmount) : Infinity;
     // `minMicros` exists for rails whose denomination is finer than a
-    // micro-euro (one lamport is 1e-8 €), where `toMicros(minAmount)` would
+    // micro-unit (one lamport is 1e-8), where `toMicros(minAmount)` would
     // round the minimum down to zero.
     const minMicros = Number.isFinite(Number(minMicrosOverride))
       ? Math.max(1, Math.round(Number(minMicrosOverride)))
@@ -481,7 +496,7 @@ class Ledger {
     /*
      * The strict impression guard.
      *
-     * Every euro on the ledger was credited by an approved impression. A payout
+     * Every unit on the ledger was credited by an approved impression. A payout
      * is therefore only legal when it settles impressions that are still
      * outstanding: if the balance is payable but no unsettled impression backs
      * it, the money has already been paid once and paying it again is exactly
@@ -568,7 +583,7 @@ class Ledger {
         message:
           rail === 'solana-devnet'
             ? `The reader share is below the Solana minimum of ${minAmount}.`
-            : 'The reader share is below the PayPal minimum of €0.01.',
+            : `The reader share is below the PayPal minimum of ${fiatSymbol(this.config.currency)}0.01.`,
         threshold: this.config.payoutThreshold,
         balance: round6(fromMicros(this._m.user))
       };
@@ -621,8 +636,8 @@ class Ledger {
           total: Math.round((userPayable + publisherPayable) / MICROS_PER_CENT)
         },
         // Why a carry exists at all: the rail can only express whole cents. A
-        // €1.00 impression splits to €0.70/€0.30 (both exact), but an odd price
-        // such as €0.05 splits to €0.035 — three decimals — and must carry.
+        // $1.00 impression splits to $0.70/$0.30 (both exact), but an odd price
+        // such as $0.05 splits to $0.035 — three decimals — and must carry.
         note:
           readerCarried + publisherCarried > 0
             ? 'The rail settles in whole cents; the sub-cent remainder stays on the ledger and is paid with the next batch.'
@@ -645,7 +660,7 @@ class Ledger {
    * Describes the split a batch moves.
    *
    * `withinTolerance` is judged on the **cumulative** paid totals, not on one
-   * batch: a single odd-priced impression (€0.05 → €0.035 per reader leg) carries
+   * batch: a single odd-priced impression ($0.05 → $0.035 per reader leg) carries
    * half a cent, so an individual batch legitimately wobbles by up to a cent
    * while the running total converges on exactly 70/30.
    */

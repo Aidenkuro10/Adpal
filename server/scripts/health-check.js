@@ -78,7 +78,7 @@ async function probe(method, path, { body = null, expect = 200, note = '' } = {}
   if (solana) {
     const p = solana.payload || {};
     record('solana profile is complete', Boolean(p.cluster && p.treasury && p.reader && p.publisher),
-      `treasury ${String(p.treasury || '').slice(0, 8)}… · ${p.unitsPerEuro ?? '?'} units/€`);
+      `treasury ${String(p.treasury || '').slice(0, 8)}… · ${p.unitsPerEuro ?? '?'} units/$`);
     record('solana explorer base present', Boolean(p.explorerBase), p.explorerBase);
     // An unfunded treasury is a state to report, not a failure to fix here.
     const bal = p.balances || {};

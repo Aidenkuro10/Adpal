@@ -128,7 +128,7 @@ function listen() {
     await sleep(250);
     balance = (await call('/api/balance')).body;
   }
-  console.log(`settled ${settles} invoice(s) · reader €${balance?.user?.balance}`);
+  console.log(`settled ${settles} invoice(s) · reader $${balance?.user?.balance}`);
 
   const paypal = await call('/api/payout', {
     method: 'POST',

@@ -162,6 +162,9 @@
     // Overwritten from /api/health (rules.payoutThreshold) on connect; this is
     // only the value shown for the instant before the first frame arrives.
     threshold: 0.005,
+    // Overwritten from /api/health (`currency`) on connect. The default matches
+    // the server's baseline so no EUR glyph can flash before the first frame.
+    currency: 'USD',
     balance: 0,
     publisher: 0,
     payable: 0,
@@ -395,11 +398,11 @@
     return false;
   }
 
-  /** Coin glyph for the money badge: devnet transfers are not euros. */
+  /** Coin glyph for the money badge: devnet transfers are not fiat. */
   function moneyGlyph(event) {
     const rail = String(event.data?.rail || '');
     if (String(event.stage || '').startsWith('solana') || rail === 'solana-devnet') return '◎';
-    return '€';
+    return currencySymbol();
   }
 
   /** Stages whose payload is agent cognition rather than protocol mechanics. */
@@ -691,7 +694,7 @@
       const split = data.split || {};
       renderBalance(data.balances.user, data.balances.publisher);
       if (Number.isFinite(Number(split.user)) && Number.isFinite(Number(split.publisher))) {
-        els.agentState.textContent = `${euro(split.user)} / ${euro(split.publisher)}`;
+        els.agentState.textContent = `${fiat3(split.user)} / ${fiat3(split.publisher)}`;
         els.agentState.title = 'Reader 70% / publisher 30% for the last approved impression';
       }
       /*
@@ -701,10 +704,10 @@
        */
       const budget = Number(data.balances.advertiser);
       if (Number.isFinite(budget) && els.agentBudget) {
-        els.agentBudget.textContent = moneyLabel(budget, data.amount?.currency || 'EUR');
+        els.agentBudget.textContent = moneyLabel(budget, data.amount?.currency || 'USD');
         const spent = Number(data.amount?.value) || (Number(split.user) + Number(split.publisher));
         els.agentBudget.title = Number.isFinite(spent) && spent > 0
-          ? `${moneyLabel(budget, 'EUR')} left after this ${moneyLabel(spent, 'EUR')} impression.`
+          ? `${moneyLabel(budget, 'USD')} left after this ${moneyLabel(spent, 'USD')} impression.`
           : 'Remaining simulated campaign budget.';
       }
     }
@@ -714,7 +717,7 @@
       // impression is served without a ledger event.
       const remaining = Number(data.advertiser.budgetRemaining);
       if (Number.isFinite(remaining) && els.agentBudget) {
-        els.agentBudget.textContent = moneyLabel(remaining, 'EUR');
+        els.agentBudget.textContent = moneyLabel(remaining, 'USD');
       }
     }
   }
@@ -829,7 +832,7 @@
       els.agentId.title = agent.name || agent.id;
     }
     if (agent.name) els.agentState.textContent = agent.name;
-    if (Number.isFinite(Number(agent.bid))) els.agentBid.textContent = euro(agent.bid);
+    if (Number.isFinite(Number(agent.bid))) els.agentBid.textContent = fiat3(agent.bid);
     if (agent.sponsor || agent.creativeId) {
       els.agentCreative.textContent = [agent.sponsor, agent.creativeId].filter(Boolean).join(' · ');
     }
@@ -877,7 +880,7 @@
         els.l402Hash.title = data.receipt.paymentHash;
       }
       els.l402Note.textContent = data.receipt
-        ? `Bearer token issued · ${data.receipt.reference} · ${euro(data.receipt.split?.user)} reader`
+        ? `Bearer token issued · ${data.receipt.reference} · ${fiat3(data.receipt.split?.user)} reader`
         : event.detail || 'Payment request accepted.';
       return;
     }
@@ -893,7 +896,7 @@
       els.l402State.className = 'card-tag is-live';
       setText(els.l402Signature, `verified via ${data.grant?.via || 'bearer'}`);
       els.l402Note.textContent = data.impression
-        ? `${data.impression.reference} · ${euro(data.impression.split?.user)} reader · ${data.impression.agent?.id}`
+        ? `${data.impression.reference} · ${fiat3(data.impression.split?.user)} reader · ${data.impression.agent?.id}`
         : event.detail || 'Paid resource served.';
       return;
     }
@@ -967,7 +970,7 @@
        * total and its legs agree before either is shown.
        */
       const sent = Array.isArray(data.request?.body?.items) ? data.request.body.items : [];
-      const currency = data.request?.body?.items?.[0]?.amount?.currency || 'EUR';
+      const currency = data.request?.body?.items?.[0]?.amount?.currency || 'USD';
       if (sent.length > 0) {
         const amounts = sent.map((entry) => Number(entry?.amount?.value) || 0);
         const total = Math.round(amounts.reduce((sum, value) => sum + value, 0) * 100) / 100;
@@ -1039,11 +1042,11 @@
    * A PayPal Payouts batch debits the sender ONCE for the batch total. The
    * reader and publisher amounts are that same total split by receiver — they
    * are not additional charges, which is the reading that made the sender's
-   * activity page look like a €2.00 debit. All three numbers are therefore
+   * activity page look like a $2.00 debit. All three numbers are therefore
    * derived here together, so the card can never show a "total" that disagrees
    * with its own legs, and the debit count is stated explicitly.
    */
-  function renderBatchMetrics({ total, reader, publisher, currency = 'EUR', debits = 1, publisherHeld = false } = {}) {
+  function renderBatchMetrics({ total, reader, publisher, currency = 'USD', debits = 1, publisherHeld = false } = {}) {
     const totalValue = Number(total);
     const readerValue = Number(reader);
     const publisherValue = Number(publisher);
@@ -1163,7 +1166,7 @@
     }
 
     setText(els.solanaCluster, `${profile.cluster || 'devnet'} · ${profile.currency || 'SOL'}`);
-    setText(els.solanaRate, `${profile.unitsPerEuro ?? '—'} units / €1`);
+    setText(els.solanaRate, `${profile.unitsPerEuro ?? '—'} units / ${currencySymbol() || '$'}1`);
 
     for (const [el, value, label] of [
       [els.solanaTreasury, profile.treasury, 'Treasury'],
@@ -1334,14 +1337,14 @@
     const value = Number(user);
     if (Number.isFinite(value)) {
       state.balance = value;
-      els.paypalBalance.textContent = euro(value);
+      els.paypalBalance.textContent = fiat3(value);
     }
 
     if (publisher !== undefined) {
       const pub = Number(publisher);
       if (Number.isFinite(pub)) {
         state.publisher = pub;
-        els.paypalPublisher.textContent = euro(pub);
+        els.paypalPublisher.textContent = fiat3(pub);
       }
     }
 
@@ -1385,14 +1388,15 @@
 
     if (els.statAccounting) {
       const paid = Number(accounting.grossPaid) || 0;
+      const symbol = currencySymbol();
       els.statAccounting.textContent = balanced
-        ? `70/30 · exact · €${paid.toFixed(2)} settled`
+        ? `70/30 · exact · ${symbol}${paid.toFixed(2)} settled`
         : `70/30 · drift ${Number(inv.readerDriftCents) || 0}¢`;
       els.statAccounting.title =
-        `accrued €${(Number(accounting.grossAccrued) || 0).toFixed(4)} · ` +
-        `reader €${(Number(accounting.readerPaid) || 0).toFixed(4)} / ` +
-        `publisher €${(Number(accounting.publisherPaid) || 0).toFixed(4)} · ` +
-        `carried €${(Number(accounting.grossCarried) || 0).toFixed(4)} · ` +
+        `accrued ${symbol}${(Number(accounting.grossAccrued) || 0).toFixed(4)} · ` +
+        `reader ${symbol}${(Number(accounting.readerPaid) || 0).toFixed(4)} / ` +
+        `publisher ${symbol}${(Number(accounting.publisherPaid) || 0).toFixed(4)} · ` +
+        `carried ${symbol}${(Number(accounting.grossCarried) || 0).toFixed(4)} · ` +
         `fees ${accounting.fees?.model || 'sender-pays'} (deducted from split: ${accounting.fees?.deductedFromSplit ?? 0})`;
     }
   }
@@ -1418,11 +1422,11 @@
       // blank until the next impression, which reads as "unknown" during a demo.
       const advertiser = data.advertiser || {};
       if (els.agentBudget && Number.isFinite(Number(advertiser.budget))) {
-        els.agentBudget.textContent = moneyLabel(advertiser.budget, 'EUR');
+        els.agentBudget.textContent = moneyLabel(advertiser.budget, 'USD');
         const spent = Number(advertiser.spent) || 0;
         const initial = Number(advertiser.initialBudget) || 0;
         els.agentBudget.title = initial > 0
-          ? `${moneyLabel(spent, 'EUR')} spent of ${moneyLabel(initial, 'EUR')} campaign budget.`
+          ? `${moneyLabel(spent, 'USD')} spent of ${moneyLabel(initial, 'USD')} campaign budget.`
           : 'Remaining simulated campaign budget.';
       }
 
@@ -1437,7 +1441,7 @@
        * Restore the last batch after a reload so the card is not blank.
        *
        * The total comes from the payout's `total`, never from `userAmount`:
-       * the reader leg is €0.70 of a €1.00 batch, so showing it as "the amount"
+       * the reader leg is $0.70 of a $1.00 batch, so showing it as "the amount"
        * was the number that disagreed with the Sandbox debit after a refresh.
        */
       const last = Array.isArray(data.payouts) ? data.payouts[0] : null;
@@ -1494,14 +1498,14 @@
     const missing = Math.max(0, state.threshold - state.balance);
     const onChain = state.rail === 'solana-devnet';
 
-    if (els.paypalPayable) els.paypalPayable.textContent = euro2(payable);
-    if (els.paypalThreshold) els.paypalThreshold.textContent = euro(state.threshold);
-    // The balance minus what a whole-cent rail can move. With the €1.00 demo
-    // baseline this is zero (€0.70/€0.30 are cent-exact); it only becomes
+    if (els.paypalPayable) els.paypalPayable.textContent = fiat2(payable);
+    if (els.paypalThreshold) els.paypalThreshold.textContent = fiat3(state.threshold);
+    // The balance minus what a whole-cent rail can move. With the $1.00 demo
+    // baseline this is zero ($0.70/$0.30 are cent-exact); it only becomes
     // non-zero for an odd configured price, where the remainder is shown
     // instead of silently vanishing.
     if (els.paypalCarry) {
-      els.paypalCarry.textContent = euro(Math.max(0, state.balance - payable));
+      els.paypalCarry.textContent = fiat3(Math.max(0, state.balance - payable));
       els.paypalCarry.title =
         'Sub-cent remainder held on the ledger: PayPal settles in whole cents, so it moves with the next batch.';
     }
@@ -1510,13 +1514,13 @@
     els.payoutRequest.textContent = state.payoutBusy
       ? (onChain ? 'Submitting to devnet…' : 'Contacting PayPal…')
       : ready
-        ? (onChain ? `Settle ${euro2(payable)} on Solana` : `Settle ${euro2(payable)} to PayPal`)
+        ? (onChain ? `Settle ${fiat2(payable)} on Solana` : `Settle ${fiat2(payable)} to PayPal`)
         // Below the threshold, say how far there is to go. At/above it but
-        // with a sub-cent carry, "€0.000 to go" would be a lie: the blocker is
+        // with a sub-cent carry, "$0.000 to go" would be a lie: the blocker is
         // the half cent a 2-decimal rail cannot express, not the threshold.
         : missing > 1e-9
-          ? `Payout · ${euro(missing)} to go`
-          : `Sub-cent carry · ${euro(Math.max(0, state.balance - payable))} held`;
+          ? `Payout · ${fiat3(missing)} to go`
+          : `Sub-cent carry · ${fiat3(Math.max(0, state.balance - payable))} held`;
 
     if (els.payoutSolana) {
       // The devnet rail pays in integer base units, so the payable amount is the
@@ -1526,8 +1530,8 @@
       els.payoutSolana.textContent = state.payoutBusy
         ? 'Submitting…'
         : devnetReady
-          ? `Pay ${euro(state.balance)} on Solana`
-          : `Solana · ${euro(missing)} to go`;
+          ? `Pay ${fiat3(state.balance)} on Solana`
+          : `Solana · ${fiat3(missing)} to go`;
     }
 
     els.payoutRefresh.disabled = !(state.batchId || state.solanaSignature) || state.payoutBusy;
@@ -1569,7 +1573,7 @@
         }
         els.payoutNote.textContent =
           `On-chain payout ${chain.status} · ${truncate(chain.signature || '', 16)} · ` +
-          `${euro(data.payout?.userAmount)} reader / ${euro(data.payout?.publisherAmount)} publisher`;
+          `${fiat3(data.payout?.userAmount)} reader / ${fiat3(data.payout?.publisherAmount)} publisher`;
         els.payoutRefresh.disabled = false;
       } else {
         // A Solana request that fell back to PayPal returns the PayPal shape.
@@ -1586,7 +1590,7 @@
         }
         if (batch.receiverEmail) els.paypalRecipient.textContent = batch.receiverEmail;
         els.payoutNote.textContent =
-          `${batch.batchId} · ${batch.status} · ${euro(batch.amount)} → ${batch.receiverEmail}`;
+          `${batch.batchId} · ${batch.status} · ${fiat3(batch.amount)} → ${batch.receiverEmail}`;
       }
     } catch {
       els.payoutNote.textContent = 'Simulator unreachable.';
@@ -1837,7 +1841,7 @@
 
     state.balance = 0;
     state.publisher = 0;
-    setText(els.paypalBalance, euro(0));
+    setText(els.paypalBalance, fiat3(0));
     renderBalance(0, 0);
     els.payoutNote.textContent =
       'Payouts are created by the server through the configured rail (PayPal or Solana Devnet).';
@@ -1926,16 +1930,34 @@
     return `${Math.round(clamp(number, 0, 1) * 100)}%`;
   }
 
-  function euro(value) {
-    return `€${new Intl.NumberFormat('en-US', {
+  /**
+   * The glyph every amount is rendered with.
+   *
+   * Read from the server's active currency rather than hardcoded, so the demo
+   * cannot keep printing a stale symbol after the deployment is reconfigured
+   * (this terminal shipped EUR glyphs for a while after the rail moved on).
+   */
+  function currencySymbol(currency = state.currency) {
+    const code = String(currency || 'USD').toUpperCase();
+    if (code === 'USD') return '$';
+    if (code === 'EUR') return '€';
+    if (code === 'GBP') return '£';
+    // Solana amounts are not fiat; the coin glyph matches the money badge.
+    if (code === 'SOL') return '◎';
+    return `${code} `;
+  }
+
+  /** Three-decimal amount with the active currency glyph (ledger precision). */
+  function fiat3(value) {
+    return `${currencySymbol()}${new Intl.NumberFormat('en-US', {
       minimumFractionDigits: 3,
       maximumFractionDigits: 3
     }).format(Number(value) || 0)}`;
   }
 
   /** Two-decimal amount, the precision a PayPal payout batch can carry. */
-  function euro2(value) {
-    return `€${new Intl.NumberFormat('en-US', {
+  function fiat2(value) {
+    return `${currencySymbol()}${new Intl.NumberFormat('en-US', {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2
     }).format(Number(value) || 0)}`;
@@ -1946,12 +1968,12 @@
   }
 
   /** Payout amounts arrive with two decimals from PayPal; keep that precision. */
-  function moneyLabel(value, currency = 'EUR') {
+  function moneyLabel(value, currency = state.currency) {
     const amount = Number(value);
     if (!Number.isFinite(amount)) return '—';
-    const code = String(currency || 'EUR').toUpperCase();
-    if (code === 'EUR') return `€${amount.toFixed(2)}`;
-    return `${code} ${amount.toFixed(2)}`;
+    const code = String(currency || 'USD').toUpperCase();
+    const symbol = currencySymbol(code);
+    return `${symbol}${amount.toFixed(2)}`;
   }
 
   function truncate(value, max) {

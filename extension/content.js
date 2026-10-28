@@ -43,7 +43,7 @@
   const SLOT_SELECTOR = '#adpal-slot, [data-adpal-slot]';
 
   const CONFIG = {
-    // Matches the server baseline: €1.00 per impression → €0.70 / €0.30.
+    // Matches the server baseline: $1.00 per impression → $0.70 / $0.30.
     price: 1,
 
     /* Measurement window */
@@ -469,6 +469,8 @@
         }
 
         const data = response.data || {};
+        // Adopt the offer's currency before any amount is rendered.
+        activeCurrency = String(data.currency || data.balance?.currency || activeCurrency).toUpperCase();
         const approved = Boolean(data.approved);
 
         ui.lastOutcome = {
@@ -509,7 +511,7 @@
           emitClientEvent(
             'ok',
             'Creative delivered',
-            `placement ${runtime.label()} · ${data.creative?.sponsor || 'Sponsored'} · reader credited €${money(ui.lastReward)}`
+            `placement ${runtime.label()} · ${data.creative?.sponsor || 'Sponsored'} · reader credited ${cash(ui.lastReward)}`
           );
         } else {
           ui.phase = 'rejected';
@@ -1239,6 +1241,26 @@
 
   function round3(value) {
     return Number(clamp(value, 0, 1).toFixed(3));
+  }
+
+  /*
+   * Money glyph for the injected placement. The offer payload carries the
+   * ledger snapshot, so the overlay follows the server's active currency
+   * instead of hardcoding a symbol that can go stale.
+   */
+  let activeCurrency = 'USD';
+
+  function currencySymbol(currency = activeCurrency) {
+    const code = String(currency || 'USD').toUpperCase();
+    if (code === 'USD') return '$';
+    if (code === 'EUR') return '€';
+    if (code === 'GBP') return '£';
+    if (code === 'SOL') return '◎';
+    return `${code} `;
+  }
+
+  function cash(value) {
+    return `${currencySymbol()}${money(value)}`;
   }
 
   function money(value) {

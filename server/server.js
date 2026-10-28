@@ -151,6 +151,20 @@ function money(value) {
   }).format(value);
 }
 
+/*
+ * The glyph the backend writes into logs and event details. Read from the
+ * configured currency so a log line can never describe a different currency
+ * from the batch that was actually sent.
+ */
+const CUR = typeof config.currencySymbol === 'function'
+  ? config.currencySymbol(config.currency)
+  : '$';
+
+/** An amount with its currency glyph, for prose in logs and events. */
+function cash(value) {
+  return `${CUR}${money(value)}`;
+}
+
 /** Short, non-identifying client label for the terminal stream. */
 function clientLabel(clientId) {
   return String(clientId).slice(0, 10);
@@ -236,7 +250,7 @@ function emitBidReasoning(negotiation, { slotKey = '', price = 0, pageTitle = ''
   });
 
   console.log(
-    `[agent] ${winnerBid.sponsor} bids €${winnerBid.bid.toFixed(3)} · relevance ${winnerBid.relevance.toFixed(2)} · ${negotiation.provider}/${negotiation.model}`
+    `[agent] ${winnerBid.sponsor} bids ${CUR}${winnerBid.bid.toFixed(3)} · relevance ${winnerBid.relevance.toFixed(2)} · ${negotiation.provider}/${negotiation.model}`
   );
 }
 
@@ -353,6 +367,10 @@ app.get('/api/health', (_req, res) => {
     service: 'adpal-simulator',
     version: config.version,
     port: serverState.port,
+    // The active denomination. Advertised at the top level because the terminal,
+    // the popup and the injected placement all follow it rather than assuming a
+    // currency; `pricing.currency` repeats it beside the money rules.
+    currency: config.currency,
     demoUrl: `${serverState.url}/demo/`,
     terminalUrl: `${serverState.url}/terminal/`,
     logsUrl: `${serverState.url}/api/logs`,
@@ -365,7 +383,7 @@ app.get('/api/health', (_req, res) => {
     },
     agents: rotation.roster.map((entry) => entry.agent.id),
     // The effective money rules, not just what the environment asked for. This
-    // is the one place to check that a deployment is really charging €1.00 and
+    // is the one place to check that a deployment is really charging $1.00 and
     // splitting 70/30, instead of trusting whatever the dashboard holds.
     pricing: {
       currency: config.currency,
@@ -375,6 +393,11 @@ app.get('/api/health', (_req, res) => {
       publisherShare: config.publisherShare,
       userAmount: Math.round(config.defaultOfferPrice * config.userShare * 100) / 100,
       publisherAmount: Math.round(config.defaultOfferPrice * config.publisherShare * 100) / 100,
+      // The code actually written into the Payouts payload. Equal to `currency`
+      // unless a deployment pins PAYPAL_CURRENCY separately, which is exactly
+      // the kind of drift worth being able to see from outside.
+      payoutCurrency: config.paypal.currency,
+      payoutCurrencyMatches: String(config.paypal.currency).toUpperCase() === String(config.currency).toUpperCase(),
       correction: config.pricingCorrection || null,
     },
     /*
@@ -1370,7 +1393,7 @@ async function handleL402Settle(req, res) {
       source: 'ledger',
       level: 'error',
       title: 'Settlement refused · budget exhausted',
-      detail: `Remaining €${money(ledger.advertiser.budget)} · requested €${money(offer.amount)}`
+      detail: `Remaining ${CUR}${money(ledger.advertiser.budget)} · requested ${CUR}${money(offer.amount)}`
     });
 
     return res.status(402).json({
@@ -1553,8 +1576,8 @@ async function handleL402Settle(req, res) {
     level: 'ok',
     title: 'Payment settled · bearer token issued',
     detail:
-      `${receipt.reference} · €${money(receipt.split.user)} reader / ` +
-      `€${money(receipt.split.publisher)} publisher · ${agent.id}` +
+      `${receipt.reference} · ${CUR}${money(receipt.split.user)} reader / ` +
+      `${CUR}${money(receipt.split.publisher)} publisher · ${agent.id}` +
       (solanaAnchor?.signature ? ` · anchored ${solanaAnchor.signature.slice(0, 12)}…` : ''),
     data: {
       phase: 'settle',
@@ -1569,7 +1592,7 @@ async function handleL402Settle(req, res) {
   });
 
   console.log(
-    `[l402] settled ${receipt.reference} · ${evaluation.score}/100 · €${money(receipt.split.user)} reader · ${agent.id}` +
+    `[l402] settled ${receipt.reference} · ${evaluation.score}/100 · ${CUR}${money(receipt.split.user)} reader · ${agent.id}` +
       (solanaAnchor?.signature ? ` · anchor ${solanaAnchor.signature}` : ` · anchor ${solanaAnchor?.status || 'skipped'}`)
   );
 
@@ -2096,7 +2119,7 @@ async function handlePaypalWebhook(req, res) {
               : 'Webhook acknowledged · nothing to apply',
     detail:
       `${eventType} · ${batchId || senderBatchId || itemId || 'no batch id'}` +
-      (reversal?.reversed ? ` · reversed €${money(reversal.restored)}` : '') +
+      (reversal?.reversed ? ` · reversed ${CUR}${money(reversal.restored)}` : '') +
       (outcome === 'deferred' ? ` · queued for reconciliation (${webhookReconciler.size} held)` : ''),
     data: {
       eventId,
@@ -2471,11 +2494,11 @@ app.post('/api/offer', async (req, res) => {
       source: 'adserver.agent',
       level: 'error',
       title: 'Offer rejected · price above cap',
-      detail: `Requested €${money(requestedPrice)} · cap €${money(config.maxOfferPrice)}`
+      detail: `Requested ${CUR}${money(requestedPrice)} · cap ${CUR}${money(config.maxOfferPrice)}`
     });
     return res.status(400).json({
       error: 'PRICE_TOO_HIGH',
-      message: `The requested price exceeds the €${money(config.maxOfferPrice)} cap.`,
+      message: `The requested price exceeds the ${CUR}${money(config.maxOfferPrice)} cap.`,
       // The cap is returned so a client that ships with a newer default than
       // the running server can renegotiate instead of failing: a stale process
       // or a deployment that lags the clients must not break the page.
@@ -2487,9 +2510,9 @@ app.post('/api/offer', async (req, res) => {
   /*
    * The demo baseline is a floor, not a suggestion.
    *
-   * A client built before the €1.00 baseline still sends `price: 0.05`, and
-   * honouring it would sell a €0.05 impression against a server whose own
-   * default is €1.00 — the split then pays €0.035/€0.015 and the banner,
+   * A client built before the $1.00 baseline still sends `price: 0.05`, and
+   * honouring it would sell a $0.05 impression against a server whose own
+   * default is $1.00 — the split then pays $0.035/$0.015 and the banner,
    * terminal and API all disagree. Raising the bid instead of refusing it keeps
    * an older page working while guaranteeing that no impression is ever sold
    * below the configured baseline. `ALLOW_LOW_PRICE=true` restores the old
@@ -2503,11 +2526,11 @@ app.post('/api/offer', async (req, res) => {
       source: 'adserver.agent',
       level: 'warn',
       title: 'Bid raised to demo baseline',
-      detail: `Requested €${money(requestedPrice)} · floor €${money(config.minOfferPrice)}`,
+      detail: `Requested ${CUR}${money(requestedPrice)} · floor ${CUR}${money(config.minOfferPrice)}`,
       data: { requestedPrice, price: effectivePrice }
     });
     console.log(
-      `[offer] bid raised €${money(requestedPrice)} → €${money(effectivePrice)} (demo baseline)`
+      `[offer] bid raised ${CUR}${money(requestedPrice)} → ${CUR}${money(effectivePrice)} (demo baseline)`
     );
   }
 
@@ -2618,7 +2641,7 @@ app.post('/api/offer', async (req, res) => {
     source: channelSource,
     level: 'info',
     title: 'Offer requested',
-    detail: `€${money(price)} · ${publisher} · ${pageTitle}`,
+    detail: `${CUR}${money(price)} · ${publisher} · ${pageTitle}`,
     data: {
       price,
       publisher,
@@ -2731,7 +2754,7 @@ app.post('/api/offer', async (req, res) => {
       source: 'adserver.agent',
       level: 'error',
       title: 'Offer rejected · budget exhausted',
-      detail: `Remaining budget €${money(ledger.advertiser.budget)} · requested €${money(price)}`
+      detail: `Remaining budget ${CUR}${money(ledger.advertiser.budget)} · requested ${CUR}${money(price)}`
     });
     return res.status(402).json({
       error: 'ADVERTISER_BUDGET_EXHAUSTED',
@@ -2900,7 +2923,7 @@ app.post('/api/offer', async (req, res) => {
     source: 'adserver.agent',
     level: 'ok',
     title: `Advertiser rotation · ${creative.sponsor}`,
-    detail: `${slotKey} · ${placement.reason} · budget left €${money(placement.advertiser.budgetRemaining - price)}`,
+    detail: `${slotKey} · ${placement.reason} · budget left ${CUR}${money(placement.advertiser.budgetRemaining - price)}`,
     data: {
       slotKey,
       reason: placement.reason,
@@ -3041,7 +3064,7 @@ app.post('/api/offer', async (req, res) => {
     detail:
       `${Math.round(offer.split.userRate * 100)}% reader / ` +
       `${Math.round(offer.split.publisherRate * 100)}% publisher · ` +
-      `€${money(offer.split.user)} / €${money(offer.split.publisher)}`,
+      `${CUR}${money(offer.split.user)} / ${CUR}${money(offer.split.publisher)}`,
     data: {
       offerId: offer.id,
       contractOfferId: L402_OFFER_ID,
@@ -3056,8 +3079,8 @@ app.post('/api/offer', async (req, res) => {
   });
 
   console.log(
-    `[offer] approved ${String(evaluation.score).padStart(3)}/100 · €${money(offer.price)} ` +
-    `→ €${money(offer.split.user)} user / €${money(offer.split.publisher)} publisher · ${agent.id}`
+    `[offer] approved ${String(evaluation.score).padStart(3)}/100 · ${CUR}${money(offer.price)} ` +
+    `→ ${CUR}${money(offer.split.user)} user / ${CUR}${money(offer.split.publisher)} publisher · ${agent.id}`
   );
 
   // Same trigger as the L402 settle route: once a credited impression pushes
@@ -3080,6 +3103,9 @@ app.post('/api/offer', async (req, res) => {
     flags: evaluation.flags,
     checks: evaluation.checks,
     factors: evaluation.factors,
+    // The denomination of `price` and `split`, so a client never has to guess
+    // which glyph to render.
+    currency: config.currency,
     split: offer.split,
     creative: creativePayload(creative),
     agent,
@@ -3254,7 +3280,7 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     const messages = {
       PAYOUT_IN_PROGRESS: 'A payout is already in progress on the other rail.',
       THRESHOLD_NOT_REACHED:
-        `Payout threshold of €${money(prepared.threshold)} not reached: €${money(prepared.missing)} short.`,
+        `Payout threshold of ${CUR}${money(prepared.threshold)} not reached: ${CUR}${money(prepared.missing)} short.`,
       AMOUNT_TOO_SMALL: prepared.message
     };
     const message = messages[prepared.reason] || 'Payout not available.';
@@ -3295,9 +3321,9 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
     level: 'info',
     title: auto ? 'Payout triggered automatically' : 'PayPal payout requested',
     detail:
-      `${reservation.reference} · €${money(reservation.userAmount)} reader` +
+      `${reservation.reference} · ${CUR}${money(reservation.userAmount)} reader` +
       (reservation.publisherAmount >= 0.01
-        ? ` + €${money(reservation.publisherAmount)} publisher`
+        ? ` + ${CUR}${money(reservation.publisherAmount)} publisher`
         : '') +
       ' → PayPal',
     data: {
@@ -3512,11 +3538,11 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
      * and concluding the sender paid twice.
      */
     detail:
-      `€${money(batch.amount)} ${batch.currency} total · ` +
-      `reader €${money(readerLeg)} / publisher €${money(publisherLeg)} · ` +
+      `${CUR}${money(batch.amount)} ${batch.currency} total · ` +
+      `reader ${CUR}${money(readerLeg)} / publisher ${CUR}${money(publisherLeg)} · ` +
       `1 debit · ${batch.batchId} ${batch.status}` +
       (reservation.reconciliation.carried.gross > 0
-        ? ` · €${money(reservation.reconciliation.carried.gross)} carried (sub-cent)`
+        ? ` · ${CUR}${money(reservation.reconciliation.carried.gross)} carried (sub-cent)`
         : ' · cent-exact'),
     data: {
       trigger,
@@ -3546,8 +3572,8 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
   });
 
   console.log(
-    `[payout] ${batch.batchId} ${batch.status} · €${money(batch.amount)} ${batch.currency} total` +
-      ` · reader €${money(readerLeg)} / publisher €${money(publisherLeg)} · 1 debit` +
+    `[payout] ${batch.batchId} ${batch.status} · ${CUR}${money(batch.amount)} ${batch.currency} total` +
+      ` · reader ${CUR}${money(readerLeg)} / publisher ${CUR}${money(publisherLeg)} · 1 debit` +
       (auto ? ` · auto (${reason})` : '')
   );
 
@@ -3629,8 +3655,8 @@ async function runSolanaPayout({ auto = false, reason = 'manual', paymentHash = 
   }
 
   // The ledger is stored in integer micro-euros. Solana's quantum is one base
-  // unit, i.e. `1 / unitsPerEuro` euros, which for native SOL (1e8 units/€) is
-  // 1e-8 € — finer than a micro. Quantising to the nearest representable micro
+  // unit, i.e. `1 / unitsPerEuro` euros, which for native SOL (1e8 units/$) is
+  // 1e-8 $ — finer than a micro. Quantising to the nearest representable micro
   // (100 lamports) keeps the reservation and the transfer identical, and the
   // residual is reported by `solana.splitUnits` rather than hidden.
   const unitsPerEuro = Math.max(1, Number(config.solana.unitsPerEuro) || 1);
@@ -3650,7 +3676,7 @@ async function runSolanaPayout({ auto = false, reason = 'manual', paymentHash = 
     const messages = {
       PAYOUT_IN_PROGRESS: 'A payout is already in progress on the other rail.',
       THRESHOLD_NOT_REACHED:
-        `Payout threshold of €${money(prepared.threshold)} not reached: €${money(prepared.missing)} short.`,
+        `Payout threshold of ${CUR}${money(prepared.threshold)} not reached: ${CUR}${money(prepared.missing)} short.`,
       AMOUNT_TOO_SMALL: prepared.message
     };
     const message = messages[prepared.reason] || 'Payout not available.';
@@ -4029,7 +4055,7 @@ function queueAutoPayout(
       source: 'ledger',
       level: 'info',
       title: 'Auto payout skipped · reader not present',
-      detail: `€${money(ledger.user.balance)} stays on the ledger until a live session settles it.`,
+      detail: `${CUR}${money(ledger.user.balance)} stays on the ledger until a live session settles it.`,
       data: { trigger: 'auto', reason, rail: selected, sessionId: String(sessionId || '').slice(0, 24) }
     });
     return;
@@ -4355,14 +4381,26 @@ function printBanner(port) {
   console.log(`  Terminal   ${base}/terminal/`);
   console.log(`  Logs       ${base}/api/logs  (SSE)`);
   console.log(`  Split      ${Math.round(config.userShare * 100)}% user · ${Math.round(config.publisherShare * 100)}% publisher`);
-  console.log(`  Threshold  €${money(config.payoutThreshold)} · offer cap €${money(config.maxOfferPrice)}`);
+  console.log(`  Threshold  ${CUR}${money(config.payoutThreshold)} · offer cap ${CUR}${money(config.maxOfferPrice)}`);
   console.log(
-    `  Price      €${money(config.defaultOfferPrice)} per impression · ` +
-      `reader €${money(config.defaultOfferPrice * config.userShare)} / ` +
-      `publisher €${money(config.defaultOfferPrice * config.publisherShare)}`
+    `  Price      ${CUR}${money(config.defaultOfferPrice)} per impression · ` +
+      `reader ${CUR}${money(config.defaultOfferPrice * config.userShare)} / ` +
+      `publisher ${CUR}${money(config.defaultOfferPrice * config.publisherShare)}`
   );
   if (config.pricingCorrection) {
     console.log(`  Note       ${config.pricingCorrection}`);
+  }
+  /*
+   * A platform environment can still pin `PAYPAL_CURRENCY` to the old code, and
+   * that silently wins over the repository default: the UI would print one
+   * glyph while the batch carried another. Surface it on stdout instead of
+   * letting the demo look broken for no visible reason.
+   */
+  if (String(config.paypal.currency).toUpperCase() !== String(config.currency).toUpperCase()) {
+    console.log(
+      `  Note       PAYPAL_CURRENCY=${config.paypal.currency} differs from CURRENCY=${config.currency}; ` +
+        'batches will settle in the former. Set both to the same code.'
+    );
   }
   const payoutPlan = planRecipients({ paypal: config.paypal });
   console.log(

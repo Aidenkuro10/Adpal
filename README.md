@@ -36,7 +36,7 @@ directly between the three parties who create the value.
 
 The claim is mechanical, not rhetorical:
 
-- The ledger stores **integer micro-euros** and computes
+- The ledger stores **integer micro-units** of the active currency and computes
   `reader = round(gross × 0.70)`, `publisher = gross − reader`, so
   `reader + publisher === gross` cannot fail.
 - A settlement publishes `accounting.readerConserved` and
@@ -73,7 +73,7 @@ unbounded authority over money.
 
 Each brand is represented by a named autonomous buyer with its own campaign
 budget, objective, and markets — Northbound Coffee (`agt_northbound_01`,
-reader-acquisition, EUR 18.00), Lumen Audio (`agt_lumen_02`, consideration, EUR
+reader-acquisition, USD 18.00), Lumen Audio (`agt_lumen_02`, consideration, USD
 14.00), Terrace Greens, Halden Optics, Field Notes Press. The roster lives in
 `server/src/creatives.js`, and the terminal prints the agent identity beside the
 creative so a judge can match an ad to the agent that paid for it.
@@ -274,7 +274,7 @@ attention already justified.
    |          +--- verified human -------+                  |
    |              attention proof                           |
    |                                                        |
-   |   ledger: integer micro-euros, 1:1 invariants          |
+   |   ledger: integer micro-units, 1:1 invariants          |
    +--------------------------------------------------------+
                 |                            |
           70%   v                      30%   v
@@ -335,8 +335,8 @@ Open **http://localhost:3000/demo/** and read for a few seconds. Then open
 **http://localhost:3000/terminal/** beside it: the bid reasoning, the attention
 narrative, the 70/30 split and the payout batch appear as they happen.
 
-The shipped baseline prices one impression at **€1.00**, so every approved
-settlement moves **€0.70 to the reader and €0.30 to the publisher** — enough for
+The shipped baseline prices one impression at **$1.00**, so every approved
+settlement moves **$0.70 to the reader and $0.30 to the publisher** — enough for
 Sandbox balances to change visibly on a single impression, and both legs are
 whole cents, so nothing is held back as rounding.
 
@@ -388,9 +388,10 @@ materially.
 | `PORT` | `3000` | HTTP port. The platform's `$PORT` wins when injected |
 | `PUBLIC_BASE_URL` | `RENDER_EXTERNAL_URL` | Base URL embedded in the 402 contract and webhook checks |
 | `USER_SHARE` | `0.7` | Reader share. Publisher share is `1 − USER_SHARE` |
-| `PAYOUT_THRESHOLD` | `0.05` | Minimum reader balance for a payout. `server/.env.example` ships `0.005`, so the first €0.70 credit settles immediately |
+| `CURRENCY` | `USD` | Application currency (ISO 4217). Read by `/api/health`, the L402 contract, the payout payload and every UI glyph |
+| `PAYOUT_THRESHOLD` | `0.05` | Minimum reader balance for a payout. `server/.env.example` ships `0.005`, so the first $0.70 credit settles immediately |
 | `MAX_OFFER_PRICE` | `1.00` | Hard ceiling on a single impression bid. Must be `>= DEFAULT_OFFER_PRICE` |
-| `DEFAULT_OFFER_PRICE` | `1.00` | Unit price of one impression: €0.70 to the reader, €0.30 to the publisher |
+| `DEFAULT_OFFER_PRICE` | `1.00` | Unit price of one impression: $0.70 to the reader, $0.30 to the publisher |
 | `HUMAN_THRESHOLD` | `50` | Minimum attention score for approval |
 | `PRESENCE_TTL_MS` | `12000` | How long a reader session stays live without a heartbeat |
 | `PAYOUT_RAIL` | `paypal_payouts` | `paypal_payouts` or `solana-devnet` |
@@ -407,10 +408,11 @@ materially.
 | `PAYPAL_SENDER_ALIASES` | *(empty)* | Other confirmed emails on the payer account, comma-separated |
 | `PAYPAL_RECEIVER_EMAIL` | payer email | Reader recipient. Must be a different account |
 | `PAYPAL_PUBLISHER_EMAIL` | *(empty)* | Publisher recipient. Empty means the 30% stays accrued |
+| `PAYPAL_CURRENCY` | `$CURRENCY` (`USD`) | ISO code sent in the batch payload. Should match `CURRENCY` |
 | `PAYPAL_WEBHOOK_ID` | *(empty)* | Enables signature verification of payout webhooks |
 | `PAYPAL_WEBHOOK_STRICT` | `false` | `true` refuses unverified webhooks with `503` |
 | `SOLANA_ENABLED` | `true` | Enable the Devnet rail |
-| `SOLANA_UNITS_PER_EUR` | `100000000` | Base units per EUR: `1e8` lamports = 0.1 SOL per euro |
+| `SOLANA_UNITS_PER_FIAT` | `100000000` | Base units per whole currency unit: `1e8` lamports = 0.1 SOL per $1.00. `SOLANA_UNITS_PER_EUR` is still honoured |
 | `SOLANA_ANCHOR_PROOFS` | `true` | Anchor `sha256(preimage)` on-chain when an invoice settles |
 | `L402_TTL_MS` | `300000` | Payment-context lifetime before it expires |
 
@@ -488,7 +490,7 @@ so every negotiation is inspectable and idempotent on retry.
   "receipt": {
     "reference": "l402_9f3c1a2b",
     "amount": 1,
-    "currency": "EUR",
+    "currency": "USD",
     "score": 99,
     "verdict": "human",
     "split": { "user": 0.7, "publisher": 0.3 }
@@ -520,7 +522,7 @@ server/
     paypal-agent-toolkit.js  MCP-shaped agent tools over the official toolkit
     l402.js                  HMAC-chained macaroon issue and verification
     l402-contract.js         402 envelope and payment-context state machine
-    ledger.js                Integer micro-euro accounts, split, reversals
+    ledger.js                Integer micro-unit accounts, split, reversals
     payout-recipients.js     Recipient planning; refuses self-payment
     paypal.js                OAuth2, Payouts, webhook signature verification
     webhook-reconciler.js    Hold-and-replay event matching

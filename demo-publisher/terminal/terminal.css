@@ -1153,7 +1153,7 @@ pre,
   border-bottom-color: #cfe4ff;
 }
 
-/* Rail accent for the devnet money badge (◎ rather than €). */
+/* Rail accent for the devnet money badge (◎ rather than $). */
 .entry[data-money="true"] .entry-money:not(:empty) {
   font-variant-numeric: tabular-nums;
 }

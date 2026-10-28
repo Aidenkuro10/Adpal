@@ -36,6 +36,9 @@
 
 const config = require('./config');
 
+/** Glyph for the configured currency, used by every prose amount below. */
+const CUR = config.currencySymbol(config.currency);
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -450,11 +453,11 @@ function buildBidRationale({
   const audience = `Objective ${objective} suits ${articleOf(profile.pageType)} ${profile.pageType} audience at ${pct(audienceFit)} affinity.`;
 
   const money = affordable
-    ? `€${price.toFixed(3)} is ${pct(budgetShare, 1)} of the €${budget.toFixed(2)} still authorised, inside the €${config.maxOfferPrice.toFixed(2)} cap.`
-    : `€${price.toFixed(3)} exceeds the €${budget.toFixed(2)} left in the campaign, so the price cannot be authorised.`;
+    ? `${CUR}${price.toFixed(3)} is ${pct(budgetShare, 1)} of the ${CUR}${budget.toFixed(2)} still authorised, inside the ${CUR}${config.maxOfferPrice.toFixed(2)} cap.`
+    : `${CUR}${price.toFixed(3)} exceeds the ${CUR}${budget.toFixed(2)} left in the campaign, so the price cannot be authorised.`;
 
   const verdict = decision === 'bid'
-    ? `Relevance ${relevance.toFixed(2)} clears the ${floor.toFixed(2)} floor — bidding €${price.toFixed(3)}.`
+    ? `Relevance ${relevance.toFixed(2)} clears the ${floor.toFixed(2)} floor — bidding ${CUR}${price.toFixed(3)}.`
     : !affordable
       ? 'Declining: the campaign budget cannot cover this impression.'
       : `Relevance ${relevance.toFixed(2)} is under the ${floor.toFixed(2)} floor — declining rather than paying for a weak match.`;
@@ -476,7 +479,7 @@ function bidSteps({ profile, candidate, price, floor, scored }) {
     scored.evidence.length
       ? `Topical overlap → ${scored.evidence.slice(0, 4).join(', ')}`
       : 'Topical overlap → none; priced as reach inventory',
-    `Budget check · €${price.toFixed(3)} of €${scored.budgetRemaining.toFixed(2)} (${pct(scored.budgetShare, 1)}) → ${scored.affordable ? 'authorised' : 'insufficient'}`,
+    `Budget check · ${CUR}${price.toFixed(3)} of ${CUR}${scored.budgetRemaining.toFixed(2)} (${pct(scored.budgetShare, 1)}) → ${scored.affordable ? 'authorised' : 'insufficient'}`,
     `Rank relevance ${scored.relevance.toFixed(3)} against floor ${floor.toFixed(2)} → ${scored.verdict}`
   ];
 }
@@ -505,7 +508,7 @@ function localNegotiation({ page, price, candidates, floor }) {
   const steps = [];
 
   steps.push(
-    `Ingest placement · €${price.toFixed(3)} · ${profile.host} · ${candidates.length} eligible advertiser${candidates.length === 1 ? '' : 's'}`
+    `Ingest placement · ${CUR}${price.toFixed(3)} · ${profile.host} · ${candidates.length} eligible advertiser${candidates.length === 1 ? '' : 's'}`
   );
   steps.push(
     `Classify page · “${profile.title}” → ${profile.pageType} (${profile.wordCount} title words, ${profile.tokens.length} tokens)`
@@ -517,7 +520,7 @@ function localNegotiation({ page, price, candidates, floor }) {
   }
   steps.push(
     winner
-      ? `Award the slot to ${winner.sponsor} · highest relevant bid at €${winner.bid.toFixed(3)}`
+      ? `Award the slot to ${winner.sponsor} · highest relevant bid at ${CUR}${winner.bid.toFixed(3)}`
       : 'No advertiser cleared the floor · recommend withholding the impression'
   );
 
@@ -546,11 +549,11 @@ function buildBidPrompt({ profile, price, floor, bids }) {
   return [
     'You are the advertiser bidding agent for an attention marketplace.',
     `Page: "${profile.title}" on ${profile.host} (${profile.pageType}).`,
-    `Placement price: EUR ${price.toFixed(3)}. Relevance floor: ${floor.toFixed(2)}.`,
+    `Placement price: ${config.currency} ${price.toFixed(3)}. Relevance floor: ${floor.toFixed(2)}.`,
     'Candidates:',
     ...bids.map(
       (bid) =>
-        `- ${bid.agentId} (${bid.sponsor}, objective ${bid.objective}) budget EUR ${bid.budgetRemaining.toFixed(2)}`
+        `- ${bid.agentId} (${bid.sponsor}, objective ${bid.objective}) budget ${config.currency} ${bid.budgetRemaining.toFixed(2)}`
     ),
     'For each candidate decide bid or decline and justify it in one short paragraph.',
     'Return JSON: {"bids":[{"agentId":"","relevance":0,"verdict":"bid|decline","rationale":""}],"winnerId":""}'

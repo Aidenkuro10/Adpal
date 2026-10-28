@@ -44,8 +44,8 @@
   let negotiatedPrice = null;
 
   const CONFIG = {
-    // One impression is priced at €1.00, so the 70/30 split credits €0.70 to
-    // the reader and €0.30 to the publisher on every approved settlement.
+    // One impression is priced at $1.00, so the 70/30 split credits $0.70 to
+    // the reader and $0.30 to the publisher on every approved settlement.
     price: 1,
 
     /* Measurement window */
@@ -464,6 +464,9 @@
         }
 
         const data = response.data || {};
+        // The offer payload carries the denomination (and the ledger snapshot);
+        // adopt it before rendering any amount.
+        activeCurrency = String(data.currency || data.balance?.currency || activeCurrency).toUpperCase();
         const approved = Boolean(data.approved);
 
         ui.lastOutcome = {
@@ -502,7 +505,7 @@
           emitClientEvent(
             'ok',
             'Creative delivered',
-            `placement ${runtime.label()} · ${data.creative?.sponsor || 'Sponsored'} · reader credited €${money(ui.lastReward)}`
+            `placement ${runtime.label()} · ${data.creative?.sponsor || 'Sponsored'} · reader credited ${cash(ui.lastReward)}`
           );
         } else {
           ui.phase = 'rejected';
@@ -593,7 +596,7 @@
           emitClientEvent(
             'info',
             'Price renegotiated',
-            `server cap €${money(cap)} · asking again`
+            `server cap ${cash(cap)} · asking again`
           );
           response = await post('/api/offer', payload);
         }
@@ -1366,6 +1369,27 @@
 
   function round3(value) {
     return Number(clamp(value, 0, 1).toFixed(3));
+  }
+
+  /*
+   * The demo page's money glyph. `/api/health` publishes `currency`, so the
+   * banner can follow the server instead of hardcoding a symbol that stops
+   * being true the moment the deployment's currency changes.
+   */
+  let activeCurrency = 'USD';
+
+  function currencySymbol(currency = activeCurrency) {
+    const code = String(currency || 'USD').toUpperCase();
+    if (code === 'USD') return '$';
+    if (code === 'EUR') return '€';
+    if (code === 'GBP') return '£';
+    if (code === 'SOL') return '◎';
+    return `${code} `;
+  }
+
+  /** Format an amount with the active currency glyph. */
+  function cash(value) {
+    return `${currencySymbol()}${money(value)}`;
   }
 
   function money(value) {

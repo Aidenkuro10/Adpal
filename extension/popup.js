@@ -14,8 +14,24 @@ let flushing = false;
 let lastOnline = false;
 let lastServerUrl = 'http://localhost:3000';
 let feedbackTimer = null;
+/*
+ * The currency the server reports. Every amount in the popup is rendered
+ * through `currencySymbol`, so switching the backend's rail currency (USD
+ * baseline) never leaves a stale glyph in the UI.
+ */
+let activeCurrency = 'USD';
 
 const $ = (id) => document.getElementById(id);
+
+/** Glyph for an ISO currency code; non-fiat codes fall back to the code. */
+function currencySymbol(currency = activeCurrency) {
+  const code = String(currency || 'USD').toUpperCase();
+  if (code === 'USD') return '$';
+  if (code === 'EUR') return '€';
+  if (code === 'GBP') return '£';
+  if (code === 'SOL') return '◎';
+  return `${code} `;
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   $('flush').addEventListener('click', flushPayout);
@@ -100,11 +116,18 @@ function renderBalance(balance, online) {
   const threshold = toNumber(balance.threshold ?? rules.threshold, 0.1);
   const userBalance = toNumber(user.balance, 0);
 
+  // Follow the server's active currency instead of assuming one, so the glyph
+  // in the popup cannot disagree with the batch that is actually sent.
+  activeCurrency = String(balance.currency || rules.currency || activeCurrency || 'USD').toUpperCase();
+  const symbol = currencySymbol();
+  const currencyGlyph = document.querySelector('.balance .currency');
+  if (currencyGlyph) currencyGlyph.textContent = symbol;
+
   setText('user-balance', money(userBalance));
-  setText('publisher-balance', `€${money(toNumber(publisher.balance, 0))}`);
+  setText('publisher-balance', `${symbol}${money(toNumber(publisher.balance, 0))}`);
   setText(
     'advertiser-budget',
-    Number.isFinite(Number(advertiser.budget)) ? `€${money(advertiser.budget, 2)}` : '—'
+    Number.isFinite(Number(advertiser.budget)) ? `${symbol}${money(advertiser.budget, 2)}` : '—'
   );
   setText('offers-count', String(toNumber(user.offersAccepted, 0)));
 
@@ -114,7 +137,7 @@ function renderBalance(balance, online) {
 
   $('threshold-fill').style.width = `${percent}%`;
   $('threshold-progress').setAttribute('aria-valuenow', String(Math.round(percent)));
-  setText('threshold-label', `€${money(userBalance)} / €${money(threshold)}`);
+  setText('threshold-label', `${symbol}${money(userBalance)} / ${symbol}${money(threshold)}`);
   setText('threshold-percent', `${Math.floor(percent)}%`);
 
   const ready = userBalance + 1e-9 >= threshold;
@@ -126,8 +149,8 @@ function renderBalance(balance, online) {
   } else {
     button.disabled = !ready || !online;
     button.textContent = ready
-      ? `Pay out €${money(userBalance)}`
-      : `Threshold: €${money(threshold)}`;
+      ? `Pay out ${symbol}${money(userBalance)}`
+      : `Threshold: ${symbol}${money(threshold)}`;
   }
 
   renderLastCheck(balance, online);
@@ -164,11 +187,12 @@ function renderLastCheck(balance, online) {
 function renderRules(rules, threshold) {
   const list = $('rules');
   list.replaceChildren();
+  const symbol = currencySymbol();
 
   const items = [
-    ['Maximum price per offer', `€${money(toNumber(rules.maxPrice, 1))}`],
+    ['Maximum price per offer', `${symbol}${money(toNumber(rules.maxPrice, 1))}`],
     ['Your share', `${Math.round(toNumber(rules.userShare, 0.7) * 100)}%`],
-    ['Grouped payout threshold', `€${money(threshold)}`],
+    ['Grouped payout threshold', `${symbol}${money(threshold)}`],
     ['Minimum attention score', `${Math.round(toNumber(rules.humanThreshold, 50))}/100`],
     ['Activation', 'Automatic · passive'],
     ['Data transmitted', 'Aggregated signals']
@@ -207,7 +231,7 @@ function renderActivity(balance) {
     const badge = document.createElement('span');
     badge.className = `badge ${offer.approved ? 'ok' : 'ko'}`;
     badge.textContent = offer.approved
-      ? `+€${money(toNumber(offer.split?.user, 0))}`
+      ? `+${currencySymbol()}${money(toNumber(offer.split?.user, 0))}`
       : 'Rejected';
 
     const meta = document.createElement('div');
@@ -227,11 +251,12 @@ function renderActivity(balance) {
 }
 
 function renderEmpty(online) {
+  const symbol = currencySymbol();
   setText('user-balance', '0.000');
-  setText('publisher-balance', '€0.000');
+  setText('publisher-balance', `${symbol}0.000`);
   setText('advertiser-budget', '—');
   setText('offers-count', '0');
-  setText('threshold-label', '€0.000 / €0.100');
+  setText('threshold-label', `${symbol}0.000 / ${symbol}0.100`);
   setText('threshold-percent', '0%');
 
   $('threshold-fill').style.width = '0%';
@@ -239,7 +264,7 @@ function renderEmpty(online) {
 
   const button = $('flush');
   button.disabled = true;
-  button.textContent = 'Threshold: €0.100';
+  button.textContent = `Threshold: ${symbol}0.100`;
 
   setText('last-score', '—');
   $('score-fill').style.width = '0%';
@@ -277,20 +302,21 @@ async function flushPayout() {
     const batch = response.data.paypal || payout.paypal || {};
     const chain = response.data.solana || payout.solana || {};
     const amount = toNumber(payout.userAmount, 0);
+    const symbol = currencySymbol();
     if (chain.signature) {
       // The devnet rail returns a transaction signature rather than a batch id;
       // show it truncated, the terminal has the full explorer link.
       const signature = String(chain.signature);
       showFeedback(
         `Solana ${chain.pending ? 'pending' : String(chain.status || 'confirmed').toLowerCase()} · ` +
-          `${signature.slice(0, 8)}…${signature.slice(-6)} · €${money(amount)}`,
+          `${signature.slice(0, 8)}…${signature.slice(-6)} · ${symbol}${money(amount)}`,
         true
       );
     } else {
       showFeedback(
         batch.batchId
-          ? `PayPal ${String(batch.status || 'PENDING').toLowerCase()} · batch ${batch.batchId} · €${money(amount)}`
-          : `Payout of €${money(amount)} sent (ref. ${payout.id || '—'}).`,
+          ? `PayPal ${String(batch.status || 'PENDING').toLowerCase()} · batch ${batch.batchId} · ${symbol}${money(amount)}`
+          : `Payout of ${symbol}${money(amount)} sent (ref. ${payout.id || '—'}).`,
         true
       );
     }

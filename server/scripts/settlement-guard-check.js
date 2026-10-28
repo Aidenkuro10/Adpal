@@ -32,7 +32,7 @@ function check(label, condition, detail = '') {
 }
 
 const config = {
-  currency: 'EUR',
+  currency: 'USD',
   advertiserBudget: 62,
   userShare: 0.7,
   publisherShare: 0.3,

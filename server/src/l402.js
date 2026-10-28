@@ -19,6 +19,7 @@
  */
 
 const { createHmac, randomBytes, createHash, timingSafeEqual } = require('crypto');
+const config = require('./config');
 
 class L402Issuer {
   /**
@@ -80,7 +81,7 @@ class L402Issuer {
       `agent_id=${agentId}`,
       `publisher=${publisher}`,
       `max_price=${round4(price)}`,
-      `currency=EUR`,
+      `currency=${config.currency}`,
       `issued_at=${new Date(issuedAtMs).toISOString()}`,
       `expires_at=${new Date(expiresAtMs).toISOString()}`,
       `attenuation=viewport-gated`

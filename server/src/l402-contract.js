@@ -63,7 +63,7 @@ const OFFERS = Object.freeze([
     description: '70% reader split / 30% publisher split upon human attention proof',
     // Same price the extension requests: one advertiser bid drives both paths.
     amount: config.defaultOfferPrice,
-    currency: 'EUR',
+    currency: config.currency,
     payment_methods: Object.freeze(['paypal_payouts'])
   }),
   Object.freeze({
@@ -74,9 +74,9 @@ const OFFERS = Object.freeze([
     // A session is a flat fee at the same unit price as one impression: the
     // 12-impression allowance is a volume benefit, not a 12x invoice. Keeping
     // the invoice at one unit price means every settlement stays inside the
-    // per-payout caps and splits to the same €0.70 / €0.30.
+    // per-payout caps and splits to the same $0.70 / $0.30.
     amount: config.defaultOfferPrice,
-    currency: 'EUR',
+    currency: config.currency,
     type: 'session',
     duration: '1 hour',
     max_impressions: 12,

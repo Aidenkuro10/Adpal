@@ -491,7 +491,7 @@ async function createPayout(input) {
     /*
      * The sender's single debit, stated explicitly so no consumer adds the batch
      * total to its own item lines and reports a double charge. The batch total
-     * (€1.00) *is* the two items (€0.70 + €0.30); they are the same money.
+     * ($1.00) *is* the two items ($0.70 + $0.30); they are the same money.
      */
     senderDebit: {
       amount: total,

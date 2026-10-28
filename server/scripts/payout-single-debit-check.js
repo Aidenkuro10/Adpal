@@ -11,7 +11,7 @@
  *      idempotency guard collapses it into the batch that already exists;
  *   2. that guard (`DUPLICATE_REQUEST_ID`) is read as success, so the ledger
  *      commits instead of cancelling the reservation and re-paying;
- *   3. committing a EUR 1.00 settlement debits the sender exactly once, and the
+ *   3. committing a USD 1.00 settlement debits the sender exactly once, and the
  *      recorded items sum back to the batch total rather than on top of it.
  *
  * Also checks the timeout path: an unconfirmed batch must not be cancelled,
@@ -88,7 +88,7 @@ function check(label, condition, detail = '') {
 }
 
 const ledgerConfig = {
-  currency: 'EUR',
+  currency: 'USD',
   advertiserBudget: 62,
   userShare: 0.7,
   publisherShare: 0.3,
@@ -103,7 +103,7 @@ const ledgerConfig = {
 const READER = 'reader@example.com';
 const PUBLISHER = 'publisher@example.com';
 
-function fundOneEuro(ledger) {
+function fundOneImpression(ledger) {
   ledger.creditOffer({
     price: 1,
     score: 99,
@@ -114,7 +114,7 @@ function fundOneEuro(ledger) {
   });
 }
 
-/** The exact split the batch must carry: EUR 0.70 reader + EUR 0.30 publisher. */
+/** The exact split the batch must carry: USD 0.70 reader + USD 0.30 publisher. */
 const SPLIT_ITEMS = [
   { receiver: READER, amount: 0.7, note: 'Reader share 70%' },
   { receiver: PUBLISHER, amount: 0.3, note: 'Publisher share 30%' }
@@ -141,7 +141,7 @@ const SPLIT_ITEMS = [
   calls.length = 0;
   const created = await paypal.createPayout({
     items: SPLIT_ITEMS,
-    currency: 'EUR',
+    currency: 'USD',
     reference: 'ADPAL-M6ABCDEF'
   });
 
@@ -164,7 +164,7 @@ const SPLIT_ITEMS = [
   calls.length = 0;
   const duplicate = await paypal.createPayout({
     items: SPLIT_ITEMS,
-    currency: 'EUR',
+    currency: 'USD',
     reference: 'ADPAL-M6ABCDEF'
   });
 
@@ -182,7 +182,7 @@ const SPLIT_ITEMS = [
   /* ---------------------------------------------------------------- */
   scenario = 'created';
   const ledger = new Ledger(ledgerConfig);
-  fundOneEuro(ledger);
+  fundOneImpression(ledger);
 
   const prepared = ledger.preparePayout({ maxAmount: 5, payPublisher: true });
   check('a 1.00 settlement is payable', prepared.ok === true, prepared.reason || '');
@@ -193,7 +193,7 @@ const SPLIT_ITEMS = [
 
   const batch = await paypal.createPayout({
     items: SPLIT_ITEMS,
-    currency: 'EUR',
+    currency: 'USD',
     reference: prepared.reservation.reference
   });
 
@@ -239,7 +239,7 @@ const SPLIT_ITEMS = [
   try {
     await paypal.createPayout({
       items: SPLIT_ITEMS,
-      currency: 'EUR',
+      currency: 'USD',
       reference: 'ADPAL-TIMEOUT1'
     });
   } catch (error) {

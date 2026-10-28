@@ -513,8 +513,12 @@
             `placement ${runtime.label()} · ${data.reason || 'Attention signal below threshold.'}`
           );
         }
-      } finally {
-        coordinator.busy = false;
+    } finally {
+      // This impression window is over, whatever its outcome. Clearing the id
+      // means the *next* impression negotiates with a fresh identity instead of
+      // being replayed as a duplicate of the one just settled.
+      impressionId = '';
+      coordinator.busy = false;
         announce();
       }
     }
@@ -527,9 +531,33 @@
      * flight, so the agent re-beats presence and asks once more before treating
      * the refusal as final — the reader never sees a spurious empty slot.
      */
+    /*
+     * One identity per impression. `requestOffer` is called once per
+     * measurement window and retries inside it, so the id is created lazily on
+     * first use and cleared when the window closes.
+     */
+    let impressionId = '';
+
+    function newImpressionId() {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+      }
+      return `imp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    }
+
     async function requestOffer(signals) {
+      /*
+       * A stable id for THIS impression, reused by both recovery attempts below.
+       *
+       * The server credits money and triggers a payout for every approved
+       * offer, so a retry that was not identifiable as a retry would sell the
+       * same impression twice. The id is generated once, before the first
+       * attempt, and travels with every retry of this measurement window.
+       */
+      if (!impressionId) impressionId = newImpressionId();
       const payload = {
         clientId: sessionId,
+        impressionId,
         channel: 'web',
         price: negotiatedPrice ?? CONFIG.price,
         signals,

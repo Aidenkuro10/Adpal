@@ -14,6 +14,7 @@
     "check:webhooks:signature": "node scripts/webhook-signature-check.js",
     "check:self-pay": "node scripts/self-pay-check.js",
     "check:single-debit": "node scripts/payout-single-debit-check.js",
+    "check:settlement-guard": "node scripts/settlement-guard-check.js",
     "check:paypal-env": "node scripts/paypal-env-check.js",
     "check:stream": "node scripts/sse-latency.js"
   },

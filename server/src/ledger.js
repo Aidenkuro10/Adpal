@@ -117,6 +117,20 @@ class Ledger {
     this.payouts = [];
     // A payout awaiting the PayPal API response (see preparePayout/commit).
     this.pendingPayout = null;
+    /*
+     * Impression-level settlement bookkeeping — the strict guard against a
+     * double payout.
+     *
+     * `claimedOffers` holds impressions whose money is reserved by an in-flight
+     * payout; `settledOffers` holds those already paid. A payout is only legal
+     * for impressions in neither set, so one impression can be paid exactly
+     * once no matter how many triggers fire or how many times a client retries.
+     */
+    this.claimedOffers = new Set();
+    this.settledOffers = new Set();
+    // Monotonic count of committed payouts, reported by /api/health so "one
+    // payout per impression" is observable rather than asserted.
+    this.payoutExecutions = 0;
     return this;
   }
 
@@ -142,6 +156,23 @@ class Ledger {
       initialBudget: round6(fromMicros(this._m.advertiserInitial)),
       spent: round6(fromMicros(this._m.advertiserSpent))
     };
+  }
+
+  /**
+   * Approved impressions whose money has not been paid out yet.
+   *
+   * This is the set a payout is allowed to settle. `claimedOffers` is excluded
+   * as well as `settledOffers`, so two triggers racing each other cannot both
+   * reserve the same impression.
+   */
+  unsettledOfferIds() {
+    const ids = [];
+    for (const offer of this.offers) {
+      if (!offer?.approved) continue;
+      if (this.settledOffers.has(offer.id) || this.claimedOffers.has(offer.id)) continue;
+      ids.push(offer.id);
+    }
+    return ids;
   }
 
   /**
@@ -256,7 +287,15 @@ class Ledger {
         offersTotal: this.offers.length,
         payoutsTotal: this.payouts.length,
         payoutPending: Boolean(this.pendingPayout),
-        payoutRail: this.pendingPayout?.rail || this.payouts[this.payouts.length - 1]?.rail || null
+        payoutRail: this.pendingPayout?.rail || this.payouts[this.payouts.length - 1]?.rail || null,
+        // Impression-level settlement guard: how many approved impressions are
+        // still awaiting payment, and how many payouts have actually executed.
+        // `settled + unsettled` must equal the approved impressions, so a double
+        // payout shows up as a settled count that outruns the impressions.
+        payoutExecutions: this.payoutExecutions,
+        settledImpressions: this.settledOffers.size,
+        unsettledImpressions: this.unsettledOfferIds().length,
+        claimedImpressions: this.claimedOffers.size
       },
       accounting: this.audit(),
       recentOffers: this.offers.slice(-8).reverse(),
@@ -400,7 +439,14 @@ class Ledger {
     quantize = floorCents,
     minAmount = 0.01,
     minMicros: minMicrosOverride = null,
-    rail = 'paypal_payouts'
+    rail = 'paypal_payouts',
+    /*
+     * The impressions this payout is allowed to settle. Defaults to every
+     * approved offer that has not been settled yet, which is the set whose
+     * money the balances currently hold. Passed explicitly only by callers that
+     * already know which impressions they are paying.
+     */
+    settleOffers = null
   } = {}) {
     const thresholdMicros = toMicros(this.config.payoutThreshold);
     const capMicros = Number.isFinite(Number(maxAmount)) ? toMicros(maxAmount) : Infinity;
@@ -432,12 +478,86 @@ class Ledger {
       };
     }
 
-    const userPayable = quantum(Math.min(this._m.user, capMicros));
+    /*
+     * The strict impression guard.
+     *
+     * Every euro on the ledger was credited by an approved impression. A payout
+     * is therefore only legal when it settles impressions that are still
+     * outstanding: if the balance is payable but no unsettled impression backs
+     * it, the money has already been paid once and paying it again is exactly
+     * the double debit this guard exists to prevent. Refusing here — before a
+     * reservation exists — means the rail is never called a second time.
+     */
+    const outstanding = Array.isArray(settleOffers)
+      ? settleOffers.map((id) => String(id || '').trim()).filter(Boolean)
+      : this.unsettledOfferIds();
+
+    if (outstanding.length === 0) {
+      return {
+        ok: false,
+        reason: 'ALREADY_SETTLED',
+        message:
+          'This balance is backed only by impressions that have already been paid; ' +
+          'a second payout for them would debit the sender twice.',
+        threshold: this.config.payoutThreshold,
+        balance: round6(fromMicros(this._m.user)),
+        settledOffers: this.settledOffers.size
+      };
+    }
+
+    const alreadyPaid = outstanding.filter(
+      (id) => this.settledOffers.has(id) || this.claimedOffers.has(id)
+    );
+    if (alreadyPaid.length > 0) {
+      return {
+        ok: false,
+        reason: 'ALREADY_SETTLED',
+        message:
+          `Impression ${alreadyPaid[0]} was already settled (or is being settled now); ` +
+          'refusing to pay it a second time.',
+        threshold: this.config.payoutThreshold,
+        balance: round6(fromMicros(this._m.user)),
+        settledOffers: alreadyPaid
+      };
+    }
+
+    /*
+     * The amount follows the claimed impressions, not the raw balances.
+     *
+     * Gating legality alone is not enough: if a payout claimed impression A but
+     * paid the whole balance (which also holds impression B's money), then B's
+     * money would leave while B stayed "outstanding" — and the next trigger
+     * would pay B again. Capping each leg at the amount its claimed impressions
+     * actually credited keeps the debit and the claim describing the same
+     * money. The default (every outstanding impression) is unchanged, so the
+     * sub-cent carry still rides along with the next batch.
+     */
+    let legReaderMicros = null;
+    let legPublisherMicros = null;
+    if (Array.isArray(settleOffers)) {
+      legReaderMicros = 0;
+      legPublisherMicros = 0;
+      for (const id of outstanding) {
+        const offer = this.offers.find((entry) => entry.id === id);
+        if (!offer?.split?.micros) continue;
+        legReaderMicros += offer.split.micros.reader;
+        legPublisherMicros += offer.split.micros.publisher;
+      }
+    }
+
+    const readerCapMicros = legReaderMicros === null
+      ? this._m.user
+      : Math.min(this._m.user, legReaderMicros);
+    const publisherCapMicros = legPublisherMicros === null
+      ? this._m.publisher
+      : Math.min(this._m.publisher, legPublisherMicros);
+
+    const userPayable = quantum(Math.min(readerCapMicros, capMicros));
     // The publisher's 30% is only moved when the rail can address a second
     // recipient. Otherwise it stays on the ledger, where a monthly publisher
     // settlement can pick it up — it must never be debited without a transfer.
     const publisherCandidate = payPublisher
-      ? quantum(Math.min(this._m.publisher, capMicros))
+      ? quantum(Math.min(publisherCapMicros, capMicros))
       : 0;
     const publisherPayable = publisherCandidate >= minMicros ? publisherCandidate : 0;
 
@@ -512,6 +632,12 @@ class Ledger {
     };
 
     this.pendingPayout = reservation;
+    // Claim the impressions so a concurrent or repeated trigger cannot reserve
+    // the same money while this reservation is in flight. Released by
+    // `cancelPayout`, made permanent by `commitPayout`.
+    for (const id of outstanding) this.claimedOffers.add(id);
+    reservation.settlesOffers = outstanding;
+
     return { ok: true, reservation, threshold: this.config.payoutThreshold, balance: this.snapshot() };
   }
 
@@ -561,6 +687,10 @@ class Ledger {
   cancelPayout(reason = '') {
     const reservation = this.pendingPayout;
     this.pendingPayout = null;
+    // Release the claim: nothing was paid, so those impressions stay payable.
+    if (reservation?.settlesOffers) {
+      for (const id of reservation.settlesOffers) this.claimedOffers.delete(id);
+    }
     return reservation ? { ...reservation, cancelled: true, reason } : null;
   }
 
@@ -585,6 +715,15 @@ class Ledger {
     const publisherDebits = this.#deductPublishers(publisherMicros);
 
     this.pendingPayout = null;
+    // The impressions are now paid, permanently. Any later trigger that tries
+    // to settle one of them is refused by preparePayout's ALREADY_SETTLED guard.
+    if (reservation.settlesOffers) {
+      for (const id of reservation.settlesOffers) {
+        this.claimedOffers.delete(id);
+        this.settledOffers.add(id);
+      }
+    }
+    this.payoutExecutions += 1;
 
     const rail = settlement.rail || reservation.rail || 'paypal_payouts';
     const payout = {

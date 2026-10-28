@@ -285,6 +285,20 @@ async function requestOffer(payload) {
     const clientId = await getClientId();
     const body = {
       clientId,
+      /*
+       * Impression identity, carried by the caller so its own retry reuses it.
+       *
+       * The server credits money and starts a payout for every approved offer,
+       * so a retry without a stable id would sell (and pay for) the same
+       * impression twice. When the caller does not supply one, it is generated
+       * here, which keeps a single call idempotent even if the transport
+       * retries it.
+       */
+      impressionId:
+        payload?.impressionId ||
+        (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `imp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`),
       price: payload?.price,
       signals: payload?.signals || {},
       page: payload?.page || {},

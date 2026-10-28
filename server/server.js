@@ -57,6 +57,10 @@ const serverState = { port: config.port, url: `http://localhost:${config.port}` 
 
 // Simple anti-spam: at most one offer per second per client.
 const lastOfferByClient = new Map();
+// Impression-level idempotency: `impressionId` -> the recorded outcome, so a
+// client retry replays instead of selling (and paying for) the same impression
+// twice. Bounded; the oldest entry is evicted first.
+const offerResultsById = new Map();
 // Debounces "no active reader" warnings so a probing script cannot fill the
 // terminal with one line per refused request.
 const lastPresenceWarnAt = new Map();
@@ -372,6 +376,23 @@ app.get('/api/health', (_req, res) => {
       userAmount: Math.round(config.defaultOfferPrice * config.userShare * 100) / 100,
       publisherAmount: Math.round(config.defaultOfferPrice * config.publisherShare * 100) / 100,
       correction: config.pricingCorrection || null,
+    },
+    /*
+     * The payout guard, exposed so "one batch per impression" can be verified
+     * from outside the process instead of taken on trust. `executions` must
+     * never exceed the number of approved impressions; `inFlight` names the
+     * execution holding the lock, if any.
+     */
+    payouts: {
+      executions: ledger.payoutExecutions,
+      settledImpressions: ledger.settledOffers.size,
+      unsettledImpressions: ledger.unsettledOfferIds().length,
+      claimedImpressions: ledger.claimedOffers.size,
+      approvedImpressions: ledger.offers.filter((offer) => offer.approved).length,
+      inFlight: payoutExecution
+        ? { reason: payoutExecution.reason, rail: payoutExecution.rail, startedAt: payoutExecution.startedAt }
+        : null,
+      singleExecutionLock: true
     },
     cognition: agentCognition.publicProfile(),
     rails: {
@@ -2379,6 +2400,53 @@ app.post('/api/webhooks/paypal', handlePaypalWebhook);
 app.post('/api/offer', async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {};
 
+  /*
+   * Impression idempotency.
+   *
+   * A client that retries this request — after a timeout, after re-beating
+   * presence, or after a price renegotiation — must not create a *second*
+   * impression. Each approved impression credits money and triggers its own
+   * payout, so a duplicate POST is a duplicate charge. The client stamps a
+   * stable `impressionId` on the impression it is trying to sell; a repeat of
+   * that id is answered from the recorded outcome instead of being sold again.
+   *
+   * Transient refusals (no live session, rate limited, bad price) are
+   * deliberately NOT recorded, because the retry is supposed to be able to
+   * succeed once the condition clears.
+   */
+  const impressionId = sanitizeText(body.impressionId, 64);
+  if (impressionId) {
+    const recorded = offerResultsById.get(impressionId);
+    if (recorded) {
+      emit({
+        stage: 'request',
+        source: 'adserver.agent',
+        level: 'warn',
+        title: 'Duplicate offer replayed',
+        detail: `Impression ${impressionId} was already evaluated; no second impression was sold.`,
+        data: { impressionId, approved: recorded.payload?.approved === true }
+      });
+      return res.status(recorded.status).json({ ...recorded.payload, replayed: true });
+    }
+
+    // Record the settled outcome of this impression, whatever it turns out to
+    // be, so the retry above has something faithful to replay.
+    const sendJson = res.json.bind(res);
+    res.json = (payload) => {
+      const settledOutcome =
+        payload &&
+        payload.error === undefined &&
+        (payload.approved === true || payload.approved === false);
+      if (settledOutcome) {
+        offerResultsById.set(impressionId, { status: res.statusCode, payload });
+        if (offerResultsById.size > 500) {
+          offerResultsById.delete(offerResultsById.keys().next().value);
+        }
+      }
+      return sendJson(payload);
+    };
+  }
+
   const requestedPrice = body.price === undefined || body.price === null
     ? config.defaultOfferPrice
     : Number(body.price);
@@ -3028,6 +3096,18 @@ app.post('/api/offer', async (req, res) => {
 let lastAutoPayoutAt = 0;
 /** Serializes automatic payouts so two settlements can never race. */
 let autoPayoutChain = Promise.resolve();
+
+/**
+ * The single-execution lock for the Payouts API.
+ *
+ * Non-null while a payout is executing. Set and cleared synchronously around
+ * the one call site that can reach the rail, so no second payment can start
+ * while one is in flight — regardless of whether it was triggered by an
+ * impression, an L402 settle, a Solana fallback or the manual button.
+ *
+ * @type {null | { startedAt: string, reason: string, rail: string, auto: boolean }}
+ */
+let payoutExecution = null;
 
 /**
  * Creates a PayPal Payouts batch for the current balances.
@@ -3844,11 +3924,57 @@ async function runPayoutBatch({
 } = {}) {
   const selected = normalizeRail(rail);
 
-  if (selected === RAILS.SOLANA) {
-    return runSolanaPayout({ auto, reason, paymentHash, anchorSignature, sessionId });
+  /*
+   * The strict execution lock.
+   *
+   * Every payout path — an approved impression, an L402 settle, a Solana
+   * transaction that fell back to PayPal, and the terminal's manual button —
+   * goes through this one function, and only one call may be executing at a
+   * time. `ledger.pendingPayout` already blocks a second *reservation*, but it
+   * is only set once `preparePayout` runs, so two callers that both pass the
+   * checks before either reserves could still each reach the Payouts API. This
+   * flag closes that window at the entry point, which is the only place a
+   * payment can be started.
+   */
+  if (payoutExecution !== null) {
+    emit({
+      stage: 'payout',
+      source: 'ledger',
+      level: 'warn',
+      title: 'Payout refused · execution already in flight',
+      detail:
+        `A payout is already executing (${payoutExecution.reason}); ` +
+        'the new request was refused so the sender cannot be debited twice.',
+      data: { trigger: auto ? 'auto' : 'manual', reason, blocked: payoutExecution.reason }
+    });
+    return {
+      status: 409,
+      body: {
+        settled: false,
+        error: 'PAYOUT_IN_FLIGHT',
+        message: 'A payout is already being executed. Only one may run at a time.',
+        inFlight: payoutExecution,
+        balance: snapshot()
+      }
+    };
   }
 
-  return runPaypalPayout({ auto, reason, receiverEmail, publisherEmail, sessionId });
+  payoutExecution = {
+    startedAt: new Date().toISOString(),
+    reason,
+    rail: selected,
+    auto
+  };
+
+  try {
+    if (selected === RAILS.SOLANA) {
+      return await runSolanaPayout({ auto, reason, paymentHash, anchorSignature, sessionId });
+    }
+
+    return await runPaypalPayout({ auto, reason, receiverEmail, publisherEmail, sessionId });
+  } finally {
+    payoutExecution = null;
+  }
 }
 
 /**
@@ -3885,8 +4011,14 @@ function queueAutoPayout(
   }
 
   if (ledger.pendingPayout) return;
+  // The execution lock, not just the reservation: a payout that is already
+  // talking to the rail must not be joined by a second one.
+  if (payoutExecution) return;
   if (ledger.user.balance + 1e-9 < config.payoutThreshold) return;
   if (Date.now() - lastAutoPayoutAt < config.paypal.autoPayoutMinIntervalMs) return;
+  // Nothing outstanding means every impression behind this balance was already
+  // paid; queueing again would be the double debit.
+  if (ledger.unsettledOfferIds().length === 0) return;
   // No reader, no payout. Checked here *and* again when the chain reaches the
   // front, because the reader can leave while an earlier batch is in flight.
   // `explicit` is reserved for a request that paid its own 402 challenge: that
@@ -4063,6 +4195,7 @@ app.post('/api/dev/reset', (_req, res) => {
   l402Sessions.clear();
   lastOfferByClient.clear();
   lastPresenceWarnAt.clear();
+  offerResultsById.clear();
   lastAutoPayoutAt = 0;
   solana.reset();
   /*

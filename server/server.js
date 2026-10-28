@@ -3263,7 +3263,46 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
       });
       break;
     } catch (error) {
-      ledger.cancelPayout(error?.message || 'PayPal request failed');
+      /*
+       * A timeout is not a refusal.
+       *
+       * `PAYPAL_TIMEOUT` / `PAYPAL_UNREACHABLE` mean the answer was lost, not
+       * that the batch was rejected — PayPal may well have accepted it. So the
+       * reservation is deliberately *not* cancelled for those: cancelling
+       * re-credits the balance and lets the next trigger submit a fresh batch,
+       * which is exactly how one impression got debited twice (once for the
+       * batch that did land, once for its replacement).
+       *
+       * Because `sender_batch_id` is now derived from the reservation
+       * reference, resubmitting the same settlement is idempotent: PayPal
+       * either returns the original batch (`DUPLICATE_REQUEST_ID`, treated as
+       * success) or creates it now. Either way the sender is debited once.
+       */
+      const unconfirmed = paypal.isUnconfirmedError(error);
+
+      if (!unconfirmed) {
+        ledger.cancelPayout(error?.message || 'PayPal request failed');
+      }
+
+      if (unconfirmed && attempt === 0) {
+        emit({
+          stage: 'payout',
+          source: 'adserver.agent',
+          level: 'warn',
+          title: 'Payment unconfirmed · retrying idempotently',
+          detail:
+            `${error?.code || 'PAYPAL_TIMEOUT'} · ${error?.message || 'no response'} ` +
+            `· resubmitting sender_batch_id so the batch cannot be created twice`,
+          data: {
+            trigger,
+            code: error?.code || 'PAYPAL_TIMEOUT',
+            reference: reservation.reference,
+            senderBatchId: paypal.buildSenderBatchId(reservation.reference),
+            attempt: attempt + 1
+          }
+        });
+        continue;
+      }
 
       const retryable =
         attempt === 0 &&
@@ -3327,15 +3366,30 @@ async function runPaypalPayout({ auto = false, reason = 'manual', receiverEmail,
 
       console.error(`[payout] failed · ${detail}`);
 
+      /*
+       * When the batch could not be confirmed, the reservation is still held on
+       * purpose: the money may already have left, and releasing it would let the
+       * next trigger pay the same impression again. The caller is told so
+       * explicitly instead of being handed a plain "failed", which reads like
+       * "nothing moved, try again".
+       */
+      const held = unconfirmed && ledger.pendingPayout?.id === reservation.id;
+
       return {
         status: error?.status || 502,
         body: {
           settled: false,
           error: error?.code || 'PAYPAL_ERROR',
-          message: detail,
+          message: held
+            ? `${detail} The reservation is still held because PayPal may have accepted the batch; ` +
+              'it will not be resubmitted under a new sender_batch_id.'
+            : detail,
+          unconfirmed: Boolean(unconfirmed),
+          held,
           issues: error?.issues || [],
           debugId: error?.debugId || '',
           reference: reservation.reference,
+          senderBatchId: paypal.buildSenderBatchId(reservation.reference),
           paypal: profile,
           balance: snapshot()
         }

@@ -647,6 +647,29 @@ class Ledger {
         currency: settlement.currency || this.config.currency,
         selfUrl: settlement.selfUrl || '',
         links: Array.isArray(settlement.links) ? settlement.links : [],
+        /*
+         * How many times the sender was debited for this settlement, and for how
+         * much. A Payouts batch is one debit for the batch total; the per-item
+         * amounts are the same money broken down by receiver. Recording it here
+         * stops a consumer (or a human reading the PayPal activity page) from
+         * adding the batch line to its own item lines and concluding the sender
+         * paid twice.
+         */
+        senderDebit: settlement.senderDebit || {
+          amount: round6(fromMicros(userMicros + publisherMicros)),
+          currency: settlement.currency || this.config.currency,
+          debits: 1,
+          items: [
+            { receiver: settlement.receiverEmail || '', amount: round6(fromMicros(userMicros)) },
+            ...(publisherMicros > 0
+              ? [{ receiver: settlement.publisherEmail || '', amount: round6(fromMicros(publisherMicros)) }]
+              : [])
+          ],
+          itemizedOnly: false
+        },
+        // True when PayPal answered `DUPLICATE_REQUEST_ID`: the batch already
+        // existed, so this settlement was submitted once and debited once.
+        duplicate: Boolean(settlement.duplicate),
         checkedAt: new Date().toISOString()
       };
     }

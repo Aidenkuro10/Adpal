@@ -11,6 +11,7 @@
  * demo can be flipped between the two with PAYPAL_MODE.
  */
 
+const crypto = require('crypto');
 const config = require('./config');
 const { isSelfPay, normalizeEmail, planRecipients, describeHold } = require('./payout-recipients');
 
@@ -453,7 +454,18 @@ async function createPayout(input) {
     }
   });
 
-  if (!response.ok) {
+  /*
+   * `DUPLICATE_REQUEST_ID` is a success, not a failure.
+   *
+   * It means PayPal already has a batch with this `sender_batch_id` — this very
+   * settlement was submitted before, most likely by the attempt that timed out.
+   * Throwing here used to make `runPaypalPayout` cancel the reservation, which
+   * re-credited the balance and let the next trigger submit a *second* batch:
+   * the sender paid 1.00 twice for one impression. A duplicate proves the
+   * money moved exactly once, so the reservation must be committed.
+   */
+  const duplicate = !response.ok && isDuplicateRequest(data);
+  if (!response.ok && !duplicate) {
     throw errorFromResponse(response, data);
   }
 
@@ -469,15 +481,44 @@ async function createPayout(input) {
     currency,
     receiverEmail: items[0].receiver,
     items,
+    // True when this response came from PayPal's idempotency guard rather than a
+    // fresh submission. The batch already existed, so nothing was debited again.
+    duplicate,
     mode: paypal.mode,
     correlationId: header.payout_batch_id || '',
     links: Array.isArray(data?.links) ? data.links : [],
     selfUrl: `${paypal.apiBase}/v1/payments/payouts/${batchId}`,
+    /*
+     * The sender's single debit, stated explicitly so no consumer adds the batch
+     * total to its own item lines and reports a double charge. The batch total
+     * (€1.00) *is* the two items (€0.70 + €0.30); they are the same money.
+     */
+    senderDebit: {
+      amount: total,
+      currency,
+      debits: 1,
+      items: items.map((item) => ({ receiver: item.receiver, amount: item.amount })),
+      itemizedOnly: false
+    },
     raw: {
       batch_header: header,
       links: data?.links ?? []
     }
   };
+}
+
+/** PayPal reports an already-submitted sender_batch_id in more than one field. */
+function isDuplicateRequest(data) {
+  const name = String(data?.name || '');
+  const message = String(data?.message || '');
+  const issues = Array.isArray(data?.details)
+    ? data.details.map((detail) => String(detail?.issue || ''))
+    : [];
+  return (
+    name === 'DUPLICATE_REQUEST_ID' ||
+    issues.includes('DUPLICATE_REQUEST_ID') ||
+    /duplicate\s+request\s+id/i.test(message)
+  );
 }
 
 /**
@@ -659,12 +700,41 @@ function normalizeBatchStatus(status) {
   return value || 'UNKNOWN';
 }
 
-/** PayPal sender_batch_id: unique per submission, printable, <= 256 chars. */
+/**
+ * PayPal sender_batch_id: unique per *settlement*, printable, <= 256 chars.
+ *
+ * This is a hash of the reservation reference and nothing else — deliberately
+ * not a timestamp. `sender_batch_id` is the idempotency key: PayPal debits the
+ * sender once per batch and answers `DUPLICATE_REQUEST_ID` if the same id is
+ * submitted again. A timestamped id defeats that, because every retry of the
+ * *same* reservation minted a fresh id, so a timeout or a 429 retry could
+ * create a second batch and debit the sender twice for one impression. Deriving
+ * the id from the reference makes a retry provably the same batch, while the
+ * next settlement (which gets a new reference) is still a new batch.
+ */
 function buildSenderBatchId(reference) {
-  const stamp = Date.now().toString(36).toUpperCase();
-  const random = Math.random().toString(36).slice(2, 6).toUpperCase();
   const base = String(reference || 'ADPAL').replace(/[^A-Za-z0-9-]/g, '').toUpperCase();
-  return `${base.slice(0, 20)}-${stamp}-${random}`.slice(0, 60);
+  const digest = crypto.createHash('sha256').update(base).digest('hex').slice(0, 12).toUpperCase();
+  return `${base.slice(0, 20)}-${digest}`.slice(0, 60);
+}
+
+/**
+ * True when a failure does *not* prove that no money moved.
+ *
+ * A timeout or a dropped connection can happen after PayPal has accepted the
+ * batch. Treating that as "nothing was submitted" is what let the same
+ * settlement be paid a second time: the reservation was cancelled, the balance
+ * re-accrued, and the next trigger sent a brand-new batch. Callers must retry
+ * with the same sender_batch_id (safe) or leave the reservation pending, never
+ * cancel it.
+ */
+function isUnconfirmedError(error) {
+  const code = String(error?.code || '');
+  return (
+    code === 'PAYPAL_TIMEOUT' ||
+    code === 'PAYPAL_UNREACHABLE' ||
+    Number(error?.status) === 504
+  );
 }
 
 function round2(value) {
@@ -1031,6 +1101,8 @@ module.exports = {
   accessToken,
   createPayout,
   getPayout,
+  isUnconfirmedError,
+  buildSenderBatchId,
   verifyWebhookSignature,
   environmentOfCertUrl,
   describeEnvironment,

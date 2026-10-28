@@ -360,6 +360,19 @@ app.get('/api/health', (_req, res) => {
       mcp: TOOLKIT.mcp?.url || null
     },
     agents: rotation.roster.map((entry) => entry.agent.id),
+    // The effective money rules, not just what the environment asked for. This
+    // is the one place to check that a deployment is really charging €1.00 and
+    // splitting 70/30, instead of trusting whatever the dashboard holds.
+    pricing: {
+      currency: config.currency,
+      defaultPrice: config.defaultOfferPrice,
+      maxPrice: config.maxOfferPrice,
+      userShare: config.userShare,
+      publisherShare: config.publisherShare,
+      userAmount: Math.round(config.defaultOfferPrice * config.userShare * 100) / 100,
+      publisherAmount: Math.round(config.defaultOfferPrice * config.publisherShare * 100) / 100,
+      correction: config.pricingCorrection || null,
+    },
     cognition: agentCognition.publicProfile(),
     rails: {
       active: config.payoutRail,
@@ -2403,7 +2416,34 @@ app.post('/api/offer', async (req, res) => {
     });
   }
 
-  const price = round4(requestedPrice);
+  /*
+   * The demo baseline is a floor, not a suggestion.
+   *
+   * A client built before the €1.00 baseline still sends `price: 0.05`, and
+   * honouring it would sell a €0.05 impression against a server whose own
+   * default is €1.00 — the split then pays €0.035/€0.015 and the banner,
+   * terminal and API all disagree. Raising the bid instead of refusing it keeps
+   * an older page working while guaranteeing that no impression is ever sold
+   * below the configured baseline. `ALLOW_LOW_PRICE=true` restores the old
+   * pass-through for anyone who really wants sub-baseline pricing.
+   */
+  let effectivePrice = requestedPrice;
+  if (!config.allowLowPrice && requestedPrice < config.minOfferPrice - 1e-9) {
+    effectivePrice = config.minOfferPrice;
+    emit({
+      stage: 'request',
+      source: 'adserver.agent',
+      level: 'warn',
+      title: 'Bid raised to demo baseline',
+      detail: `Requested €${money(requestedPrice)} · floor €${money(config.minOfferPrice)}`,
+      data: { requestedPrice, price: effectivePrice }
+    });
+    console.log(
+      `[offer] bid raised €${money(requestedPrice)} → €${money(effectivePrice)} (demo baseline)`
+    );
+  }
+
+  const price = round4(effectivePrice);
   const clientId = sanitizeText(body.clientId, 64) || req.ip || 'anonymous';
   const now = Date.now();
 
@@ -4103,6 +4143,14 @@ function printBanner(port) {
   console.log(`  Logs       ${base}/api/logs  (SSE)`);
   console.log(`  Split      ${Math.round(config.userShare * 100)}% user · ${Math.round(config.publisherShare * 100)}% publisher`);
   console.log(`  Threshold  €${money(config.payoutThreshold)} · offer cap €${money(config.maxOfferPrice)}`);
+  console.log(
+    `  Price      €${money(config.defaultOfferPrice)} per impression · ` +
+      `reader €${money(config.defaultOfferPrice * config.userShare)} / ` +
+      `publisher €${money(config.defaultOfferPrice * config.publisherShare)}`
+  );
+  if (config.pricingCorrection) {
+    console.log(`  Note       ${config.pricingCorrection}`);
+  }
   const payoutPlan = planRecipients({ paypal: config.paypal });
   console.log(
     `  Payouts    ${config.paypal.mode} · ${payoutPlan.reader || '(no receiver)'}` +

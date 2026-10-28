@@ -93,8 +93,27 @@ const userShare = clamp(numberFromEnv('USER_SHARE', 0.7), 0.1, 0.9);
  *
  * The cap must be >= the default price, or `defaultOfferPrice` is clamped down
  * to the cap below.
+ *
+ * The baseline is also a floor. A deployment created before the demo moved to
+ * €1.00 still carries `MAX_OFFER_PRICE=0.05` (and often
+ * `DEFAULT_OFFER_PRICE=0.05`) in its platform environment, and that stale
+ * value is invisible from the repository because `.env` is not committed.
+ * Left alone it silently quarters every payout, so the on-page banner and the
+ * terminal disagree with the README and the demo looks broken. Both values are
+ * therefore raised to the baseline and the override is logged at boot.
+ * `ALLOW_LOW_PRICE=true` opts back into the old value for anyone who genuinely
+ * wants to run below the baseline.
  */
-const maxOfferPrice = Math.max(0.001, numberFromEnv('MAX_OFFER_PRICE', 1));
+const DEMO_BASELINE_PRICE = 1;
+const envMaxOfferPrice = Math.max(0.001, numberFromEnv('MAX_OFFER_PRICE', DEMO_BASELINE_PRICE));
+const envDefaultOfferPrice = Math.max(
+  0.001,
+  numberFromEnv('DEFAULT_OFFER_PRICE', DEMO_BASELINE_PRICE)
+);
+const allowLowPrice = textFromEnv('ALLOW_LOW_PRICE', '').toLowerCase() === 'true';
+const maxOfferPrice = allowLowPrice
+  ? envMaxOfferPrice
+  : Math.max(envMaxOfferPrice, DEMO_BASELINE_PRICE);
 
 /*
  * Solana Devnet rail.
@@ -118,10 +137,27 @@ const solanaUnitsPerEuro = Math.max(
   )
 );
 const defaultOfferPrice = clamp(
-  numberFromEnv('DEFAULT_OFFER_PRICE', 1),
+  allowLowPrice ? envDefaultOfferPrice : Math.max(envDefaultOfferPrice, DEMO_BASELINE_PRICE),
   0.001,
   maxOfferPrice
 );
+/*
+ * The floor `/api/offer` enforces. Without it a stale client that still bids
+ * €0.05 (the pre-baseline default) would be honoured even though the server's
+ * own default is €1.00, so "the price is €1.00" would only be true for callers
+ * that ask nicely.
+ */
+const minOfferPrice = Math.min(defaultOfferPrice, maxOfferPrice);
+
+/* A stale platform value is corrected above rather than obeyed, so say so out
+ * loud instead of letting the effective price drift away from the README. */
+const pricingCorrection =
+  !allowLowPrice && (envMaxOfferPrice < DEMO_BASELINE_PRICE || envDefaultOfferPrice < DEMO_BASELINE_PRICE)
+    ? `MAX_OFFER_PRICE=${envMaxOfferPrice} / DEFAULT_OFFER_PRICE=${envDefaultOfferPrice} ` +
+      `is below the €${DEMO_BASELINE_PRICE.toFixed(2)} demo baseline; using ` +
+      `€${maxOfferPrice.toFixed(2)} cap / €${defaultOfferPrice.toFixed(2)} price. ` +
+      'Set ALLOW_LOW_PRICE=true to honour the platform value.'
+    : '';
 
 module.exports = Object.freeze({
   version: require('../package.json').version,
@@ -138,6 +174,12 @@ module.exports = Object.freeze({
   payoutThreshold: Math.max(0.001, numberFromEnv('PAYOUT_THRESHOLD', 0.05)),
   maxOfferPrice,
   defaultOfferPrice,
+  // Enforced floor for any bid `/api/offer` accepts (the demo baseline).
+  minOfferPrice,
+  allowLowPrice,
+  // Empty unless a stale platform value was raised to the demo baseline; the
+  // boot log prints it so a silently mispriced deployment is impossible.
+  pricingCorrection,
   userShare: Math.round(userShare * 1000) / 1000,
   publisherShare: Math.round((1 - userShare) * 1000) / 1000,
   advertiserBudget: Math.max(1, numberFromEnv('ADVERTISER_BUDGET', 50)),

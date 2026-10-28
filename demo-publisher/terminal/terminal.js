@@ -155,7 +155,9 @@
     seq: 0,
     lastAt: null,
     mode: 'connecting',
-    threshold: 0.05,
+    // Overwritten from /api/health (rules.payoutThreshold) on connect; this is
+    // only the value shown for the instant before the first frame arrives.
+    threshold: 0.005,
     balance: 0,
     publisher: 0,
     payable: 0,

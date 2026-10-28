@@ -294,6 +294,27 @@
     let lastAttempt = { mouseMoves: 0, scrollEvents: 0, clicks: 0, at: 0 };
     let snapshot = null;
     let swapTimer = 0;
+    /*
+     * Identity of the impression being negotiated right now.
+     *
+     * This declaration MUST stay above `return runtime;` further down. The body
+     * below that return is a block of hoisted function declarations, which is
+     * why the helpers there work — but a `let`/`const` declared down there is
+     * never evaluated, so the binding stays in the temporal dead zone and the
+     * first access throws "Cannot access 'impressionId' before initialization".
+     *
+     * One id per impression window: `requestOffer` reuses it across its retries
+     * (so a retry replays the settled impression instead of selling it twice)
+     * and `runSession` clears it when the window closes.
+     */
+    let impressionId = '';
+
+    function newImpressionId() {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+      }
+      return `imp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    }
 
     const runtime = {
       host,
@@ -522,8 +543,8 @@
       // being replayed as a duplicate of the one just settled.
       impressionId = '';
       coordinator.busy = false;
-        announce();
-      }
+      announce();
+    }
     }
 
     /**
@@ -534,20 +555,6 @@
      * flight, so the agent re-beats presence and asks once more before treating
      * the refusal as final — the reader never sees a spurious empty slot.
      */
-    /*
-     * One identity per impression. `requestOffer` is called once per
-     * measurement window and retries inside it, so the id is created lazily on
-     * first use and cleared when the window closes.
-     */
-    let impressionId = '';
-
-    function newImpressionId() {
-      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-        return crypto.randomUUID();
-      }
-      return `imp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    }
-
     async function requestOffer(signals) {
       /*
        * A stable id for THIS impression, reused by both recovery attempts below.
